@@ -61,17 +61,24 @@ export class AgentOrchestrator {
 
 			if (tool) {
 				try {
-					await tool.handler(this.bot, {});
+					// LLMの入力は今回はないので空のオブジェクト
+					// 完了するまでしっかり await する（これが重要）
+					const result = await tool.handler(this.bot, {});
+
+					if (!result.success) {
+						// 失敗（道がない等）した場合は少し長めに待機して負荷を避ける
+						await new Promise((r) => setTimeout(r, 2000));
+					}
 				} catch (e) {
-					console.error(`Reflex error [${this.profile.name}]:`, e);
+					console.error(`[${this.profile.name}] Tool execution error:`, e);
+					await new Promise((r) => setTimeout(r, 5000)); // エラー時は止まる
 				}
 			} else {
-				// タスクが未設定(idle)なら「探索」をデフォルトにするなどの処置
-				this.currentTaskName = "world.explore";
+				this.currentTaskName = "exploring.exploreLand";
 			}
 
-			// 反復のインターバル（短すぎると負荷、長すぎると反応が鈍る）
-			await new Promise((r) => setTimeout(r, 500));
+			// 次の動作までのインターバル
+			await new Promise((r) => setTimeout(r, 1000));
 		}
 	}
 

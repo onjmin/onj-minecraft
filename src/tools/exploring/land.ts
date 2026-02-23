@@ -6,36 +6,33 @@ import { createTool, type ToolResponse, toolResult } from "../types";
  * Exploring Domain: Surface exploration.
  * 探索ドメイン（地表）：村や動物を探して、地表を広く探索します。
  */
-export const exploreLandTool = createTool<void, { found: string[] }>({
+export const exploreLandTool = createTool<void, { x: number; z: number }>({
 	name: "exploring.explore_land",
 	description:
 		"Explores the surface to find villages, animals, or structures. Best used in daylight.",
 	inputSchema: {} as any,
-	handler: async (bot: Bot): Promise<ToolResponse<{ found: string[] }>> => {
+	handler: async (bot: Bot): Promise<ToolResponse<{ x: number; z: number }>> => {
 		// 1. Randomly pick a distant surface location
 		// 遠くの地表の座標をランダムに決定
 		const angle = Math.random() * Math.PI * 2;
-		const x = Math.round(bot.entity.position.x + Math.cos(angle) * 40);
-		const z = Math.round(bot.entity.position.z + Math.sin(angle) * 40);
+		const x = Math.round(bot.entity.position.x + Math.cos(angle) * 80);
+		const z = Math.round(bot.entity.position.z + Math.sin(angle) * 80);
 
 		try {
-			// 2. Move using GoalXZ (pathfinder handles Y)
-			// GoalXZ で移動（高さはパスファインダーが解決）
-			await bot.pathfinder.goto(new goals.GoalXZ(x, z));
+			// timeout を設定して、あまりに長い移動は区切る
+			// 30秒経っても着かなければ一旦戻る
+			await Promise.race([
+				bot.pathfinder.goto(new goals.GoalXZ(x, z)),
+				new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 30000)),
+			]);
 
-			// 3. Scan for interesting things on the surface
-			// 地表にある興味深いものをスキャン
-			const entities = Object.values(bot.entities)
-				.filter((e) => e.position.distanceTo(bot.entity.position) < 20)
-				.map((e) => e.name || "unknown");
-
-			const uniqueEntities = Array.from(new Set(entities));
-
-			return toolResult.ok(`Explored surface area. Noticed: ${uniqueEntities.join(", ")}`, {
-				found: uniqueEntities,
-			});
+			return toolResult.ok("Moving to new area...", { x, z });
 		} catch {
-			return toolResult.fail("Could not find a safe path across the surface.");
+			// 失敗した場合はランダムに少しジャンプしたりして「詰まり」を解消する脊髄反射
+			bot.setControlState("jump", true);
+			await new Promise((r) => setTimeout(r, 500));
+			bot.setControlState("jump", false);
+			return toolResult.fail("Path not found, trying again.");
 		}
 	},
 });
