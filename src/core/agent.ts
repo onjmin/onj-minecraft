@@ -4,7 +4,7 @@ import type { AgentProfile } from "../profiles/types";
 import { emitDiscordWebhook, translateWithRoleplay } from "./discord-webhook";
 import { llm } from "./llm-client";
 
-const mcDataFactory = require("minecraft-data"); // ファクトリを読み込み
+const mcDataFactory = require("minecraft-data");
 
 type ObservationRecord = {
 	action: string;
@@ -16,11 +16,140 @@ type ObservationRecord = {
 export class AgentOrchestrator {
 	public bot: mineflayer.Bot;
 	private profile: AgentProfile;
-	private tools: Map<string, any>; // Store tools in a Map for easy lookup
+	private tools: Map<string, any>;
 	private currentTaskName: string = "idle";
-
 	private observationHistory: ObservationRecord[] = [];
-	private maxHistory = 5; // 少し増やして5件程度保持
+	private maxHistory = 5;
+	private lastDamageCause: string = "None";
+	private hasSetSkin: boolean = false; // スキン設定済みフラグ
+
+	constructor(profile: AgentProfile, toolList: any[]) {
+		this.profile = profile;
+		this.tools = new Map(toolList.map((t) => [t.name, t]));
+
+		this.bot = mineflayer.createBot({
+			host: process.env.MINECRAFT_HOST,
+			port: Number(process.env.MINECRAFT_PORT),
+			username: profile.minecraftName,
+			auth: "offline",
+		});
+
+		// インスタンス作成時に一度だけプラグインをロード
+		this.bot.loadPlugin(pathfinder);
+
+		// イベント登録
+		this.initEvents();
+	}
+
+	/**
+	 * イベントリスナーの初期化
+	 * spawnの中で他のonを登録しないよう、すべて外出しで定義
+	 */
+	private initEvents() {
+		// --- ログイン/スポーン関連 ---
+		this.bot.once("spawn", () => {
+			console.log(`[${this.profile.minecraftName}] First spawn - Initializing pathfinder`);
+			this.setupPathfinderConfig();
+
+			// ループは初回のスポーン時に一度だけ開始
+			this.startReflexLoop();
+			this.startThinkingLoop();
+		});
+
+		this.bot.on("spawn", () => {
+			console.log(`[${this.profile.minecraftName}] Spawned/Respawned!`);
+			this.applySkinOnce();
+		});
+
+		// --- 状態監視（重複登録を避けるためここで行う） ---
+		this.bot.on("health", () => this.handleHealthChange());
+		this.bot.on("entityHurt", (entity) => this.handleEntityHurt(entity));
+		this.bot.on("move", () => this.handleEnvironmentCheck());
+
+		// --- パスファインダー ---
+		this.bot.on("goal_reached", () => console.log(`[${this.profile.minecraftName}] Goal reached!`));
+		this.bot.on("path_update", (results) => {
+			if (results.status === "noPath") {
+				console.warn(`[${this.profile.minecraftName}] No path found.`);
+			}
+		});
+	}
+
+	/**
+	 * パスファインダーの初期設定
+	 */
+	private setupPathfinderConfig() {
+		const mcData = mcDataFactory(this.bot.version);
+		const movements = new Movements(this.bot);
+
+		movements.allowFreeMotion = true;
+		movements.allowSprinting = true;
+		movements.canDig = true;
+		movements.allow1by1towers = true;
+		movements.allowParkour = true;
+
+		const dirt = mcData.blocksByName.dirt;
+		if (dirt) movements.scafoldingBlocks = [dirt.id];
+
+		this.bot.pathfinder.setMovements(movements);
+		this.bot.pathfinder.thinkTimeout = 5000;
+		this.bot.pathfinder.tickTimeout = 20;
+	}
+
+	/**
+	 * スキン適用処理（フラグ管理で連打を防止）
+	 */
+	private applySkinOnce() {
+		if (this.profile.skinUrl && !this.hasSetSkin) {
+			console.log(`[${this.profile.minecraftName}] Setting skin: ${this.profile.skinUrl}`);
+			// スポーン直後の安定を待ってから一度だけ実行
+			setTimeout(() => {
+				this.bot.chat(`/skin ${this.profile.skinUrl}`);
+				this.hasSetSkin = true;
+			}, 5000);
+		}
+	}
+
+	private handleHealthChange() {
+		if (this.bot.health < 20) {
+			// 必要に応じてロジック追加
+		}
+	}
+
+	private handleEntityHurt(entity: any) {
+		if (entity === this.bot.entity) {
+			const attacker = this.bot.nearestEntity(
+				(e) =>
+					(e.type === "mob" || e.type === "player") &&
+					e.position.distanceTo(this.bot.entity.position) < 5,
+			);
+			this.lastDamageCause = attacker
+				? `Attacked by ${attacker.name || attacker.type}`
+				: "Taken damage from unknown source";
+		}
+	}
+
+	private handleEnvironmentCheck() {
+		const entity = this.bot.entity;
+
+		// 落下判定
+		if (!entity.onGround && entity.velocity.y < -0.6) {
+			this.lastDamageCause = "Falling";
+		}
+
+		// 環境判定
+		const blockAtFeet = this.bot.blockAt(entity.position);
+		if (blockAtFeet) {
+			if (blockAtFeet.name === "lava") this.lastDamageCause = "Burning in Lava";
+			else if (blockAtFeet.name === "fire") this.lastDamageCause = "Burning in Fire";
+		}
+
+		// 窒息判定
+		const oxygen = (this.bot as any).oxygenLevel;
+		if (oxygen !== undefined && oxygen <= 0) {
+			this.lastDamageCause = "Drowning/Suffocating";
+		}
+	}
 
 	private pushHistory(record: ObservationRecord) {
 		this.observationHistory.push(record);
@@ -36,218 +165,26 @@ export class AgentOrchestrator {
 			.join("\n");
 	}
 
-	constructor(profile: AgentProfile, toolList: any[]) {
-		this.profile = profile;
-		// Convert array to Map with tool name as key
-		// ツール名をキーにしたMapに変換して保持
-		this.tools = new Map(toolList.map((t) => [t.name, t]));
-
-		this.bot = mineflayer.createBot({
-			host: process.env.MINECRAFT_HOST,
-			port: Number(process.env.MINECRAFT_PORT),
-			username: profile.minecraftName,
-			auth: "offline",
-		});
-
-		this.initEvents();
-	}
-
-	private initEvents() {
-		// 重要: プラグインのロードはインスタンスごとに行う
-		this.bot.loadPlugin(pathfinder);
-
-		this.bot.on("spawn", () => {
-			console.log(`[${this.profile.minecraftName}] Spawned!`);
-
-			// --- スキン反映処理の追加 ---
-			// SkinsRestorerの /skin <URL> コマンドを送信
-			if (this.profile.skinUrl) {
-				console.log(`[${this.profile.minecraftName}] Setting skin: ${this.profile.skinUrl}`);
-				// スポーン直後だとコマンドが通らないことがあるため、少し待機して実行
-				setTimeout(() => {
-					this.bot.chat(`/skin ${this.profile.skinUrl}`);
-				}, 2000);
-			}
-			// -----------------------
-
-			// ダメージ監視を開始
-			this.setupHealthListeners();
-
-			// パスファインダー関連のイベントは bot から取得
-			// 計算が完了/中止されたとき
-			this.bot.on("goal_reached", () => {
-				console.log(`[${this.profile.minecraftName}] Goal reached!`);
-			});
-
-			this.bot.on("path_update", (results) => {
-				// status: 'success', 'noPath', 'timeout' など
-				if (results.status === "noPath") {
-					console.warn(`[${this.profile.minecraftName}] No path found to destination.`);
-				}
-			});
-
-			this.bot.on("path_reset", (reason) => {
-				console.log(`[${this.profile.minecraftName}] Path reset: ${reason}`);
-			});
-
-			// 1. mcData を現在のボットのバージョンから生成
-			const mcData = mcDataFactory(this.bot.version);
-
-			// 2. このボット専用の Movements を生成
-			const movements = new Movements(this.bot);
-
-			// パフォーマンス向上のための設定
-			movements.allowFreeMotion = true; // 障害物がない直線は計算をスキップして歩く
-			movements.allowSprinting = true; // 計算コストは上がるが、移動時間を短縮して計算回数を減らす
-
-			// pathfinder 自体の計算制限（config）
-			this.bot.pathfinder.setMovements(movements);
-			this.bot.pathfinder.thinkTimeout = 5000; // 計算を5秒で打ち切る
-			this.bot.pathfinder.tickTimeout = 20; // 1回あたりの占有時間を短くして、他ボットに処理を回す
-
-			movements.canDig = true; // ブロックを掘って進む
-			movements.allow1by1towers = true; // 足元に置いて登る
-			movements.allowParkour = true; // 1ブロックの隙間を飛び越える
-
-			const dirt = mcData.blocksByName.dirt;
-			if (dirt) {
-				movements.scafoldingBlocks = [dirt.id];
-			}
-
-			// 4. このボットのパスファインダーに Movements をセット
-			this.bot.pathfinder.setMovements(movements);
-
-			this.startReflexLoop();
-			this.startThinkingLoop();
-		});
-	}
-
-	// AgentOrchestrator.ts
-
-	private lastDamageCause: string = "None"; // ダメージ原因を保持
-
-	private setupHealthListeners() {
-		if (!this.bot) return;
-
-		// 自分のHPが減少したタイミングを監視
-		this.bot.on("health", () => {
-			if (this.bot.health < 20) {
-				// HPが減っているが原因が特定できていない場合、
-				// 窒息や空腹などの環境要因を推測するロジックをここに入れても良い
-			}
-		});
-
-		// 攻撃（エンティティによるダメージ）を検知
-		this.bot.on("entityHurt", (entity) => {
-			if (entity === this.bot?.entity) {
-				// 自分にダメージを与えたものが近くにいるか確認
-				const attacker = this.bot?.nearestEntity(
-					(e) =>
-						(e.type === "mob" || e.type === "player") &&
-						e.position.distanceTo(this.bot.entity.position) < 5,
-				);
-
-				if (attacker) {
-					this.lastDamageCause = `Attacked by ${attacker.name || attacker.type}`;
-				} else {
-					this.lastDamageCause = "Taken damage from unknown source";
-				}
-			}
-		});
-
-		// 特殊なダメージ（落下、溶岩など）の簡易判定
-		this.bot.on("move", () => {
-			const entity = this.bot.entity;
-
-			// 1. 落下判定 (y速度がマイナス、かつ地面にいない)
-			if (!entity.onGround && entity.velocity.y < -0.6) {
-				this.lastDamageCause = "Falling";
-			}
-
-			// 2. 溶岩・火・水などの環境判定
-			// 型定義にない場合は、直接ブロックを確認するのが確実です
-			const blockAtFeet = this.bot.blockAt(entity.position);
-			if (blockAtFeet) {
-				if (blockAtFeet.name === "lava") {
-					this.lastDamageCause = "Burning in Lava";
-				} else if (blockAtFeet.name === "fire") {
-					this.lastDamageCause = "Burning in Fire";
-				}
-			}
-
-			// 3. 窒息判定 (酸素レベル)
-			// mineflayer の oxygenLevel は型定義から漏れることが多いため any で回避
-			const oxygen = (this.bot as any).oxygenLevel;
-			if (oxygen !== undefined && oxygen <= 0) {
-				this.lastDamageCause = "Drowning/Suffocating";
-			}
-		});
-
-		// 4. 攻撃を受けた時の決定打 (entityHurt)
-		this.bot.on("entityHurt", (target) => {
-			if (target === this.bot.entity) {
-				// 近くにいる敵対的なエンティティを探す
-				const attacker = this.bot.nearestEntity(
-					(e) =>
-						(e.type === "mob" || e.type === "player") &&
-						e.position.distanceTo(this.bot.entity.position) < 4,
-				);
-				if (attacker) {
-					this.lastDamageCause = `Attacked by ${attacker.name || attacker.type}`;
-				}
-			}
-		});
-	}
-
-	/**
-	 * Spinal Loop (Reflex): Continues current autonomous task
-	 * 脊髄ループ：タスクを「反復」し続ける
-	 */
 	private async startReflexLoop() {
-		// 起動時の初期化ログ
-		console.log(
-			`[${this.profile.minecraftName}] ReflexLoop started. Task: ${this.currentTaskName}`,
-		);
-
-		// 起動時に 0~2秒 ランダムに待たせて、3人が同時に goto しないようにする
+		console.log(`[${this.profile.minecraftName}] ReflexLoop started.`);
 		await new Promise((r) => setTimeout(r, Math.random() * 2000));
 
-		while (this.bot) {
+		while (this.bot && this.bot.entity) {
 			const tool = this.tools.get(this.currentTaskName);
-
 			if (tool) {
-				// 現在のゴールを取得
-				const currentGoal = this.bot.pathfinder.goal;
-				console.log(
-					`[${this.profile.minecraftName}] Task: ${this.currentTaskName} | Active Goal: ${currentGoal ? "Yes" : "None"}`,
-				);
 				try {
-					// LLMの入力は今回はないので空のオブジェクト
-					// 完了するまでしっかり await する（これが重要）
 					const result = await tool.handler(this, {});
-
-					// 2. 実行結果を履歴に保存 (ここで push)
-					// rationale は ThinkingLoop でセットされた latestRationale を使うと良いです
 					this.pushHistory({
 						action: this.currentTaskName,
 						rationale: (this as any).latestRationale || "Continuing task",
 						result: result.success ? "Success" : "Fail",
 						message: result.message,
 					});
-
-					if (!result.success) {
-						// 失敗（道がない等）した場合は少し長めに待機して負荷を避ける
-						await new Promise((r) => setTimeout(r, 2000));
-					}
+					if (!result.success) await new Promise((r) => setTimeout(r, 2000));
 				} catch (e) {
-					// ここで「パスが見つからない」などのエラーをキャッチ
 					const errorMsg = e instanceof Error ? e.message : String(e);
 					console.error(`[${this.profile.minecraftName}] Reflex Error: ${errorMsg}`);
-
-					// パスが見つからない(No path)エラー時は少し長めに待機
-					if (errorMsg.includes("No path")) {
-						await new Promise((r) => setTimeout(r, 2000));
-					}
+					if (errorMsg.includes("No path")) await new Promise((r) => setTimeout(r, 2000));
 				}
 			} else {
 				this.currentTaskName = "exploring.exploreLand";
@@ -263,17 +200,14 @@ export class AgentOrchestrator {
 	 * 大脳ループ：定期的に状況を評価し、方針を更新する
 	 */
 	private async startThinkingLoop() {
-		while (this.bot) {
+		while (this.bot && this.bot.entity) {
 			const toolNames = Array.from(this.tools.keys()).join(", ");
 			const historyText = this.getHistoryContext();
-
 			// --- インベントリ情報の取得 ---
 			const inventory =
 				this.bot.inventory
 					.items()
-					.map((item) => {
-						return `${item.name} x${item.count}`;
-					})
+					.map((i) => `${i.name} x${i.count}`)
 					.join(", ") || "Empty";
 
 			// 1. 周囲のエンティティ（Botの視界）
@@ -294,18 +228,16 @@ export class AgentOrchestrator {
 			const biome = this.bot.blockAt(this.bot.entity.position)?.biome.name || "unknown";
 			const isRaining = this.bot.isRaining;
 			const timeOfDay = this.bot.time.isDay ? "Day" : "Night";
-
 			// 3. 直近のダメージ原因
 			// 「なぜHPが減ったか」がわからないと、同じミスを繰り返します。
 
 			// 4. 装備の状態（Equipment）
 			// 手に何を持っているか、防具を着ているか。インベントリの中にあるだけでは使えないため、**「今、手に持っているもの」**は重要です。
-			const heldItem = this.bot.heldItem ? `${this.bot.heldItem.name}` : "Bare hands";
+			const heldItem = this.bot.heldItem ? this.bot.heldItem.name : "Bare hands";
 
 			const systemPrompt = `You are ${this.profile.minecraftName}.
 ## PERSONALITY
 ${this.profile.personality}
-
 ## CURRENT STATUS
 - HP: ${this.bot.health}/20 | Food: ${this.bot.food}/20
 - Last Damage Cause: ${this.lastDamageCause}
@@ -314,78 +246,38 @@ ${this.profile.personality}
 - Held Item: ${heldItem}
 - Inventory: ${inventory}
 - Nearby Entities: ${nearbyEntities}
-
 ## PAST OBSERVATIONS
 ${historyText}
-
 ## AVAILABLE TOOLS
 [${toolNames}]
-
-## TASK
-1. Review the "PAST OBSERVATIONS". If a tool failed repeatedly, DO NOT try the same parameters.
-2. Decide the next tool. If the DoD gap remains, try a different approach.
-
 ## OUTPUT FORMAT
-Rationale: (Briefly explain your logic based on history)
-Tool: (The exact name of the tool)`;
+Rationale: (logic)
+Tool: (exact name)`;
 
 			try {
-				// completeAsJson ではなく通常の complete を使い、自前でパースする
 				const rawContent = await llm.complete(systemPrompt);
-
-				if (!rawContent) {
-					console.warn(`[${this.profile.minecraftName}] LLM returned empty response.`);
-				} else {
-					// --- 提示された抽出ロジックの適用 ---
-
-					// 1. Rationale (思考プロセス) の抽出
+				if (rawContent) {
 					const rationaleMatch = rawContent.match(/Rationale:\s*(.*)/i);
-					const rationale = rationaleMatch ? rationaleMatch[1].trim() : "No reasoning provided.";
-
-					// 2. Tool 名の抽出（正規表現とフォールバック）
+					const rationale = rationaleMatch ? rationaleMatch[1].trim() : "No reasoning.";
 					const toolLineMatch = rawContent.match(/Tool:\s*([a-zA-Z0-9._-]+)/i);
-					let foundToolName = toolLineMatch ? toolLineMatch[1].trim() : null;
+					const foundToolName = toolLineMatch ? toolLineMatch[1].trim() : null;
 
-					// 登録済みツール名との照合
-					const registeredNames = Array.from(this.tools.keys());
-
-					if (!foundToolName || !this.tools.has(foundToolName)) {
-						foundToolName =
-							registeredNames.find((name) => {
-								const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-								return new RegExp(`\\b${escapedName}\\b`, "i").test(rawContent);
-							}) ?? null;
-					}
-
-					// 3. アクションの切り替え
 					if (foundToolName && this.tools.has(foundToolName)) {
 						if (this.currentTaskName !== foundToolName) {
-							console.log(`[${this.profile.minecraftName}] Thought: ${rationale}`);
-							console.log(
-								`[${this.profile.minecraftName}] Task Switched: ${this.currentTaskName} -> ${foundToolName}`,
-							);
 							this.currentTaskName = foundToolName;
+							(this as any).latestRationale = rationale;
+							const translatedText = await translateWithRoleplay(rationale, this.profile);
+							await emitDiscordWebhook({
+								username: this.profile.displayName,
+								content: `**Action:** \`${foundToolName}\`\n**Thought:** ${translatedText}`,
+								avatar_url: this.profile.avatarUrl,
+							});
 						}
-					} else {
-						console.warn(
-							`[${this.profile.minecraftName}] Failed to extract a valid tool from: ${rawContent}`,
-						);
 					}
-
-					const translatedText = await translateWithRoleplay(rationale, this.profile);
-
-					// Discordへ通知 (タスク変更時、または定期生存報告として)
-					// rationale と foundToolName を渡して、Discord側でリッチな表示にする
-					await emitDiscordWebhook({
-						username: this.profile.displayName,
-						content: `**Action:** \`${foundToolName}\`\n**Thought:** ${translatedText}`,
-						avatar_url: this.profile.avatarUrl,
-					});
 				}
 			} catch (err) {
 				console.error(`[${this.profile.minecraftName}] Thinking error:`, err);
 			}
-
 			await new Promise((r) => setTimeout(r, 30000));
 		}
 	}
@@ -395,7 +287,6 @@ Tool: (The exact name of the tool)`;
 	 */
 	public async smartGoto(goal: goals.Goal): Promise<void> {
 		try {
-			// A* での移動を試みる
 			await Promise.race([
 				this.bot.pathfinder.goto(goal),
 				new Promise((_, reject) =>
@@ -403,15 +294,8 @@ Tool: (The exact name of the tool)`;
 				),
 			]);
 		} catch (err) {
-			const errorMsg = err instanceof Error ? err.message : String(err);
-			console.warn(
-				`[${this.profile.minecraftName}] A* failed (${errorMsg}). Starting physical fallback...`,
-			);
-
-			// 1. ゴールオブジェクトから安全に座標を抽出する
-			const target = goal as any; // 型チェックを回避
-
-			// 座標を持っているタイプのゴール（GoalXZ, GoalNear, GoalBlock等）か確認
+			console.error(err);
+			const target = goal as any;
 			if (typeof target.x === "number" && typeof target.z === "number") {
 				const targetY = typeof target.y === "number" ? target.y : this.bot.entity.position.y;
 				const Vec3 = require("vec3");
