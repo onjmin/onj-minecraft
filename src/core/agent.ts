@@ -282,10 +282,22 @@ Tool: (exact name)`;
 		}
 	}
 
+	private isMoving: boolean = false;
+
 	/**
 	 * A* (pathfinder.goto) を実行し、失敗した場合は物理的な強制移動（フォールバック）を行います。
 	 */
 	public async smartGoto(goal: goals.Goal): Promise<void> {
+		// 1. 同時実行の防止
+		if (this.isMoving) {
+			this.bot.pathfinder.setGoal(null);
+			this.bot.pathfinder.stop();
+			// 少し待って前の Promise が reject 処理を終えるのを待つ
+			await new Promise((r) => setTimeout(r, 100));
+		}
+
+		this.isMoving = true;
+
 		try {
 			await Promise.race([
 				this.bot.pathfinder.goto(goal),
@@ -294,7 +306,17 @@ Tool: (exact name)`;
 				),
 			]);
 		} catch (err) {
-			console.error(err);
+			this.bot.pathfinder.setGoal(null);
+			this.bot.pathfinder.stop();
+
+			// GoalChanged は「新しい移動が始まった」ことによる中断なので、
+			// ここで fallback を動かすと、新しい移動（新しい smartGoto）と物理操作が競合します。
+			if (err instanceof Error && err.name === "GoalChanged") {
+				console.log(`[${this.profile.minecraftName}] Pathfinding interrupted by a new goal.`);
+				this.isMoving = false; // フラグを戻して終了
+				return;
+			}
+
 			const target = goal as any;
 			if (typeof target.x === "number" && typeof target.z === "number") {
 				const targetY = typeof target.y === "number" ? target.y : this.bot.entity.position.y;
@@ -319,6 +341,8 @@ Tool: (exact name)`;
 			}
 
 			console.log(`[${this.profile.minecraftName}] Fallback movement finished.`);
+		} finally {
+			this.isMoving = false;
 		}
 	}
 }
