@@ -357,13 +357,6 @@ Tool: (exact name)`;
 					if (chatMessage !== "") {
 						// ゲーム内チャットに送信
 						this.bot.chat(chatMessage);
-
-						// Discordにも送信（履歴として見やすいように）
-						emitDiscordWebhook({
-							username: this.profile.displayName,
-							content: `💬 **Chat:** ${chatMessage}`,
-							avatar_url: this.profile.avatarUrl,
-						});
 					}
 
 					// --- ツールの実行とDiscord通知(思考) ---
