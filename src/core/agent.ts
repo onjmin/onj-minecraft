@@ -332,15 +332,25 @@ Tool: (exact name)`;
 					let chatMessage = chatMatch ? chatMatch[1].trim() : "";
 					const foundToolName = toolMatch ? toolMatch[1].trim() : null;
 
-					// 2. Chat内容のクリーンアップと判定
-					// 括弧やピリオドを除去して判定用に正規化
-					const normalizedChat = chatMessage.toLowerCase().replace(/[().]/g, "").trim();
-					const isNone = ["", "none", "empty", "n/a", "nothing", "no message", "silent"].includes(
-						normalizedChat,
-					);
+					// 2. Chat内容の高度なクリーンアップ
+					if (chatMessage) {
+						// 複数行返ってきた場合は、最初の1行目だけを対象にする（Tool:などが混入するのを防ぐ）
+						chatMessage = chatMessage.split("\n")[0].trim();
 
-					if (isNone) {
-						chatMessage = "";
+						// 判定用に正規化（括弧、ピリオド、ハイフン以降をカット）
+						// 例: "empty — silent for now" -> "empty"
+						const normalizedChat = chatMessage
+							.toLowerCase()
+							.split(/[\s—-]/)[0] // 空白、全角ダッシュ、ハイフンで分割して最初の単語のみ
+							.replace(/[().]/g, "");
+
+						const isNone = ["", "none", "empty", "n/a", "nothing", "silent", "ignored"].includes(
+							normalizedChat,
+						);
+
+						if (isNone) {
+							chatMessage = "";
+						}
 					}
 
 					// 3. チャットの実行
@@ -364,7 +374,7 @@ Tool: (exact name)`;
 							translateWithRoleplay(rationale, this.profile).then((translatedText) =>
 								emitDiscordWebhook({
 									username: this.profile.displayName,
-									content: `**Action:** \`${foundToolName}\`\n**Thought:** ${translatedText}${isNone ? "" : `\n**Chat:** ${normalizedChat}`}`,
+									content: `**Action:** \`${foundToolName}\`\n**Thought:** ${translatedText}${chatMessage === "" ? "" : `\n**Chat:** ${chatMessage}`}`,
 									avatar_url: this.profile.avatarUrl,
 								}),
 							);
