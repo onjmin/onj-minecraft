@@ -84,9 +84,6 @@ export class AgentOrchestrator {
 		});
 
 		this.bot.on("chat", (username, message) => {
-			// 自分自身のチャットは除外
-			if (username === this.bot.username) return;
-
 			// ログに追加
 			this.chatHistory.push({
 				username,
@@ -292,7 +289,9 @@ export class AgentOrchestrator {
 				this.chatHistory.map((c) => `<${c.username}> ${c.message}`).join("\n") ||
 				"No recent conversations.";
 
-			const systemPrompt = `You are ${this.profile.minecraftName}.
+			const systemPrompt = `Your name is ${this.profile.minecraftName}.
+Roleplay as this character and interact with other players naturally.
+
 ## PERSONALITY
 ${this.profile.personality}
 
@@ -334,28 +333,39 @@ Tool: (exact name)`;
 
 					// 2. Chat内容の高度なクリーンアップ
 					if (chatMessage) {
-						// 【重要】もしChatの中に Tool: や Rationale: が混入していたら、その手前で切る
-						// これにより "Hello! Tool: mining" -> "Hello!" となる
+						// 1. キーワード混入対策: "Tool:" や "Rationale:" 以降をカット
 						chatMessage = chatMessage.split(/(?:Tool|Rationale):/i)[0].trim();
 
-						// 複数行返ってきた場合は、最初の1行目だけを対象にする（Tool:などが混入するのを防ぐ）
+						// 2. 複数行対策: 最初の1行目のみ取得
 						chatMessage = chatMessage.split("\n")[0].trim();
 
-						// 判定用に正規化（括弧、ピリオド、ハイフン以降をカット）
-						// 例: "empty — silent for now" -> "empty"
-						const normalizedChat = chatMessage
-							.toLowerCase()
-							.split(/[\s—-]/)[0] // 空白、全角ダッシュ、ハイフンで分割して最初の単語のみ
-							.replace(/[().]/g, "");
-
-						const isNone = ["", "none", "empty", "n/a", "nothing", "silent", "ignored"].includes(
-							normalizedChat,
-						);
-
-						if (isNone) {
+						// 3. 【追加】括弧（全角含む）で始まっていたら「心の声」とみなして無視
+						if (chatMessage.startsWith("(") || chatMessage.startsWith("（")) {
 							chatMessage = "";
 						}
+
+						if (chatMessage) {
+							// 4. 引用符の除去（"Hello" -> Hello）
+							chatMessage = chatMessage.replace(/^["'「](.*)["'」]$/, "$1").trim();
+
+							// 5. 特定キーワード（none, empty等）の最終判定
+							const normalizedChat = chatMessage
+								.toLowerCase()
+								.replace(/[()."']/g, "")
+								.split(/[\s—-]/)[0];
+
+							const isNone = ["", "none", "empty", "n/a", "nothing", "silent", "ignored"].includes(
+								normalizedChat,
+							);
+
+							if (isNone) {
+								chatMessage = "";
+							}
+						}
 					}
+
+					// 最終チェック: 前後を trim した際に残った引用符をもう一度掃除
+					chatMessage = chatMessage.replace(/^["']|["']$/g, "").trim();
 
 					// 3. チャットの実行
 					if (chatMessage !== "") {
