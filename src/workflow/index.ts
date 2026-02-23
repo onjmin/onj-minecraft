@@ -19,12 +19,16 @@ const allTools = [
 	exploreUndergroundTool,
 	eatFoodTool,
 ];
+
 /**
  * Initialize and start all agents
  * 全てのエージェントを初期化して起動
  */
-const agents = Object.values(profiles).map((p) => {
-	return new AgentOrchestrator(p, allTools);
-});
+(async () => {
+	for (const profile of Object.values(profiles)) {
+		new AgentOrchestrator(profile, allTools);
+		await new Promise((resolve) => setTimeout(resolve, 3000));
+	}
+})();
 
-console.log(`Started ${agents.length} agents.`);
+console.log(`Started ${Object.values(profiles).length} agents.`);
