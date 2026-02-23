@@ -57,8 +57,25 @@ export const farmTendCropsTool = createTool<void, { harvestedCount: number }>({
 				}
 			}
 
-			return toolResult.ok(`Successfully harvested and managed ${harvestedCount} crops.`, {
+			let ate = false;
+
+			// --- Survival Routine: Eat after farming ---
+			if (bot.food < 20) {
+				const edibleItems = bot.inventory.items().filter((item) => {
+					return bot.registry.foodsByName[item.name] || bot.registry.foods[item.type];
+				});
+
+				if (edibleItems.length > 0) {
+					const food = edibleItems[0];
+					await bot.equip(food, "hand");
+					await bot.consume();
+					ate = true;
+				}
+			}
+
+			return toolResult.ok(`Managed ${harvestedCount} crops${ate ? " and ate" : ""}.`, {
 				harvestedCount,
+				ate,
 			});
 		} catch (err) {
 			return toolResult.fail(
