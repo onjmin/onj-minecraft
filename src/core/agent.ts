@@ -346,7 +346,7 @@ Tool: (exact name)`;
 
 						if (chatMessage) {
 							// 4. 引用符の除去（"Hello" -> Hello）
-							chatMessage = chatMessage.replace(/^["'「](.*)["'」]$/, "$1").trim();
+							chatMessage = chatMessage.replace(/^["'「“](.*)["'」”]$/, "$1").trim();
 
 							// 5. 特定キーワード（none, empty等）の最終判定
 							const normalizedChat = chatMessage
@@ -365,7 +365,7 @@ Tool: (exact name)`;
 					}
 
 					// 最終チェック: 前後を trim した際に残った引用符をもう一度掃除
-					chatMessage = chatMessage.replace(/^["']|["']$/g, "").trim();
+					chatMessage = chatMessage.replace(/^["'“]|["'”]$/g, "").trim();
 
 					// 3. チャットの実行
 					if (chatMessage !== "") {
