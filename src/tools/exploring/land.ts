@@ -14,10 +14,10 @@ export const exploreLandTool = createTool<void, { x: number; z: number }>({
 	handler: async (agent: AgentOrchestrator): Promise<ToolResponse<{ x: number; z: number }>> => {
 		const { bot } = agent;
 
-		// 1. 距離を 20〜30ブロックに短縮
-		// これにより、パス計算の負荷を下げ、障害物を回避する精度を高めます
 		const angle = Math.random() * Math.PI * 2;
-		const distance = 20 + Math.random() * 10;
+
+		// 5〜15ブロックの範囲でランダムに決定
+		const distance = 5 + Math.random() * 10;
 		const x = Math.round(bot.entity.position.x + Math.cos(angle) * distance);
 		const z = Math.round(bot.entity.position.z + Math.sin(angle) * distance);
 
