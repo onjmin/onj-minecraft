@@ -106,7 +106,7 @@ export class Agent {
 				try {
 					// LLMの入力は今回はないので空のオブジェクト
 					// 完了するまでしっかり await する（これが重要）
-					const result = await tool.handler(this.bot, {});
+					const result = await tool.handler(this, {});
 
 					if (!result.success) {
 						// 失敗（道がない等）した場合は少し長めに待機して負荷を避ける
