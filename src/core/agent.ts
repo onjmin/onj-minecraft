@@ -207,40 +207,49 @@ Tool: (The exact name of the tool to use)`;
 		}
 	}
 
+	/**
+	 * A* (pathfinder.goto) を実行し、失敗した場合は物理的な強制移動（フォールバック）を行います。
+	 */
 	public async smartGoto(goal: goals.Goal): Promise<void> {
-		// 1. まず setGoal で「そっちに行きたい」という意思をセット
-		this.bot.pathfinder.setGoal(goal);
+		try {
+			// A* での移動を試みる
+			await Promise.race([
+				this.bot.pathfinder.goto(goal),
+				new Promise((_, reject) =>
+					setTimeout(() => reject(new Error("Pathfinding timeout")), 12000),
+				),
+			]);
+		} catch (err) {
+			const errorMsg = err instanceof Error ? err.message : String(err);
+			console.warn(`[${this.profile.name}] A* failed (${errorMsg}). Starting physical fallback...`);
 
-		return new Promise((resolve) => {
-			const timeout = setTimeout(() => {
-				cleanup();
-				resolve(); // タイムアウトしても次へ
-			}, 10000); // 10秒制限
+			// 1. ゴールオブジェクトから安全に座標を抽出する
+			const target = goal as any; // 型チェックを回避
 
-			const cleanup = () => {
-				clearTimeout(timeout);
-				this.bot.removeListener("goal_reached", onReached);
-				this.bot.removeListener("path_update", onPathUpdate);
-			};
+			// 座標を持っているタイプのゴール（GoalXZ, GoalNear, GoalBlock等）か確認
+			if (typeof target.x === "number" && typeof target.z === "number") {
+				const targetY = typeof target.y === "number" ? target.y : this.bot.entity.position.y;
+				const Vec3 = require("vec3");
 
-			const onReached = () => {
-				cleanup();
-				resolve();
-			};
+				// その方向を向く
+				await this.bot.lookAt(new Vec3(target.x, targetY, target.z));
 
-			const onPathUpdate = (results: any) => {
-				// A*が「道がない」と言ったら、物理フォールバック（脳筋）
-				if (results.status === "noPath") {
-					console.log(`[${this.profile.name}] No path. Force walking...`);
-					this.bot.setControlState("forward", true);
-					this.bot.setControlState("jump", true);
-					// 1秒後に前進を止めて、再度パス計算が走るのを待つ
-					setTimeout(() => this.bot.clearControlStates(), 1000);
-				}
-			};
+				// 2. 物理フォールバック（ジャンプ前進）
+				this.bot.setControlState("forward", true);
+				this.bot.setControlState("jump", true);
+				this.bot.setControlState("sprint", true);
 
-			this.bot.on("goal_reached", onReached);
-			this.bot.on("path_update", onPathUpdate);
-		});
+				await new Promise((r) => setTimeout(r, 2000));
+				this.bot.clearControlStates();
+			} else {
+				// 座標がないゴール（GoalFollow等）の場合は、ランダムにジャンプして詰まりを解消
+				console.log(`[${this.profile.name}] No coordinate in goal. Random jump fallback.`);
+				this.bot.setControlState("jump", true);
+				await new Promise((r) => setTimeout(r, 500));
+				this.bot.clearControlStates();
+			}
+
+			console.log(`[${this.profile.name}] Fallback movement finished.`);
+		}
 	}
 }
