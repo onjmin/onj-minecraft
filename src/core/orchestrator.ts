@@ -165,27 +165,6 @@ Tool: (The exact name of the tool to use)`;
 					const toolLineMatch = rawContent.match(/Tool:\s*([a-zA-Z0-9._-]+)/i);
 					let foundToolName = toolLineMatch ? toolLineMatch[1].trim() : null;
 
-					if (foundToolName) {
-						// LLMが返してきた名前を正規化（例: explore_underground -> exploreUnderground）
-						const normalizedName = foundToolName.replace(/_([a-z])/g, (g) => g[1].toUpperCase());
-
-						// 登録名そのまま、または正規化した名前でヒットするか確認
-						const finalToolName = this.tools.has(foundToolName)
-							? foundToolName
-							: this.tools.has(normalizedName)
-								? normalizedName
-								: null;
-
-						if (finalToolName) {
-							if (this.currentTaskName !== finalToolName) {
-								console.log(
-									`[${this.profile.name}] Task Switched: ${this.currentTaskName} -> ${finalToolName}`,
-								);
-								this.currentTaskName = finalToolName;
-							}
-						}
-					}
-
 					// 登録済みツール名との照合
 					const registeredNames = Array.from(this.tools.keys());
 
