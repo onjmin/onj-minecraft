@@ -1,4 +1,5 @@
 import { AgentOrchestrator } from "../core/agent";
+import { profiles } from "../profiles";
 import { farmTendCropsTool } from "../tools/collecting/farming";
 import { fellTreesTool } from "../tools/collecting/felling";
 import { huntAnimalsTool } from "../tools/collecting/hunting";
@@ -19,22 +20,10 @@ const allTools = [
 	eatFoodTool,
 ];
 /**
- * Agent profiles for the simulation (Project Sid style)
- * シミュレーション用のエージェントプロフィール
- */
-const profiles = [
-	{ name: "onj_miner", personality: "Obsessed with mining ores and deep exploration." },
-	{ name: "onj_farmer", personality: "Finds joy in tending crops and ensuring food security." },
-	{ name: "onj_destroyer", personality: "Wants to break everything in sight and cause chaos." },
-];
-
-/**
  * Initialize and start all agents
  * 全てのエージェントを初期化して起動
  */
-const agents = profiles.map((p) => {
-	// Pass the tool list to the orchestrator
-	// オーケストレーターにツールリストを渡してインスタンス化
+const agents = Object.values(profiles).map((p) => {
 	return new AgentOrchestrator(p, allTools);
 });
 

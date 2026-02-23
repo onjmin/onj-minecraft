@@ -10,6 +10,8 @@ export interface LLMOutput {
 	content: string;
 }
 
+let taskQueue: Promise<any> = Promise.resolve();
+
 /**
  * 大脳（LLM）通信
  */
@@ -26,28 +28,51 @@ export const llm = {
 		return repairAndParseJSON<T>(res.content);
 	},
 
+	/**
+	 * 内部でキューイングを行い、リクエストを1つずつ処理する
+	 */
 	async ask(prompt: string): Promise<LLMOutput> {
-		const response = await fetch(`${LLM_BASE_URL}/chat/completions`, {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-				Authorization: `Bearer ${LLM_API_KEY}`,
-			},
-			body: JSON.stringify({
-				model: LLM_MODEL,
-				messages: [{ role: "user", content: prompt }],
-				temperature: 0,
-			}),
+		// 新しいタスクをキューに追加
+		const result = new Promise<LLMOutput>((resolve, reject) => {
+			taskQueue = taskQueue
+				.then(async () => {
+					try {
+						const response = await fetch(`${LLM_BASE_URL}/chat/completions`, {
+							method: "POST",
+							headers: {
+								"Content-Type": "application/json",
+								Authorization: `Bearer ${LLM_API_KEY}`,
+							},
+							body: JSON.stringify({
+								model: LLM_MODEL,
+								messages: [{ role: "user", content: prompt }],
+								temperature: 0,
+							}),
+						});
+
+						if (!response.ok) {
+							const errorText = await response.text();
+							throw new Error(`LLM API Error (${response.status}): ${errorText}`);
+						}
+
+						const json = await response.json();
+						const content = json.choices[0].message.content || "";
+
+						// ローカルLLMへの負荷軽減のため、少しだけ待機（冷却期間）
+						await new Promise((r) => setTimeout(r, 200));
+
+						resolve({ content });
+					} catch (err) {
+						reject(err);
+					}
+				})
+				.catch((err) => {
+					// 前のタスクがエラーになってもキューを止めないための処理
+					console.error("[Queue] Task failed in queue:", err);
+				});
 		});
 
-		if (!response.ok) {
-			const errorText = await response.text();
-			throw new Error(`LLM API Error (${response.status}): ${errorText}`);
-		}
-
-		const json = await response.json();
-		const content = json.choices[0].message.content || "";
-		return { content };
+		return result;
 	},
 };
 

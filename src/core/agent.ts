@@ -1,6 +1,7 @@
 import mineflayer from "mineflayer";
 import { type goals, Movements, pathfinder } from "mineflayer-pathfinder";
-import { emitDiscordWebhook } from "./discord-webhook";
+import type { AgentProfile } from "../profiles/types";
+import { emitDiscordWebhook, translateWithRoleplay } from "./discord-webhook";
 import { llm } from "./llm-client";
 
 const mcDataFactory = require("minecraft-data"); // ファクトリを読み込み
@@ -14,7 +15,7 @@ type ObservationRecord = {
 
 export class AgentOrchestrator {
 	public bot: mineflayer.Bot;
-	private profile: any;
+	private profile: AgentProfile;
 	private tools: Map<string, any>; // Store tools in a Map for easy lookup
 	private currentTaskName: string = "idle";
 
@@ -35,7 +36,7 @@ export class AgentOrchestrator {
 			.join("\n");
 	}
 
-	constructor(profile: any, toolList: any[]) {
+	constructor(profile: AgentProfile, toolList: any[]) {
 		this.profile = profile;
 		// Convert array to Map with tool name as key
 		// ツール名をキーにしたMapに変換して保持
@@ -44,7 +45,7 @@ export class AgentOrchestrator {
 		this.bot = mineflayer.createBot({
 			host: process.env.MINECRAFT_HOST,
 			port: Number(process.env.MINECRAFT_PORT),
-			username: profile.name,
+			username: profile.minecraftName,
 			auth: "offline",
 		});
 
@@ -56,7 +57,18 @@ export class AgentOrchestrator {
 		this.bot.loadPlugin(pathfinder);
 
 		this.bot.on("spawn", () => {
-			console.log(`[${this.profile.name}] Spawned!`);
+			console.log(`[${this.profile.minecraftName}] Spawned!`);
+
+			// --- スキン反映処理の追加 ---
+			// SkinsRestorerの /skin <URL> コマンドを送信
+			if (this.profile.skinUrl) {
+				console.log(`[${this.profile.minecraftName}] Setting skin: ${this.profile.skinUrl}`);
+				// スポーン直後だとコマンドが通らないことがあるため、少し待機して実行
+				setTimeout(() => {
+					this.bot.chat(`/skin ${this.profile.skinUrl}`);
+				}, 2000);
+			}
+			// -----------------------
 
 			// ダメージ監視を開始
 			this.setupHealthListeners();
@@ -64,18 +76,18 @@ export class AgentOrchestrator {
 			// パスファインダー関連のイベントは bot から取得
 			// 計算が完了/中止されたとき
 			this.bot.on("goal_reached", () => {
-				console.log(`[${this.profile.name}] Goal reached!`);
+				console.log(`[${this.profile.minecraftName}] Goal reached!`);
 			});
 
 			this.bot.on("path_update", (results) => {
 				// status: 'success', 'noPath', 'timeout' など
 				if (results.status === "noPath") {
-					console.warn(`[${this.profile.name}] No path found to destination.`);
+					console.warn(`[${this.profile.minecraftName}] No path found to destination.`);
 				}
 			});
 
 			this.bot.on("path_reset", (reason) => {
-				console.log(`[${this.profile.name}] Path reset: ${reason}`);
+				console.log(`[${this.profile.minecraftName}] Path reset: ${reason}`);
 			});
 
 			// 1. mcData を現在のボットのバージョンから生成
@@ -193,7 +205,9 @@ export class AgentOrchestrator {
 	 */
 	private async startReflexLoop() {
 		// 起動時の初期化ログ
-		console.log(`[${this.profile.name}] ReflexLoop started. Task: ${this.currentTaskName}`);
+		console.log(
+			`[${this.profile.minecraftName}] ReflexLoop started. Task: ${this.currentTaskName}`,
+		);
 
 		// 起動時に 0~2秒 ランダムに待たせて、3人が同時に goto しないようにする
 		await new Promise((r) => setTimeout(r, Math.random() * 2000));
@@ -205,7 +219,7 @@ export class AgentOrchestrator {
 				// 現在のゴールを取得
 				const currentGoal = this.bot.pathfinder.goal;
 				console.log(
-					`[${this.profile.name}] Task: ${this.currentTaskName} | Active Goal: ${currentGoal ? "Yes" : "None"}`,
+					`[${this.profile.minecraftName}] Task: ${this.currentTaskName} | Active Goal: ${currentGoal ? "Yes" : "None"}`,
 				);
 				try {
 					// LLMの入力は今回はないので空のオブジェクト
@@ -228,7 +242,7 @@ export class AgentOrchestrator {
 				} catch (e) {
 					// ここで「パスが見つからない」などのエラーをキャッチ
 					const errorMsg = e instanceof Error ? e.message : String(e);
-					console.error(`[${this.profile.name}] Reflex Error: ${errorMsg}`);
+					console.error(`[${this.profile.minecraftName}] Reflex Error: ${errorMsg}`);
 
 					// パスが見つからない(No path)エラー時は少し長めに待機
 					if (errorMsg.includes("No path")) {
@@ -288,7 +302,7 @@ export class AgentOrchestrator {
 			// 手に何を持っているか、防具を着ているか。インベントリの中にあるだけでは使えないため、**「今、手に持っているもの」**は重要です。
 			const heldItem = this.bot.heldItem ? `${this.bot.heldItem.name}` : "Bare hands";
 
-			const systemPrompt = `You are ${this.profile.name}.
+			const systemPrompt = `You are ${this.profile.minecraftName}.
 ## PERSONALITY
 ${this.profile.personality}
 
@@ -320,7 +334,7 @@ Tool: (The exact name of the tool)`;
 				const rawContent = await llm.complete(systemPrompt);
 
 				if (!rawContent) {
-					console.warn(`[${this.profile.name}] LLM returned empty response.`);
+					console.warn(`[${this.profile.minecraftName}] LLM returned empty response.`);
 				} else {
 					// --- 提示された抽出ロジックの適用 ---
 
@@ -346,28 +360,30 @@ Tool: (The exact name of the tool)`;
 					// 3. アクションの切り替え
 					if (foundToolName && this.tools.has(foundToolName)) {
 						if (this.currentTaskName !== foundToolName) {
-							console.log(`[${this.profile.name}] Thought: ${rationale}`);
+							console.log(`[${this.profile.minecraftName}] Thought: ${rationale}`);
 							console.log(
-								`[${this.profile.name}] Task Switched: ${this.currentTaskName} -> ${foundToolName}`,
+								`[${this.profile.minecraftName}] Task Switched: ${this.currentTaskName} -> ${foundToolName}`,
 							);
 							this.currentTaskName = foundToolName;
 						}
 					} else {
 						console.warn(
-							`[${this.profile.name}] Failed to extract a valid tool from: ${rawContent}`,
+							`[${this.profile.minecraftName}] Failed to extract a valid tool from: ${rawContent}`,
 						);
 					}
+
+					const translatedText = translateWithRoleplay(rationale, this.profile);
 
 					// Discordへ通知 (タスク変更時、または定期生存報告として)
 					// rationale と foundToolName を渡して、Discord側でリッチな表示にする
 					await emitDiscordWebhook({
-						username: this.profile.name,
-						content: `**Action:** \`${foundToolName}\`\n**Thought:** ${rationale}`,
-						avatar_url: `https://minotar.net/avatar/${this.profile.name}.png`, // スキンを表示
+						username: this.profile.displayName,
+						content: `**Action:** \`${foundToolName}\`\n**Thought:** ${translatedText}`,
+						avatar_url: this.profile.avatarUrl,
 					});
 				}
 			} catch (err) {
-				console.error(`[${this.profile.name}] Thinking error:`, err);
+				console.error(`[${this.profile.minecraftName}] Thinking error:`, err);
 			}
 
 			await new Promise((r) => setTimeout(r, 30000));
@@ -388,7 +404,9 @@ Tool: (The exact name of the tool)`;
 			]);
 		} catch (err) {
 			const errorMsg = err instanceof Error ? err.message : String(err);
-			console.warn(`[${this.profile.name}] A* failed (${errorMsg}). Starting physical fallback...`);
+			console.warn(
+				`[${this.profile.minecraftName}] A* failed (${errorMsg}). Starting physical fallback...`,
+			);
 
 			// 1. ゴールオブジェクトから安全に座標を抽出する
 			const target = goal as any; // 型チェックを回避
@@ -410,13 +428,13 @@ Tool: (The exact name of the tool)`;
 				this.bot.clearControlStates();
 			} else {
 				// 座標がないゴール（GoalFollow等）の場合は、ランダムにジャンプして詰まりを解消
-				console.log(`[${this.profile.name}] No coordinate in goal. Random jump fallback.`);
+				console.log(`[${this.profile.minecraftName}] No coordinate in goal. Random jump fallback.`);
 				this.bot.setControlState("jump", true);
 				await new Promise((r) => setTimeout(r, 500));
 				this.bot.clearControlStates();
 			}
 
-			console.log(`[${this.profile.name}] Fallback movement finished.`);
+			console.log(`[${this.profile.minecraftName}] Fallback movement finished.`);
 		}
 	}
 }
