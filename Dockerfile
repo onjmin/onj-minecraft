@@ -11,7 +11,7 @@ COPY package.json pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
 
 # --- Runtime Stage ---
-FROM node:24-bookworm-slim AS runner
+FROM node:24-bookworm-slim AS builder
 
 # 実行時に必要な最小限のライブラリ（mineflayer-canvasやheadless対応）
 RUN apt-get update && apt-get install -y --no-install-recommends \
