@@ -110,7 +110,6 @@ export class AgentOrchestrator {
 	 * パスファインダーの初期設定
 	 */
 	private setupPathfinderConfig() {
-		const mcData = mcDataFactory(this.bot.version);
 		const movements = new Movements(this.bot);
 
 		movements.allowFreeMotion = true;
@@ -120,19 +119,26 @@ export class AgentOrchestrator {
 		movements.allowParkour = true;
 		movements.allowFreeMotion = true;
 
-		// buildable グループに含まれるすべてのブロック ID を抽出して配列にする
-		if (mcData.blocksByGroup.buildable) {
-			movements.scafoldingBlocks = Array.from(mcData.blocksByGroup.buildable);
-		} else {
-			// もし group が取れない場合のフォールバック（土と丸石）
-			movements.scafoldingBlocks = [
-				mcData.blocksByName.dirt?.id,
-				mcData.blocksByName.grass_block?.id,
-				mcData.blocksByName.cobblestone?.id,
-				mcData.blocksByName.stone?.id,
-				mcData.blocksByName.sand?.id,
-			];
+		// 1. 基本となる足場ブロックの定義
+		const buildableBlockNames = ["dirt", "cobblestone", "stone", "netherrack"];
+		const buildableBlockIds = new Set<number>();
+
+		// 固定名のブロックを追加
+		for (const name of buildableBlockNames) {
+			const block = this.bot.registry.blocksByName[name];
+			if (block) buildableBlockIds.add(block.id);
 		}
+
+		// 2. 「すべての木材（planks）」を動的に追加
+		// 内部レジストリを走査して、名前に "_planks" が含まれるものをすべて許可
+		Object.values(this.bot.registry.blocks).forEach((block) => {
+			if (block.name.endsWith("_planks")) {
+				buildableBlockIds.add(block.id);
+			}
+		});
+
+		// 3. movements に反映
+		movements.scafoldingBlocks = Array.from(buildableBlockIds);
 
 		this.bot.pathfinder.setMovements(movements);
 		this.bot.pathfinder.thinkTimeout = 5000;
