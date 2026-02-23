@@ -27,7 +27,7 @@ const allTools = [
 (async () => {
 	for (const profile of Object.values(profiles)) {
 		new AgentOrchestrator(profile, allTools);
-		await new Promise((resolve) => setTimeout(resolve, 3000));
+		await new Promise((resolve) => setTimeout(resolve, 5000));
 	}
 })();
 
