@@ -13,6 +13,12 @@ type ObservationRecord = {
 	message: string;
 };
 
+type ChatLog = {
+	username: string;
+	message: string;
+	timestamp: number;
+};
+
 export class AgentOrchestrator {
 	public bot: mineflayer.Bot;
 	private profile: AgentProfile;
@@ -22,6 +28,9 @@ export class AgentOrchestrator {
 	private maxHistory = 5;
 	private lastDamageCause: string = "None";
 	private hasSetSkin: boolean = false; // スキン設定済みフラグ
+
+	private chatHistory: ChatLog[] = [];
+	private maxChatHistory = 10; // 過去10件保持
 
 	constructor(profile: AgentProfile, toolList: any[]) {
 		this.profile = profile;
@@ -72,6 +81,28 @@ export class AgentOrchestrator {
 			if (results.status === "noPath") {
 				console.warn(`[${this.profile.minecraftName}] No path found.`);
 			}
+		});
+
+		this.bot.on("chat", (username, message) => {
+			// 自分自身のチャットは除外
+			if (username === this.bot.username) return;
+
+			// ログに追加
+			this.chatHistory.push({
+				username,
+				message,
+				timestamp: Date.now(),
+			});
+
+			// 履歴制限
+			if (this.chatHistory.length > this.maxChatHistory) {
+				this.chatHistory.shift();
+			}
+
+			console.log(`[Chat Log] ${username}: ${message}`);
+
+			// オプション: 話しかけられたら即座に再考フェーズへ（30秒待たずに反応したい場合）
+			// this.triggerThinking();
 		});
 	}
 
@@ -210,16 +241,37 @@ export class AgentOrchestrator {
 					.map((i) => `${i.name} x${i.count}`)
 					.join(", ") || "Empty";
 
-			// 1. 周囲のエンティティ（Botの視界）
-			// 今、目の前に何がいるか。これがないと、クリーパーが目の前にいても「採掘」を続けたり、村人がいても無視したりします。
-			const nearbyEntities =
+			// 1. 周囲のプレイヤー情報を詳細に取得
+			const players = Object.values(this.bot.entities)
+				.filter((e) => e.type === "player" && e !== this.bot.entity)
+				.filter((e) => e.position.distanceTo(this.bot.entity.position) < 24); // 視界を少し広めに設定
+
+			const nearbyPlayersData = players.map((p) => {
+				const dist = Math.round(p.position.distanceTo(this.bot.entity.position));
+				// 手に持っているアイテム（メインハンド）
+				const heldItem = p.heldItem ? p.heldItem.name : "Nothing";
+				// 装備（ヘルメット等があるか）
+				const hasArmor = p.equipment?.some((item) => item && item.name.includes("helmet"))
+					? "Armored"
+					: "No Armor";
+
+				return `${p.username} (Dist: ${dist}m, Holding: ${heldItem}, ${hasArmor})`;
+			});
+
+			const nearbyPlayersText =
+				nearbyPlayersData.length > 0 ? nearbyPlayersData.join(", ") : "None";
+
+			// 2. その他のエンティティ（中立・敵対モブ）
+			const nearbyMobs =
 				Object.values(this.bot.entities)
 					.filter(
-						(e) => e.position.distanceTo(this.bot.entity.position) < 16 && e !== this.bot.entity,
+						(e) =>
+							(e.type === "mob" || e.type === "hostile") &&
+							e.position.distanceTo(this.bot.entity.position) < 16,
 					)
 					.map(
 						(e) =>
-							`${e.name || e.type} (dist: ${Math.round(e.position.distanceTo(this.bot.entity.position))})`,
+							`${e.name || e.type}(${Math.round(e.position.distanceTo(this.bot.entity.position))}m)`,
 					)
 					.join(", ") || "None";
 
@@ -235,43 +287,70 @@ export class AgentOrchestrator {
 			// 手に何を持っているか、防具を着ているか。インベントリの中にあるだけでは使えないため、**「今、手に持っているもの」**は重要です。
 			const heldItem = this.bot.heldItem ? this.bot.heldItem.name : "Bare hands";
 
+			// チャットログのテキスト化
+			const chatLogContext =
+				this.chatHistory.map((c) => `<${c.username}> ${c.message}`).join("\n") ||
+				"No recent conversations.";
+
 			const systemPrompt = `You are ${this.profile.minecraftName}.
 ## PERSONALITY
 ${this.profile.personality}
+
 ## CURRENT STATUS
 - HP: ${this.bot.health}/20 | Food: ${this.bot.food}/20
-- Last Damage Cause: ${this.lastDamageCause}
 - Position: ${this.bot.entity.position.floored()} (Biome: ${biome})
 - Time: ${timeOfDay} | Weather: ${isRaining ? "Raining" : "Clear"}
 - Held Item: ${heldItem}
 - Inventory: ${inventory}
-- Nearby Entities: ${nearbyEntities}
+- Nearby Players (IMPORTANT): ${nearbyPlayersText}
+- Nearby Mobs: ${nearbyMobs}
+- Last Damage Cause: ${this.lastDamageCause}
+
+## RECENT CHAT LOG
+${chatLogContext}
+
 ## PAST OBSERVATIONS
 ${historyText}
+
 ## AVAILABLE TOOLS
 [${toolNames}]
+
 ## OUTPUT FORMAT
 Rationale: (logic)
+Chat: (message to send in Minecraft, if any. empty if silent)
 Tool: (exact name)`;
 
 			try {
 				const rawContent = await llm.complete(systemPrompt);
 				if (rawContent) {
+					// パース処理
 					const rationaleMatch = rawContent.match(/Rationale:\s*(.*)/i);
 					const rationale = rationaleMatch ? rationaleMatch[1].trim() : "No reasoning.";
+
+					const chatMatch = rawContent.match(/Chat:\s*(.*)/i);
+					const chatMessage = chatMatch ? chatMatch[1].trim() : "";
+
 					const toolLineMatch = rawContent.match(/Tool:\s*([a-zA-Z0-9._-]+)/i);
 					const foundToolName = toolLineMatch ? toolLineMatch[1].trim() : null;
 
+					// --- チャットの実行 ---
+					if (chatMessage && chatMessage !== "" && chatMessage.toLowerCase() !== "none") {
+						// ゲーム内チャットに送信
+						this.bot.chat(chatMessage);
+					}
+
+					// --- ツールの実行とDiscord通知(思考) ---
 					if (foundToolName && this.tools.has(foundToolName)) {
 						if (this.currentTaskName !== foundToolName) {
 							this.currentTaskName = foundToolName;
 							(this as any).latestRationale = rationale;
-							const translatedText = await translateWithRoleplay(rationale, this.profile);
-							await emitDiscordWebhook({
-								username: this.profile.displayName,
-								content: `**Action:** \`${foundToolName}\`\n**Thought:** ${translatedText}`,
-								avatar_url: this.profile.avatarUrl,
-							});
+							translateWithRoleplay(rationale, this.profile).then((translatedText) =>
+								emitDiscordWebhook({
+									username: this.profile.displayName,
+									content: `**Action:** \`${foundToolName}\`\n**Thought:** ${translatedText}\n**Chat:** ${translatedText}`,
+									avatar_url: this.profile.avatarUrl,
+								}),
+							);
 						}
 					}
 				}
