@@ -323,20 +323,37 @@ Tool: (exact name)`;
 			try {
 				const rawContent = await llm.complete(systemPrompt);
 				if (rawContent) {
-					// パース処理
-					const rationaleMatch = rawContent.match(/Rationale:\s*(.*)/i);
+					// 1. 各セクションを抽出（次のキーワードまたは終端まで）
+					const rationaleMatch = rawContent.match(/Rationale:\s*([\s\S]*?)(?=\n(?:Chat|Tool):|$)/i);
+					const chatMatch = rawContent.match(/Chat:\s*([\s\S]*?)(?=\n(?:Rationale|Tool):|$)/i);
+					const toolMatch = rawContent.match(/Tool:\s*([a-zA-Z0-9._-]+)/i);
+
 					const rationale = rationaleMatch ? rationaleMatch[1].trim() : "No reasoning.";
+					let chatMessage = chatMatch ? chatMatch[1].trim() : "";
+					const foundToolName = toolMatch ? toolMatch[1].trim() : null;
 
-					const chatMatch = rawContent.match(/Chat:\s*(.*)/i);
-					const chatMessage = chatMatch ? chatMatch[1].trim() : "";
+					// 2. Chat内容のクリーンアップと判定
+					// 括弧やピリオドを除去して判定用に正規化
+					const normalizedChat = chatMessage.toLowerCase().replace(/[().]/g, "").trim();
+					const isNone = ["", "none", "empty", "n/a", "nothing", "no message", "silent"].includes(
+						normalizedChat,
+					);
 
-					const toolLineMatch = rawContent.match(/Tool:\s*([a-zA-Z0-9._-]+)/i);
-					const foundToolName = toolLineMatch ? toolLineMatch[1].trim() : null;
+					if (isNone) {
+						chatMessage = "";
+					}
 
-					// --- チャットの実行 ---
-					if (chatMessage && chatMessage !== "" && chatMessage.toLowerCase() !== "none") {
+					// 3. チャットの実行
+					if (chatMessage !== "") {
 						// ゲーム内チャットに送信
 						this.bot.chat(chatMessage);
+
+						// Discordにも送信（履歴として見やすいように）
+						emitDiscordWebhook({
+							username: this.profile.displayName,
+							content: `💬 **Chat:** ${chatMessage}`,
+							avatar_url: this.profile.avatarUrl,
+						});
 					}
 
 					// --- ツールの実行とDiscord通知(思考) ---
@@ -347,7 +364,7 @@ Tool: (exact name)`;
 							translateWithRoleplay(rationale, this.profile).then((translatedText) =>
 								emitDiscordWebhook({
 									username: this.profile.displayName,
-									content: `**Action:** \`${foundToolName}\`\n**Thought:** ${translatedText}\n**Chat:** ${translatedText}`,
+									content: `**Action:** \`${foundToolName}\`\n**Thought:** ${translatedText}${isNone ? "" : `\n**Chat:** ${normalizedChat}`}`,
 									avatar_url: this.profile.avatarUrl,
 								}),
 							);
