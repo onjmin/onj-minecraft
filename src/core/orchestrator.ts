@@ -34,6 +34,23 @@ export class AgentOrchestrator {
 		this.bot.on("spawn", () => {
 			console.log(`[${this.profile.name}] Spawned!`);
 
+			// パスファインダー関連のイベントは bot から取得
+			// 計算が完了/中止されたとき
+			this.bot.on("goal_reached", () => {
+				console.log(`[${this.profile.name}] Goal reached!`);
+			});
+
+			this.bot.on("path_update", (results) => {
+				// status: 'success', 'noPath', 'timeout' など
+				if (results.status === "noPath") {
+					console.warn(`[${this.profile.name}] No path found to destination.`);
+				}
+			});
+
+			this.bot.on("path_reset", (reason) => {
+				console.log(`[${this.profile.name}] Path reset: ${reason}`);
+			});
+
 			// 1. mcData を現在のボットのバージョンから生成
 			const mcData = mcDataFactory(this.bot.version);
 
@@ -71,6 +88,9 @@ export class AgentOrchestrator {
 	 * 脊髄ループ：タスクを「反復」し続ける
 	 */
 	private async startReflexLoop() {
+		// 起動時の初期化ログ
+		console.log(`[${this.profile.name}] ReflexLoop started. Task: ${this.currentTaskName}`);
+
 		// 起動時に 0~2秒 ランダムに待たせて、3人が同時に goto しないようにする
 		await new Promise((r) => setTimeout(r, Math.random() * 2000));
 
@@ -78,6 +98,11 @@ export class AgentOrchestrator {
 			const tool = this.tools.get(this.currentTaskName);
 
 			if (tool) {
+				// 現在のゴールを取得
+				const currentGoal = this.bot.pathfinder.goal;
+				console.log(
+					`[${this.profile.name}] Task: ${this.currentTaskName} | Active Goal: ${currentGoal ? "Yes" : "None"}`,
+				);
 				try {
 					// LLMの入力は今回はないので空のオブジェクト
 					// 完了するまでしっかり await する（これが重要）
@@ -88,8 +113,14 @@ export class AgentOrchestrator {
 						await new Promise((r) => setTimeout(r, 2000));
 					}
 				} catch (e) {
-					console.error(`[${this.profile.name}] Tool execution error:`, e);
-					await new Promise((r) => setTimeout(r, 5000)); // エラー時は止まる
+					// ここで「パスが見つからない」などのエラーをキャッチ
+					const errorMsg = e instanceof Error ? e.message : String(e);
+					console.error(`[${this.profile.name}] Reflex Error: ${errorMsg}`);
+
+					// パスが見つからない(No path)エラー時は少し長めに待機
+					if (errorMsg.includes("No path")) {
+						await new Promise((r) => setTimeout(r, 2000));
+					}
 				}
 			} else {
 				this.currentTaskName = "exploring.exploreLand";
