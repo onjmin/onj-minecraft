@@ -29,7 +29,7 @@ export async function emitDiscordWebhook(payload: WebhookPayload): Promise<void>
 // 翻訳関数
 async function translateText(text: string) {
 	try {
-		const response = await fetch("http://translate:5000/translate", {
+		const response = await fetch("http://localhost:5000/translate", {
 			method: "POST",
 			body: JSON.stringify({
 				q: text,
