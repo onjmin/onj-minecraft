@@ -11,10 +11,7 @@ export const huntAnimalsTool = createTool<void, { hunted: string; success: boole
 	description:
 		"Finds and hunts nearby animals (cows, pigs, sheep, chickens) for food and materials.",
 	inputSchema: {} as any,
-	handler: async (): Promise<ToolResponse<{ hunted: string; success: boolean }>> => {
-		const bot = (global as any).bot as Bot;
-		if (!bot) return toolResult.fail("Bot instance not available.");
-
+	handler: async (bot: Bot): Promise<ToolResponse<{ hunted: string; success: boolean }>> => {
 		// 1. Target animals (passive mobs)
 		// 対象とする動物のリスト
 		const targetNames = ["cow", "pig", "sheep", "chicken", "rabbit"];

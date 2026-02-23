@@ -11,10 +11,7 @@ export const exploreLandTool = createTool<void, { found: string[] }>({
 	description:
 		"Explores the surface to find villages, animals, or structures. Best used in daylight.",
 	inputSchema: {} as any,
-	handler: async (): Promise<ToolResponse<{ found: string[] }>> => {
-		const bot = (global as any).bot as Bot;
-		if (!bot) return toolResult.fail("Bot instance not available.");
-
+	handler: async (bot: Bot): Promise<ToolResponse<{ found: string[] }>> => {
 		// 1. Randomly pick a distant surface location
 		// 遠くの地表の座標をランダムに決定
 		const angle = Math.random() * Math.PI * 2;

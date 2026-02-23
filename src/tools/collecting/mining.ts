@@ -12,11 +12,9 @@ export const mineOresTool = createTool<void, { minedCount: number }>({
 	description:
 		"Scans the nearby area for valuable ores and mines them autonomously. No coordinates required.",
 	inputSchema: {} as any,
-	handler: async (): Promise<ToolResponse<{ minedCount: number }>> => {
+	handler: async (bot: Bot): Promise<ToolResponse<{ minedCount: number }>> => {
 		// Retrieve the bot instance from global scope
 		// グローバルスコープから bot インスタンスを取得
-		const bot = (global as any).bot as Bot;
-		if (!bot) return toolResult.fail("Bot instance not found.");
 
 		// 1. Scan for nearby ores
 		// 周囲の鉱石をスキャン

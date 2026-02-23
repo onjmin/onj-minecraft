@@ -1,3 +1,5 @@
+import type { Bot } from "mineflayer";
+
 // スネークケース（_を含む）を禁止するためのユーティリティ型
 type NoSnakeCase<T> = {
 	[K in keyof T]: K extends `${string}_${string}`
@@ -20,7 +22,7 @@ export interface ToolDefinition<T, R = void> {
 	name: string;
 	description: string;
 	inputSchema: Record<keyof T, ToolField>;
-	handler: (args: T) => Promise<ToolResponse<R>>;
+	handler: (bot: Bot, args: T) => Promise<ToolResponse<R>>;
 }
 
 export function createTool<T extends NoSnakeCase<T>, R = void>(

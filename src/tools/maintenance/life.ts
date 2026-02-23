@@ -9,10 +9,7 @@ export const eatFoodTool = createTool<void, { ate: boolean; foodLevel: number }>
 	name: "maintenance.eat",
 	description: "Automatically selects and eats food from inventory when hunger is low.",
 	inputSchema: {} as any,
-	handler: async (): Promise<ToolResponse<{ ate: boolean; foodLevel: number }>> => {
-		const bot = (global as any).bot as Bot;
-		if (!bot) return toolResult.fail("Bot instance not available.");
-
+	handler: async (bot: Bot): Promise<ToolResponse<{ ate: boolean; foodLevel: number }>> => {
 		// Check if actually hungry (Max food is 20)
 		// 空腹度を確認（20が最大）。16以下なら食べる準備。
 		if (bot.food >= 20) {

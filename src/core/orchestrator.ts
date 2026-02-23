@@ -60,9 +60,11 @@ export class AgentOrchestrator {
 			const tool = this.tools.get(this.currentTaskName);
 
 			if (tool) {
-				(global as any).bot = this.bot;
-				// ツール側で「やるべきことがない」なら即座に返ってくるよう設計する
-				await tool.handler({});
+				try {
+					await tool.handler(this.bot, {});
+				} catch (e) {
+					console.error(`Reflex error [${this.profile.name}]:`, e);
+				}
 			} else {
 				// タスクが未設定(idle)なら「探索」をデフォルトにするなどの処置
 				this.currentTaskName = "world.explore";

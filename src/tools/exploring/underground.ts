@@ -14,10 +14,7 @@ export const exploreUndergroundTool = createTool<void, { torchPlaced: boolean }>
 	name: "exploring.explore_underground",
 	description: "Navigates through caves or tunnels. Automatically places torches if it's too dark.",
 	inputSchema: {} as any,
-	handler: async (): Promise<ToolResponse<{ torchPlaced: boolean }>> => {
-		const bot = (global as any).bot as Bot;
-		if (!bot) return toolResult.fail("Bot instance not available.");
-
+	handler: async (bot: Bot): Promise<ToolResponse<{ torchPlaced: boolean }>> => {
 		let torchPlaced = false;
 
 		try {

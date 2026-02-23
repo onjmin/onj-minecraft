@@ -12,10 +12,7 @@ export const exploreSeaTool = createTool<void, { usedBoat: boolean }>({
 	name: "exploring.explore_sea",
 	description: "Explores the ocean. Automatically attempts to use a boat for efficient travel.",
 	inputSchema: {} as any,
-	handler: async (): Promise<ToolResponse<{ usedBoat: boolean }>> => {
-		const bot = (global as any).bot as Bot;
-		if (!bot) return toolResult.fail("Bot instance not available.");
-
+	handler: async (bot: Bot): Promise<ToolResponse<{ usedBoat: boolean }>> => {
 		let usedBoat = false;
 
 		try {

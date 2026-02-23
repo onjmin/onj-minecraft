@@ -12,12 +12,7 @@ export const farmTendCropsTool = createTool<void, { harvestedCount: number }>({
 	description:
 		"Automatically harvests fully grown crops and replants seeds in the vicinity. Decisions are made autonomously.",
 	inputSchema: {} as any,
-	handler: async (): Promise<ToolResponse<{ harvestedCount: number }>> => {
-		// Access the bot instance injected into the global scope
-		// グローバルに注入された bot インスタンスを取得
-		const bot = (global as any).bot as Bot;
-		if (!bot) return toolResult.fail("Bot instance is not available.");
-
+	handler: async (bot: Bot): Promise<ToolResponse<{ harvestedCount: number }>> => {
 		// 1. Scan for harvestable crops (metadata 7)
 		// 収穫可能な成熟した作物（メタデータ7）をスキャン
 		const targets = farmingScanner.findHarvestableCrops(bot);

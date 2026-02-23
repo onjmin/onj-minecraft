@@ -11,10 +11,7 @@ export const fellTreesTool = createTool<void, { count: number }>({
 	name: "collecting.felling",
 	description: "Automatically finds and fells nearby trees. It also attempts to collect saplings.",
 	inputSchema: {} as any,
-	handler: async (): Promise<ToolResponse<{ count: number }>> => {
-		const bot = (global as any).bot as Bot;
-		if (!bot) return toolResult.fail("Bot instance not found.");
-
+	handler: async (bot: Bot): Promise<ToolResponse<{ count: number }>> => {
 		// 1. Scan for logs
 		// 周囲の原木をスキャン
 		const logs = fellingScanner.findNearbyLogs(bot);
