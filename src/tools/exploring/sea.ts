@@ -61,7 +61,7 @@ export const exploreSeaTool = createTool<void, { usedBoat: boolean }>({
 			// 3. Set destination across the water
 			// 対岸や遠くの海上の座標を決定
 			const angle = Math.random() * Math.PI * 2;
-			const distance = 50; // 海は広いので少し遠めに設定
+			const distance = 20; // 海は広いので少し遠めに設定
 			const x = Math.round(bot.entity.position.x + Math.cos(angle) * distance);
 			const z = Math.round(bot.entity.position.z + Math.sin(angle) * distance);
 

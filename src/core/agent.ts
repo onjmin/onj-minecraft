@@ -4,6 +4,8 @@ import type { AgentProfile } from "../profiles/types";
 import { emitDiscordWebhook, translateWithRoleplay } from "./discord-webhook";
 import { llm } from "./llm-client";
 
+let lastDiscordEmitAt = 0;
+
 const mcDataFactory = require("minecraft-data");
 
 type ObservationRecord = {
@@ -28,6 +30,7 @@ export class AgentOrchestrator {
 	private maxHistory = 5;
 	private lastDamageCause: string = "None";
 	private hasSetSkin: boolean = false; // スキン設定済みフラグ
+	private latestRationale: string = "";
 
 	private chatHistory: ChatLog[] = [];
 	private maxChatHistory = 10; // 過去10件保持
@@ -204,7 +207,7 @@ export class AgentOrchestrator {
 					const result = await tool.handler(this, {});
 					this.pushHistory({
 						action: this.currentTaskName,
-						rationale: (this as any).latestRationale || "Continuing task",
+						rationale: this.latestRationale || "Continuing task",
 						result: result.success ? "Success" : "Fail",
 						message: result.message,
 					});
@@ -377,14 +380,21 @@ Tool: (exact name)`;
 					if (foundToolName && this.tools.has(foundToolName)) {
 						if (this.currentTaskName !== foundToolName) {
 							this.currentTaskName = foundToolName;
-							(this as any).latestRationale = rationale;
-							translateWithRoleplay(rationale, this.profile).then((translatedText) =>
-								emitDiscordWebhook({
-									username: this.profile.displayName,
-									content: `**Action:** \`${foundToolName}\`\n**Thought:** ${translatedText}${chatMessage === "" ? "" : `\n**Chat:** ${chatMessage}`}`,
-									avatar_url: this.profile.avatarUrl,
-								}),
-							);
+							this.latestRationale = rationale;
+
+							// --- 送信処理の中 ---
+							const now = Date.now();
+							if (now - lastDiscordEmitAt >= 30_000) {
+								// 最後に送信した時刻を更新
+								lastDiscordEmitAt = now;
+								translateWithRoleplay(rationale, this.profile).then((translatedText) =>
+									emitDiscordWebhook({
+										username: this.profile.displayName,
+										content: `**Action:** \`${foundToolName}\`\n**Thought:** ${translatedText}${chatMessage === "" ? "" : `\n**Chat:** ${chatMessage}`}`,
+										avatar_url: this.profile.avatarUrl,
+									}),
+								);
+							}
 						}
 					}
 				}

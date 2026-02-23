@@ -14,11 +14,12 @@ export const exploreLandTool = createTool<void, { x: number; z: number }>({
 	handler: async (agent: AgentOrchestrator): Promise<ToolResponse<{ x: number; z: number }>> => {
 		const { bot } = agent;
 
-		// 1. Randomly pick a distant surface location
-		// 遠くの地表の座標をランダムに決定
+		// 1. 距離を 20〜30ブロックに短縮
+		// これにより、パス計算の負荷を下げ、障害物を回避する精度を高めます
 		const angle = Math.random() * Math.PI * 2;
-		const x = Math.round(bot.entity.position.x + Math.cos(angle) * 80);
-		const z = Math.round(bot.entity.position.z + Math.sin(angle) * 80);
+		const distance = 20 + Math.random() * 10;
+		const x = Math.round(bot.entity.position.x + Math.cos(angle) * distance);
+		const z = Math.round(bot.entity.position.z + Math.sin(angle) * distance);
 
 		try {
 			// timeout を設定して、あまりに長い移動は区切る
@@ -30,13 +31,21 @@ export const exploreLandTool = createTool<void, { x: number; z: number }>({
 
 			return toolResult.ok("Moving to new area...", { x, z });
 		} catch {
-			// 詰まった(stuck)時のためのリカバリ：とりあえずジャンプして前に進んでみる
+			// 4. リカバリ処理の強化
+			// 詰まった時は単なるジャンプだけでなく、少し横にずれるなどの動作を加える
+			bot.clearControlStates();
 			bot.setControlState("jump", true);
 			bot.setControlState("forward", true);
-			await new Promise((r) => setTimeout(r, 500));
+
+			// 左右どちらかにランダムに旋回してスタック脱出を試みる
+			const yaw = bot.entity.yaw + (Math.random() > 0.5 ? 0.5 : -0.5);
+			await bot.look(yaw, bot.entity.pitch, true);
+
+			await new Promise((r) => setTimeout(r, 800));
 			bot.clearControlStates();
 
-			return toolResult.fail("Stuck or No path, force jumped.");
+			// タイムアウトでも、ある程度進めていれば「一部成功」として扱うのも手
+			return toolResult.fail("Stuck or timeout, attempted recovery jump.");
 		}
 	},
 });
