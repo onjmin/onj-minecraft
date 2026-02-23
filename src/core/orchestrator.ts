@@ -28,26 +28,32 @@ export class AgentOrchestrator {
 	}
 
 	private initEvents() {
+		// 重要: プラグインのロードはインスタンスごとに行う
 		this.bot.loadPlugin(pathfinder);
 
 		this.bot.on("spawn", () => {
 			console.log(`[${this.profile.name}] Spawned!`);
 
-			// Use only 'this.bot' for Movements constructor
-			// Movements のコンストラクタには this.bot のみを渡す
-			const movements = new Movements(this.bot);
-			movements.canDig = true; // 道を作るために掘ることを許可
-			movements.allow1by1towers = true; // 足元にブロックを置いて登るのを許可
-
+			// 1. mcData を現在のボットのバージョンから生成
 			const mcData = mcDataFactory(this.bot.version);
-			movements.scafoldingBlocks.push(mcData.blocksByName.dirt.id); // 土を足場に使う
 
-			// If you need to customize movements with mcData,
-			// it's usually handled internally or set via properties.
+			// 2. このボット専用の Movements を生成
+			const movements = new Movements(this.bot);
+
+			// 3. このボット専用の移動設定を行う
+			movements.canDig = true;
+			movements.allow1by1towers = true;
+
+			const dirt = mcData.blocksByName.dirt;
+			if (dirt) {
+				movements.scafoldingBlocks = [dirt.id];
+			}
+
+			// 4. このボットのパスファインダーに Movements をセット
 			this.bot.pathfinder.setMovements(movements);
 
-			this.startReflexLoop(); // 脊髄：実行ループ
-			this.startThinkingLoop(); // 大脳：思考ループ
+			this.startReflexLoop();
+			this.startThinkingLoop();
 		});
 	}
 
