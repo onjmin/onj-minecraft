@@ -58,6 +58,9 @@ export class AgentOrchestrator {
 		this.bot.on("spawn", () => {
 			console.log(`[${this.profile.name}] Spawned!`);
 
+			// ダメージ監視を開始
+			this.setupHealthListeners();
+
 			// パスファインダー関連のイベントは bot から取得
 			// 計算が完了/中止されたとき
 			this.bot.on("goal_reached", () => {
@@ -104,6 +107,83 @@ export class AgentOrchestrator {
 
 			this.startReflexLoop();
 			this.startThinkingLoop();
+		});
+	}
+
+	// AgentOrchestrator.ts
+
+	private lastDamageCause: string = "None"; // ダメージ原因を保持
+
+	private setupHealthListeners() {
+		if (!this.bot) return;
+
+		// 自分のHPが減少したタイミングを監視
+		this.bot.on("health", () => {
+			if (this.bot.health < 20) {
+				// HPが減っているが原因が特定できていない場合、
+				// 窒息や空腹などの環境要因を推測するロジックをここに入れても良い
+			}
+		});
+
+		// 攻撃（エンティティによるダメージ）を検知
+		this.bot.on("entityHurt", (entity) => {
+			if (entity === this.bot?.entity) {
+				// 自分にダメージを与えたものが近くにいるか確認
+				const attacker = this.bot?.nearestEntity(
+					(e) =>
+						(e.type === "mob" || e.type === "player") &&
+						e.position.distanceTo(this.bot.entity.position) < 5,
+				);
+
+				if (attacker) {
+					this.lastDamageCause = `Attacked by ${attacker.name || attacker.type}`;
+				} else {
+					this.lastDamageCause = "Taken damage from unknown source";
+				}
+			}
+		});
+
+		// 特殊なダメージ（落下、溶岩など）の簡易判定
+		this.bot.on("move", () => {
+			const entity = this.bot.entity;
+
+			// 1. 落下判定 (y速度がマイナス、かつ地面にいない)
+			if (!entity.onGround && entity.velocity.y < -0.6) {
+				this.lastDamageCause = "Falling";
+			}
+
+			// 2. 溶岩・火・水などの環境判定
+			// 型定義にない場合は、直接ブロックを確認するのが確実です
+			const blockAtFeet = this.bot.blockAt(entity.position);
+			if (blockAtFeet) {
+				if (blockAtFeet.name === "lava") {
+					this.lastDamageCause = "Burning in Lava";
+				} else if (blockAtFeet.name === "fire") {
+					this.lastDamageCause = "Burning in Fire";
+				}
+			}
+
+			// 3. 窒息判定 (酸素レベル)
+			// mineflayer の oxygenLevel は型定義から漏れることが多いため any で回避
+			const oxygen = (this.bot as any).oxygenLevel;
+			if (oxygen !== undefined && oxygen <= 0) {
+				this.lastDamageCause = "Drowning/Suffocating";
+			}
+		});
+
+		// 4. 攻撃を受けた時の決定打 (entityHurt)
+		this.bot.on("entityHurt", (target) => {
+			if (target === this.bot.entity) {
+				// 近くにいる敵対的なエンティティを探す
+				const attacker = this.bot.nearestEntity(
+					(e) =>
+						(e.type === "mob" || e.type === "player") &&
+						e.position.distanceTo(this.bot.entity.position) < 4,
+				);
+				if (attacker) {
+					this.lastDamageCause = `Attacked by ${attacker.name || attacker.type}`;
+				}
+			}
 		});
 	}
 
@@ -173,16 +253,55 @@ export class AgentOrchestrator {
 			const toolNames = Array.from(this.tools.keys()).join(", ");
 			const historyText = this.getHistoryContext();
 
+			// --- インベントリ情報の取得 ---
+			const inventory =
+				this.bot.inventory
+					.items()
+					.map((item) => {
+						return `${item.name} x${item.count}`;
+					})
+					.join(", ") || "Empty";
+
+			// 1. 周囲のエンティティ（Botの視界）
+			// 今、目の前に何がいるか。これがないと、クリーパーが目の前にいても「採掘」を続けたり、村人がいても無視したりします。
+			const nearbyEntities =
+				Object.values(this.bot.entities)
+					.filter(
+						(e) => e.position.distanceTo(this.bot.entity.position) < 16 && e !== this.bot.entity,
+					)
+					.map(
+						(e) =>
+							`${e.name || e.type} (dist: ${Math.round(e.position.distanceTo(this.bot.entity.position))})`,
+					)
+					.join(", ") || "None";
+
+			// 2. 現在のバイオームと周囲の環境
+			// 「砂漠で農業しようとしている」「洞窟の中にいるのに地上探索しようとしている」といった矛盾を防げます。また、**「今何時か（夜か昼か）」**は生存戦略に直結します。
+			const biome = this.bot.blockAt(this.bot.entity.position)?.biome.name || "unknown";
+			const isRaining = this.bot.isRaining;
+			const timeOfDay = this.bot.time.isDay ? "Day" : "Night";
+
+			// 3. 直近のダメージ原因
+			// 「なぜHPが減ったか」がわからないと、同じミスを繰り返します。
+
+			// 4. 装備の状態（Equipment）
+			// 手に何を持っているか、防具を着ているか。インベントリの中にあるだけでは使えないため、**「今、手に持っているもの」**は重要です。
+			const heldItem = this.bot.heldItem ? `${this.bot.heldItem.name}` : "Bare hands";
+
 			const systemPrompt = `You are ${this.profile.name}.
 ## PERSONALITY
 ${this.profile.personality}
 
 ## CURRENT STATUS
-- HP: ${this.bot.health}
-- Food: ${this.bot.food}
-- Current Pos: ${this.bot.entity.position.floored()}
+- HP: ${this.bot.health}/20 | Food: ${this.bot.food}/20
+- Last Damage Cause: ${this.lastDamageCause}
+- Position: ${this.bot.entity.position.floored()} (Biome: ${biome})
+- Time: ${timeOfDay} | Weather: ${isRaining ? "Raining" : "Clear"}
+- Held Item: ${heldItem}
+- Inventory: ${inventory}
+- Nearby Entities: ${nearbyEntities}
 
-## PAST OBSERVATIONS (Your memory)
+## PAST OBSERVATIONS
 ${historyText}
 
 ## AVAILABLE TOOLS
