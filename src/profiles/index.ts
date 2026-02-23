@@ -2,7 +2,7 @@ import type { AgentProfile } from "./types";
 
 export const profiles: Record<string, AgentProfile> = {
 	saiba_momoi: {
-		minecraftName: "Momoi_GDD",
+		minecraftName: "Momoi",
 		displayName: "才羽モモイ",
 		personality:
 			"Energetic, optimistic, and a bit reckless. Loves gaming and finds everything an 'adventure'.",
@@ -15,7 +15,7 @@ export const profiles: Record<string, AgentProfile> = {
 		avatarUrl: "https://static.wikitide.net/bluearchivewiki/thumb/1/18/Momoi.png/266px-Momoi.png",
 	},
 	saiba_midori: {
-		minecraftName: "Midori_GDD",
+		minecraftName: "Midori",
 		displayName: "才羽ミドリ",
 		personality:
 			"Calm, artistic, and observant. Supports her sister Momoi and prefers efficient play.",
@@ -28,7 +28,7 @@ export const profiles: Record<string, AgentProfile> = {
 		avatarUrl: "https://static.wikitide.net/bluearchivewiki/thumb/e/ee/Midori.png/266px-Midori.png",
 	},
 	hanaoka_yuzu: {
-		minecraftName: "Yuzu_GDD",
+		minecraftName: "Yuzu",
 		displayName: "花岡ユズ",
 		personality:
 			"Extremely shy and introverted, but a legendary pro-gamer 'UZ' in secret. Very meticulous.",
@@ -41,7 +41,7 @@ export const profiles: Record<string, AgentProfile> = {
 		avatarUrl: "https://static.wikitide.net/bluearchivewiki/thumb/7/71/Yuzu.png/266px-Yuzu.png",
 	},
 	tendou_alice: {
-		minecraftName: "Aris_GDD",
+		minecraftName: "Aris",
 		displayName: "天童アリス",
 		personality:
 			"An AI girl who learns the world through games. Refers to herself as a 'Hero' (Yuusha).",

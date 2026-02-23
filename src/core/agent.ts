@@ -118,13 +118,25 @@ export class AgentOrchestrator {
 		movements.canDig = true;
 		movements.allow1by1towers = true;
 		movements.allowParkour = true;
+		movements.allowFreeMotion = true;
 
-		const dirt = mcData.blocksByName.dirt;
-		if (dirt) movements.scafoldingBlocks = [dirt.id];
+		// buildable グループに含まれるすべてのブロック ID を抽出して配列にする
+		if (mcData.blocksByGroup.buildable) {
+			movements.scafoldingBlocks = Array.from(mcData.blocksByGroup.buildable);
+		} else {
+			// もし group が取れない場合のフォールバック（土と丸石）
+			movements.scafoldingBlocks = [
+				mcData.blocksByName.dirt?.id,
+				mcData.blocksByName.grass_block?.id,
+				mcData.blocksByName.cobblestone?.id,
+				mcData.blocksByName.stone?.id,
+				mcData.blocksByName.sand?.id,
+			];
+		}
 
 		this.bot.pathfinder.setMovements(movements);
 		this.bot.pathfinder.thinkTimeout = 5000;
-		this.bot.pathfinder.tickTimeout = 20;
+		this.bot.pathfinder.tickTimeout = 100;
 	}
 
 	/**
@@ -382,6 +394,19 @@ Tool: (exact name)`;
 							this.currentTaskName = foundToolName;
 							this.latestRationale = rationale;
 
+							console.log(
+								new Intl.DateTimeFormat("ja-JP", {
+									hour: "2-digit",
+									minute: "2-digit",
+									second: "2-digit",
+									hour12: false,
+									timeZone: "Asia/Tokyo",
+								}).format(new Date()),
+								this.profile.displayName,
+								foundToolName,
+								rationale,
+							);
+
 							// --- 送信処理の中 ---
 							const now = Date.now();
 							if (now - lastDiscordEmitAt >= 30_000) {
@@ -442,18 +467,29 @@ Tool: (exact name)`;
 
 			const target = goal as any;
 			if (typeof target.x === "number" && typeof target.z === "number") {
-				const targetY = typeof target.y === "number" ? target.y : this.bot.entity.position.y;
 				const Vec3 = require("vec3");
 
-				// その方向を向く
-				await this.bot.lookAt(new Vec3(target.x, targetY, target.z));
+				// 目の高さ（eye level）を考慮して向く
+				// bot.entity.height は通常プレイヤーなら 1.8 です。
+				// 目の位置はその 90% 程度の 1.62 あたりになります。
+				const eyePosition = this.bot.entity.position.offset(0, this.bot.entity.height * 0.9, 0);
+				const targetVec = new Vec3(target.x, eyePosition.y, target.z);
+
+				// ターゲットの X, Z はそのままで、高さだけ自分の目の高さに合わせて水平に向く
+				await this.bot.lookAt(targetVec, true);
 
 				// 2. 物理フォールバック（ジャンプ前進）
 				this.bot.setControlState("forward", true);
-				this.bot.setControlState("jump", true);
 				this.bot.setControlState("sprint", true);
 
+				// 2秒間の間、断続的にジャンプを試みる（1マスの段差に強い）
+				const jumpInterval = setInterval(() => {
+					this.bot.setControlState("jump", true);
+					setTimeout(() => this.bot.setControlState("jump", false), 100);
+				}, 300);
+
 				await new Promise((r) => setTimeout(r, 2000));
+				clearInterval(jumpInterval);
 				this.bot.clearControlStates();
 			} else {
 				// 座標がないゴール（GoalFollow等）の場合は、ランダムにジャンプして詰まりを解消
