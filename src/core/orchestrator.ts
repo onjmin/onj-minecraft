@@ -40,6 +40,15 @@ export class AgentOrchestrator {
 			// 2. このボット専用の Movements を生成
 			const movements = new Movements(this.bot);
 
+			// パフォーマンス向上のための設定
+			movements.allowFreeMotion = true; // 障害物がない直線は計算をスキップして歩く
+			movements.allowSprinting = true; // 計算コストは上がるが、移動時間を短縮して計算回数を減らす
+
+			// pathfinder 自体の計算制限（config）
+			this.bot.pathfinder.setMovements(movements);
+			this.bot.pathfinder.thinkTimeout = 5000; // 計算を5秒で打ち切る
+			this.bot.pathfinder.tickTimeout = 20; // 1回あたりの占有時間を短くして、他ボットに処理を回す
+
 			// 3. このボット専用の移動設定を行う
 			movements.canDig = true;
 			movements.allow1by1towers = true;
@@ -62,6 +71,9 @@ export class AgentOrchestrator {
 	 * 脊髄ループ：タスクを「反復」し続ける
 	 */
 	private async startReflexLoop() {
+		// 起動時に 0~2秒 ランダムに待たせて、3人が同時に goto しないようにする
+		await new Promise((r) => setTimeout(r, Math.random() * 2000));
+
 		while (this.bot) {
 			const tool = this.tools.get(this.currentTaskName);
 
@@ -83,8 +95,8 @@ export class AgentOrchestrator {
 				this.currentTaskName = "exploring.exploreLand";
 			}
 
-			// 次の動作までのインターバル
-			await new Promise((r) => setTimeout(r, 1000));
+			// 次の行動までも少しランダム性を入れる
+			await new Promise((r) => setTimeout(r, 1000 + Math.random() * 500));
 		}
 	}
 
