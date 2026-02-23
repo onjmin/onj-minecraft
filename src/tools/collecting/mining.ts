@@ -11,7 +11,9 @@ import { createTool, type ToolResponse, toolResult } from "../types";
 export const mineOresTool = createTool<void, { minedCount: number }>({
 	name: "collecting.mining",
 	description:
-		"Scans the nearby area for valuable ores and mines them autonomously. No coordinates required.",
+		"Scans for and mines nearby ores. IMPORTANT: You MUST have a pickaxe equipped or in your inventory. " +
+		"Mining with bare hands is extremely inefficient, takes too long, and results in NO item drops for most ores. " +
+		"If you lack a pickaxe, craft one first instead of using this tool.",
 	inputSchema: {} as any,
 	handler: async (agent: AgentOrchestrator): Promise<ToolResponse<{ minedCount: number }>> => {
 		const { bot } = agent;

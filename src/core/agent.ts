@@ -244,7 +244,10 @@ export class AgentOrchestrator {
 	 */
 	private async startThinkingLoop() {
 		while (this.bot && this.bot.entity) {
-			const toolNames = Array.from(this.tools.keys()).join(", ");
+			const toolsContext = Array.from(this.tools.values())
+				.map((t) => `- ${t.name}: ${t.description}`)
+				.join("\n");
+
 			const historyText = this.getHistoryContext();
 			// --- インベントリ情報の取得 ---
 			const inventory =
@@ -327,7 +330,7 @@ ${chatLogContext}
 ${historyText}
 
 ## AVAILABLE TOOLS
-[${toolNames}]
+${toolsContext}
 
 ## OUTPUT FORMAT
 Rationale: (logic)

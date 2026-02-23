@@ -12,7 +12,11 @@ const Vec3 = require("vec3");
  */
 export const exploreUndergroundTool = createTool<void, { torchPlaced: boolean }>({
 	name: "exploring.explore_underground",
-	description: "Navigates through caves or tunnels. Automatically places torches if it's too dark.",
+	description:
+		"Navigates through caves or tunnels and places torches in low light. " +
+		"REQUIRED: A pickaxe is essential for this task. Cave exploration without a pickaxe is highly inefficient " +
+		"as you will be unable to mine through obstructions, collect ores you find, or create escape routes. " +
+		"Ensure you have a pickaxe and torches before starting.",
 	inputSchema: {} as any,
 	handler: async (agent: AgentOrchestrator): Promise<ToolResponse<{ torchPlaced: boolean }>> => {
 		let torchPlaced = false;
