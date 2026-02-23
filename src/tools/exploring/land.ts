@@ -1,5 +1,5 @@
-import type { Bot } from "mineflayer";
 import { goals } from "mineflayer-pathfinder";
+import type { Agent } from "../../core/agent";
 import { createTool, type ToolResponse, toolResult } from "../types";
 
 /**
@@ -11,7 +11,9 @@ export const exploreLandTool = createTool<void, { x: number; z: number }>({
 	description:
 		"Explores the surface to find villages, animals, or structures. Best used in daylight.",
 	inputSchema: {} as any,
-	handler: async (bot: Bot): Promise<ToolResponse<{ x: number; z: number }>> => {
+	handler: async (agent: Agent): Promise<ToolResponse<{ x: number; z: number }>> => {
+		const { bot } = agent;
+
 		// 1. Randomly pick a distant surface location
 		// 遠くの地表の座標をランダムに決定
 		const angle = Math.random() * Math.PI * 2;
@@ -22,7 +24,7 @@ export const exploreLandTool = createTool<void, { x: number; z: number }>({
 			// timeout を設定して、あまりに長い移動は区切る
 			// 30秒経っても着かなければ一旦戻る
 			await Promise.race([
-				bot.pathfinder.goto(new goals.GoalXZ(x, z)),
+				agent.smartGoto(new goals.GoalXZ(x, z)),
 				new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 30000)),
 			]);
 

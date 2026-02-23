@@ -1,5 +1,5 @@
-import type { Bot } from "mineflayer";
 import { goals } from "mineflayer-pathfinder";
+import type { Agent } from "../../core/agent";
 import { createTool, type ToolResponse, toolResult } from "../types";
 
 const Vec3 = require("vec3");
@@ -12,8 +12,10 @@ export const exploreSeaTool = createTool<void, { usedBoat: boolean }>({
 	name: "exploring.explore_sea",
 	description: "Explores the ocean. Automatically attempts to use a boat for efficient travel.",
 	inputSchema: {} as any,
-	handler: async (bot: Bot): Promise<ToolResponse<{ usedBoat: boolean }>> => {
+	handler: async (agent: Agent): Promise<ToolResponse<{ usedBoat: boolean }>> => {
 		let usedBoat = false;
+
+		const { bot } = agent;
 
 		try {
 			// 1. Check if we are already in a boat
@@ -65,7 +67,7 @@ export const exploreSeaTool = createTool<void, { usedBoat: boolean }>({
 
 			// Using GoalXZ works for boats too (pathfinder handles boat movement in latest versions)
 			// ボートに乗った状態でも GoalXZ で移動可能
-			await bot.pathfinder.goto(new goals.GoalXZ(x, z));
+			await agent.smartGoto(new goals.GoalXZ(x, z));
 
 			return toolResult.ok(
 				`Navigating the ocean towards ${x}, ${z}. ${usedBoat ? "Using a boat." : "Swimming."}`,

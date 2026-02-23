@@ -1,6 +1,7 @@
 import type { Bot } from "mineflayer";
 import { goals } from "mineflayer-pathfinder";
 import type { Vec3 } from "vec3";
+import type { Agent } from "../../core/agent";
 import { createTool, type ToolResponse, toolResult } from "../types";
 
 /**
@@ -12,7 +13,8 @@ export const farmTendCropsTool = createTool<void, { harvestedCount: number }>({
 	description:
 		"Automatically harvests fully grown crops and replants seeds in the vicinity. Decisions are made autonomously.",
 	inputSchema: {} as any,
-	handler: async (bot: Bot): Promise<ToolResponse<{ harvestedCount: number }>> => {
+	handler: async (agent: Agent): Promise<ToolResponse<{ harvestedCount: number }>> => {
+		const { bot } = agent;
 		// 1. Scan for harvestable crops (metadata 7)
 		// 収穫可能な成熟した作物（メタデータ7）をスキャン
 		const targets = farmingScanner.findHarvestableCrops(bot);
@@ -27,7 +29,7 @@ export const farmTendCropsTool = createTool<void, { harvestedCount: number }>({
 			for (const pos of targets) {
 				// Navigate to the target crop
 				// ターゲットの作物の場所まで移動
-				await bot.pathfinder.goto(new goals.GoalGetToBlock(pos.x, pos.y, pos.z));
+				await agent.smartGoto(new goals.GoalGetToBlock(pos.x, pos.y, pos.z));
 
 				const block = bot.blockAt(pos);
 				// Check again if it's still harvestable

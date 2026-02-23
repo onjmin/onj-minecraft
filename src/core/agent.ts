@@ -1,12 +1,12 @@
 import mineflayer from "mineflayer";
-import { Movements, pathfinder } from "mineflayer-pathfinder";
+import { type goals, Movements, pathfinder } from "mineflayer-pathfinder";
 import { emitDiscordWebhook } from "./discord-webhook";
 import { llm } from "./llm-client";
 
 const mcDataFactory = require("minecraft-data"); // ファクトリを読み込み
 
-export class AgentOrchestrator {
-	private bot: mineflayer.Bot;
+export class Agent {
+	public bot: mineflayer.Bot;
 	private profile: any;
 	private tools: Map<string, any>; // Store tools in a Map for easy lookup
 	private currentTaskName: string = "idle";
@@ -205,5 +205,42 @@ Tool: (The exact name of the tool to use)`;
 
 			await new Promise((r) => setTimeout(r, 30000));
 		}
+	}
+
+	public async smartGoto(goal: goals.Goal): Promise<void> {
+		// 1. まず setGoal で「そっちに行きたい」という意思をセット
+		this.bot.pathfinder.setGoal(goal);
+
+		return new Promise((resolve) => {
+			const timeout = setTimeout(() => {
+				cleanup();
+				resolve(); // タイムアウトしても次へ
+			}, 10000); // 10秒制限
+
+			const cleanup = () => {
+				clearTimeout(timeout);
+				this.bot.removeListener("goal_reached", onReached);
+				this.bot.removeListener("path_update", onPathUpdate);
+			};
+
+			const onReached = () => {
+				cleanup();
+				resolve();
+			};
+
+			const onPathUpdate = (results: any) => {
+				// A*が「道がない」と言ったら、物理フォールバック（脳筋）
+				if (results.status === "noPath") {
+					console.log(`[${this.profile.name}] No path. Force walking...`);
+					this.bot.setControlState("forward", true);
+					this.bot.setControlState("jump", true);
+					// 1秒後に前進を止めて、再度パス計算が走るのを待つ
+					setTimeout(() => this.bot.clearControlStates(), 1000);
+				}
+			};
+
+			this.bot.on("goal_reached", onReached);
+			this.bot.on("path_update", onPathUpdate);
+		});
 	}
 }

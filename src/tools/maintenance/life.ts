@@ -1,4 +1,4 @@
-import type { Bot } from "mineflayer";
+import type { Agent } from "../../core/agent";
 import { createTool, type ToolResponse, toolResult } from "../types";
 
 /**
@@ -9,7 +9,9 @@ export const eatFoodTool = createTool<void, { ate: boolean; foodLevel: number }>
 	name: "maintenance.eat",
 	description: "Automatically selects and eats food from inventory when hunger is low.",
 	inputSchema: {} as any,
-	handler: async (bot: Bot): Promise<ToolResponse<{ ate: boolean; foodLevel: number }>> => {
+	handler: async (agent: Agent): Promise<ToolResponse<{ ate: boolean; foodLevel: number }>> => {
+		const { bot } = agent;
+
 		// Check if actually hungry (Max food is 20)
 		// 空腹度を確認（20が最大）。16以下なら食べる準備。
 		if (bot.food >= 20) {

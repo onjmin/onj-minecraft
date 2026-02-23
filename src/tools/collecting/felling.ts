@@ -2,6 +2,7 @@ import type { Bot } from "mineflayer";
 import { goals } from "mineflayer-pathfinder";
 // 1. 型としての Vec3 をインポート（競合を避けるために別名にするか、型定義のみにする）
 import type { Vec3 } from "vec3";
+import type { Agent } from "../../core/agent";
 import { createTool, type ToolResponse, toolResult } from "../types";
 /**
  * Collecting Domain: Autonomous tree felling.
@@ -11,7 +12,9 @@ export const fellTreesTool = createTool<void, { count: number }>({
 	name: "collecting.felling",
 	description: "Automatically finds and fells nearby trees. It also attempts to collect saplings.",
 	inputSchema: {} as any,
-	handler: async (bot: Bot): Promise<ToolResponse<{ count: number }>> => {
+	handler: async (agent: Agent): Promise<ToolResponse<{ count: number }>> => {
+		const { bot } = agent;
+
 		// 1. Scan for logs
 		// 周囲の原木をスキャン
 		const logs = fellingScanner.findNearbyLogs(bot);
@@ -36,7 +39,7 @@ export const fellTreesTool = createTool<void, { count: number }>({
 
 			// Navigate to the tree
 			// 木の場所まで移動
-			await bot.pathfinder.goto(new goals.GoalGetToBlock(target.x, target.y, target.z));
+			await agent.smartGoto(new goals.GoalGetToBlock(target.x, target.y, target.z));
 
 			// Fell the log
 			// 原木を伐採

@@ -1,5 +1,5 @@
-import type { Bot } from "mineflayer";
 import { goals } from "mineflayer-pathfinder";
+import type { Agent } from "../../core/agent";
 import { createTool, type ToolResponse, toolResult } from "../types";
 
 /**
@@ -11,7 +11,9 @@ export const huntAnimalsTool = createTool<void, { hunted: string; success: boole
 	description:
 		"Finds and hunts nearby animals (cows, pigs, sheep, chickens) for food and materials.",
 	inputSchema: {} as any,
-	handler: async (bot: Bot): Promise<ToolResponse<{ hunted: string; success: boolean }>> => {
+	handler: async (agent: Agent): Promise<ToolResponse<{ hunted: string; success: boolean }>> => {
+		const { bot } = agent;
+
 		// 1. Target animals (passive mobs)
 		// 対象とする動物のリスト
 		const targetNames = ["cow", "pig", "sheep", "chicken", "rabbit"];
@@ -34,7 +36,7 @@ export const huntAnimalsTool = createTool<void, { hunted: string; success: boole
 			// 3. Approach and attack
 			// 動物に近づいて攻撃
 			const pos = target.position;
-			await bot.pathfinder.goto(new goals.GoalFollow(target, 1));
+			await agent.smartGoto(new goals.GoalFollow(target, 1));
 
 			// Attack the entity
 			// 攻撃実行
@@ -43,7 +45,7 @@ export const huntAnimalsTool = createTool<void, { hunted: string; success: boole
 			// 4. Wait a moment and collect drops (Reflex)
 			// ドロップアイテムを拾うために少し待機して移動（脊髄反射）
 			await new Promise((r) => setTimeout(r, 800));
-			await bot.pathfinder.goto(new goals.GoalNear(pos.x, pos.y, pos.z, 1));
+			await agent.smartGoto(new goals.GoalNear(pos.x, pos.y, pos.z, 1));
 
 			return toolResult.ok(`Successfully hunted a ${target.name}.`, {
 				hunted: target.name || "unknown",

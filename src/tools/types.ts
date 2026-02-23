@@ -1,4 +1,4 @@
-import type { Bot } from "mineflayer";
+import type { Agent } from "../core/agent";
 
 // スネークケース（_を含む）を禁止するためのユーティリティ型
 type NoSnakeCase<T> = {
@@ -22,7 +22,7 @@ export interface ToolDefinition<T, R = void> {
 	name: string;
 	description: string;
 	inputSchema: Record<keyof T, ToolField>;
-	handler: (bot: Bot, args: T) => Promise<ToolResponse<R>>;
+	handler: (agent: Agent, args: T) => Promise<ToolResponse<R>>;
 }
 
 export function createTool<T extends NoSnakeCase<T>, R = void>(

@@ -1,5 +1,5 @@
-import type { Bot } from "mineflayer";
 import { goals } from "mineflayer-pathfinder";
+import type { Agent } from "../../core/agent";
 import { createTool, type ToolResponse, toolResult } from "../types";
 
 // Dynamic require to avoid namespace issues
@@ -14,8 +14,10 @@ export const exploreUndergroundTool = createTool<void, { torchPlaced: boolean }>
 	name: "exploring.explore_underground",
 	description: "Navigates through caves or tunnels. Automatically places torches if it's too dark.",
 	inputSchema: {} as any,
-	handler: async (bot: Bot): Promise<ToolResponse<{ torchPlaced: boolean }>> => {
+	handler: async (agent: Agent): Promise<ToolResponse<{ torchPlaced: boolean }>> => {
 		let torchPlaced = false;
+
+		const { bot } = agent;
 
 		try {
 			// 1. Check light level and place torch if necessary
@@ -52,7 +54,7 @@ export const exploreUndergroundTool = createTool<void, { torchPlaced: boolean }>
 				const targetBlock = bot.blockAt(targetPos);
 
 				if (targetBlock && targetBlock.name === "air") {
-					await bot.pathfinder.goto(new goals.GoalNear(targetPos.x, targetPos.y, targetPos.z, 2));
+					await agent.smartGoto(new goals.GoalNear(targetPos.x, targetPos.y, targetPos.z, 2));
 					return toolResult.ok(`Moved deeper into the cave.`, { torchPlaced });
 				}
 			}

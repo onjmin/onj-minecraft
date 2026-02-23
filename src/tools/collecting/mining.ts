@@ -1,6 +1,7 @@
 import type { Bot } from "mineflayer";
 import { goals } from "mineflayer-pathfinder";
 import type { Vec3 } from "vec3";
+import type { Agent } from "../../core/agent";
 import { createTool, type ToolResponse, toolResult } from "../types";
 
 /**
@@ -12,9 +13,8 @@ export const mineOresTool = createTool<void, { minedCount: number }>({
 	description:
 		"Scans the nearby area for valuable ores and mines them autonomously. No coordinates required.",
 	inputSchema: {} as any,
-	handler: async (bot: Bot): Promise<ToolResponse<{ minedCount: number }>> => {
-		// Retrieve the bot instance from global scope
-		// グローバルスコープから bot インスタンスを取得
+	handler: async (agent: Agent): Promise<ToolResponse<{ minedCount: number }>> => {
+		const { bot } = agent;
 
 		// 1. Scan for nearby ores
 		// 周囲の鉱石をスキャン
@@ -35,7 +35,7 @@ export const mineOresTool = createTool<void, { minedCount: number }>({
 
 				// Navigate to the ore position
 				// 鉱石の座標まで移動
-				await bot.pathfinder.goto(new goals.GoalGetToBlock(pos.x, pos.y, pos.z));
+				await agent.smartGoto(new goals.GoalGetToBlock(pos.x, pos.y, pos.z));
 
 				const block = bot.blockAt(pos);
 				// Verify the block is still an ore before digging
