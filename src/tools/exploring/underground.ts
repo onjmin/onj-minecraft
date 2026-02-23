@@ -1,5 +1,5 @@
 import { goals } from "mineflayer-pathfinder";
-import type { Agent } from "../../core/agent";
+import type { AgentOrchestrator } from "../../core/agent";
 import { createTool, type ToolResponse, toolResult } from "../types";
 
 // Dynamic require to avoid namespace issues
@@ -14,7 +14,7 @@ export const exploreUndergroundTool = createTool<void, { torchPlaced: boolean }>
 	name: "exploring.explore_underground",
 	description: "Navigates through caves or tunnels. Automatically places torches if it's too dark.",
 	inputSchema: {} as any,
-	handler: async (agent: Agent): Promise<ToolResponse<{ torchPlaced: boolean }>> => {
+	handler: async (agent: AgentOrchestrator): Promise<ToolResponse<{ torchPlaced: boolean }>> => {
 		let torchPlaced = false;
 
 		const { bot } = agent;
@@ -53,19 +53,21 @@ export const exploreUndergroundTool = createTool<void, { torchPlaced: boolean }>
 				if (targetBlock && targetBlock.name === "air") {
 					const goal = new goals.GoalNear(targetPos.x, targetPos.y, targetPos.z, 2);
 
-					// Orchestrator側で bot.smartMove などを生やしている場合はそれを使う
-					if ((bot as any).smartMove) {
-						await (bot as any).smartMove(goal);
-					} else {
-						// 直接 pathfinder を呼ぶ（await を忘れずに）
-						await agent.smartGoto(goal);
-					}
+					agent.smartGoto(goal);
 
 					return toolResult.ok(
 						`Moved deeper into the cave at ${targetPos.x}, ${targetPos.y}, ${targetPos.z}`,
 						{ torchPlaced },
 					);
 				}
+			}
+
+			// 目的地が見つからない時のあがき：真下を1段掘って、少し下がる
+			console.log(`[${bot.username}] No cave found. Digging down...`);
+			const down = bot.blockAt(bot.entity.position.offset(0, -1, 0));
+			if (down && down.name !== "air" && down.name !== "bedrock") {
+				await bot.dig(down);
+				// 掘った後に少し待つ、または smartGoto で座標を更新
 			}
 
 			// 3. Fallback: もし周囲に空気ブロックが見つからない場合、少し下を掘るかランダム移動

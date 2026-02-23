@@ -1,4 +1,4 @@
-import { Agent } from "../core/agent";
+import { AgentOrchestrator } from "../core/agent";
 import { farmTendCropsTool } from "../tools/collecting/farming";
 import { fellTreesTool } from "../tools/collecting/felling";
 import { huntAnimalsTool } from "../tools/collecting/hunting";
@@ -35,7 +35,7 @@ const profiles = [
 const agents = profiles.map((p) => {
 	// Pass the tool list to the orchestrator
 	// オーケストレーターにツールリストを渡してインスタンス化
-	return new Agent(p, allTools);
+	return new AgentOrchestrator(p, allTools);
 });
 
 console.log(`Started ${agents.length} agents.`);

@@ -5,11 +5,35 @@ import { llm } from "./llm-client";
 
 const mcDataFactory = require("minecraft-data"); // ファクトリを読み込み
 
-export class Agent {
+type ObservationRecord = {
+	action: string;
+	rationale: string;
+	result: "Success" | "Fail";
+	message: string;
+};
+
+export class AgentOrchestrator {
 	public bot: mineflayer.Bot;
 	private profile: any;
 	private tools: Map<string, any>; // Store tools in a Map for easy lookup
 	private currentTaskName: string = "idle";
+
+	private observationHistory: ObservationRecord[] = [];
+	private maxHistory = 5; // 少し増やして5件程度保持
+
+	private pushHistory(record: ObservationRecord) {
+		this.observationHistory.push(record);
+		if (this.observationHistory.length > this.maxHistory) this.observationHistory.shift();
+	}
+
+	private getHistoryContext(): string {
+		return this.observationHistory
+			.map(
+				(h, i) =>
+					`Step ${i + 1}: Action[${h.action}] -> ${h.result}: ${h.message} (Why: ${h.rationale})`,
+			)
+			.join("\n");
+	}
 
 	constructor(profile: any, toolList: any[]) {
 		this.profile = profile;
@@ -108,6 +132,15 @@ export class Agent {
 					// 完了するまでしっかり await する（これが重要）
 					const result = await tool.handler(this, {});
 
+					// 2. 実行結果を履歴に保存 (ここで push)
+					// rationale は ThinkingLoop でセットされた latestRationale を使うと良いです
+					this.pushHistory({
+						action: this.currentTaskName,
+						rationale: (this as any).latestRationale || "Continuing task",
+						result: result.success ? "Success" : "Fail",
+						message: result.message,
+					});
+
 					if (!result.success) {
 						// 失敗（道がない等）した場合は少し長めに待機して負荷を避ける
 						await new Promise((r) => setTimeout(r, 2000));
@@ -138,15 +171,30 @@ export class Agent {
 	private async startThinkingLoop() {
 		while (this.bot) {
 			const toolNames = Array.from(this.tools.keys()).join(", ");
+			const historyText = this.getHistoryContext();
 
-			const systemPrompt = `You are ${this.profile.name}, with personality: ${this.profile.personality}.
-Current Status: HP:${this.bot.health}, Food:${this.bot.food}.
-Available Tools: [${toolNames}].
+			const systemPrompt = `You are ${this.profile.name}.
+## PERSONALITY
+${this.profile.personality}
 
-Task: Decide your next autonomous goal.
-Return your decision in this format:
-Rationale: (Reason for choosing this action)
-Tool: (The exact name of the tool to use)`;
+## CURRENT STATUS
+- HP: ${this.bot.health}
+- Food: ${this.bot.food}
+- Current Pos: ${this.bot.entity.position.floored()}
+
+## PAST OBSERVATIONS (Your memory)
+${historyText}
+
+## AVAILABLE TOOLS
+[${toolNames}]
+
+## TASK
+1. Review the "PAST OBSERVATIONS". If a tool failed repeatedly, DO NOT try the same parameters.
+2. Decide the next tool. If the DoD gap remains, try a different approach.
+
+## OUTPUT FORMAT
+Rationale: (Briefly explain your logic based on history)
+Tool: (The exact name of the tool)`;
 
 			try {
 				// completeAsJson ではなく通常の complete を使い、自前でパースする

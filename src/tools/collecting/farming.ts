@@ -1,7 +1,7 @@
 import type { Bot } from "mineflayer";
 import { goals } from "mineflayer-pathfinder";
 import type { Vec3 } from "vec3";
-import type { Agent } from "../../core/agent";
+import type { AgentOrchestrator } from "../../core/agent";
 import { createTool, type ToolResponse, toolResult } from "../types";
 
 /**
@@ -13,7 +13,7 @@ export const farmTendCropsTool = createTool<void, { harvestedCount: number }>({
 	description:
 		"Automatically harvests fully grown crops and replants seeds in the vicinity. Decisions are made autonomously.",
 	inputSchema: {} as any,
-	handler: async (agent: Agent): Promise<ToolResponse<{ harvestedCount: number }>> => {
+	handler: async (agent: AgentOrchestrator): Promise<ToolResponse<{ harvestedCount: number }>> => {
 		const { bot } = agent;
 		// 1. Scan for harvestable crops (metadata 7)
 		// 収穫可能な成熟した作物（メタデータ7）をスキャン

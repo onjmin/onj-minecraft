@@ -1,5 +1,5 @@
 import { goals } from "mineflayer-pathfinder";
-import type { Agent } from "../../core/agent";
+import type { AgentOrchestrator } from "../../core/agent";
 import { createTool, type ToolResponse, toolResult } from "../types";
 
 /**
@@ -11,7 +11,9 @@ export const huntAnimalsTool = createTool<void, { hunted: string; success: boole
 	description:
 		"Finds and hunts nearby animals (cows, pigs, sheep, chickens) for food and materials.",
 	inputSchema: {} as any,
-	handler: async (agent: Agent): Promise<ToolResponse<{ hunted: string; success: boolean }>> => {
+	handler: async (
+		agent: AgentOrchestrator,
+	): Promise<ToolResponse<{ hunted: string; success: boolean }>> => {
 		const { bot } = agent;
 
 		// 1. Target animals (passive mobs)

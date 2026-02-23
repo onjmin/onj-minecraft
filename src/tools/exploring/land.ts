@@ -1,5 +1,5 @@
 import { goals } from "mineflayer-pathfinder";
-import type { Agent } from "../../core/agent";
+import type { AgentOrchestrator } from "../../core/agent";
 import { createTool, type ToolResponse, toolResult } from "../types";
 
 /**
@@ -11,7 +11,7 @@ export const exploreLandTool = createTool<void, { x: number; z: number }>({
 	description:
 		"Explores the surface to find villages, animals, or structures. Best used in daylight.",
 	inputSchema: {} as any,
-	handler: async (agent: Agent): Promise<ToolResponse<{ x: number; z: number }>> => {
+	handler: async (agent: AgentOrchestrator): Promise<ToolResponse<{ x: number; z: number }>> => {
 		const { bot } = agent;
 
 		// 1. Randomly pick a distant surface location

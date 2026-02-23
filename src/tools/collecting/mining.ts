@@ -1,7 +1,7 @@
 import type { Bot } from "mineflayer";
 import { goals } from "mineflayer-pathfinder";
 import type { Vec3 } from "vec3";
-import type { Agent } from "../../core/agent";
+import type { AgentOrchestrator } from "../../core/agent";
 import { createTool, type ToolResponse, toolResult } from "../types";
 
 /**
@@ -13,7 +13,7 @@ export const mineOresTool = createTool<void, { minedCount: number }>({
 	description:
 		"Scans the nearby area for valuable ores and mines them autonomously. No coordinates required.",
 	inputSchema: {} as any,
-	handler: async (agent: Agent): Promise<ToolResponse<{ minedCount: number }>> => {
+	handler: async (agent: AgentOrchestrator): Promise<ToolResponse<{ minedCount: number }>> => {
 		const { bot } = agent;
 
 		// 1. Scan for nearby ores

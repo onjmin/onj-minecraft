@@ -1,5 +1,5 @@
 import { goals } from "mineflayer-pathfinder";
-import type { Agent } from "../../core/agent";
+import type { AgentOrchestrator } from "../../core/agent";
 import { createTool, type ToolResponse, toolResult } from "../types";
 
 const Vec3 = require("vec3");
@@ -12,7 +12,7 @@ export const exploreSeaTool = createTool<void, { usedBoat: boolean }>({
 	name: "exploring.explore_sea",
 	description: "Explores the ocean. Automatically attempts to use a boat for efficient travel.",
 	inputSchema: {} as any,
-	handler: async (agent: Agent): Promise<ToolResponse<{ usedBoat: boolean }>> => {
+	handler: async (agent: AgentOrchestrator): Promise<ToolResponse<{ usedBoat: boolean }>> => {
 		let usedBoat = false;
 
 		const { bot } = agent;
