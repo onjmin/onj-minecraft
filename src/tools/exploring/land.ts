@@ -28,11 +28,13 @@ export const exploreLandTool = createTool<void, { x: number; z: number }>({
 
 			return toolResult.ok("Moving to new area...", { x, z });
 		} catch {
-			// 失敗した場合はランダムに少しジャンプしたりして「詰まり」を解消する脊髄反射
+			// 詰まった(stuck)時のためのリカバリ：とりあえずジャンプして前に進んでみる
 			bot.setControlState("jump", true);
+			bot.setControlState("forward", true);
 			await new Promise((r) => setTimeout(r, 500));
-			bot.setControlState("jump", false);
-			return toolResult.fail("Path not found, trying again.");
+			bot.clearControlStates();
+
+			return toolResult.fail("Stuck or No path, force jumped.");
 		}
 	},
 });

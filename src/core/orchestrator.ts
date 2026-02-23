@@ -66,9 +66,9 @@ export class AgentOrchestrator {
 			this.bot.pathfinder.thinkTimeout = 5000; // 計算を5秒で打ち切る
 			this.bot.pathfinder.tickTimeout = 20; // 1回あたりの占有時間を短くして、他ボットに処理を回す
 
-			// 3. このボット専用の移動設定を行う
-			movements.canDig = true;
-			movements.allow1by1towers = true;
+			movements.canDig = true; // ブロックを掘って進む
+			movements.allow1by1towers = true; // 足元に置いて登る
+			movements.allowParkour = true; // 1ブロックの隙間を飛び越える
 
 			const dirt = mcData.blocksByName.dirt;
 			if (dirt) {
@@ -164,6 +164,27 @@ Tool: (The exact name of the tool to use)`;
 					// 2. Tool 名の抽出（正規表現とフォールバック）
 					const toolLineMatch = rawContent.match(/Tool:\s*([a-zA-Z0-9._-]+)/i);
 					let foundToolName = toolLineMatch ? toolLineMatch[1].trim() : null;
+
+					if (foundToolName) {
+						// LLMが返してきた名前を正規化（例: explore_underground -> exploreUnderground）
+						const normalizedName = foundToolName.replace(/_([a-z])/g, (g) => g[1].toUpperCase());
+
+						// 登録名そのまま、または正規化した名前でヒットするか確認
+						const finalToolName = this.tools.has(foundToolName)
+							? foundToolName
+							: this.tools.has(normalizedName)
+								? normalizedName
+								: null;
+
+						if (finalToolName) {
+							if (this.currentTaskName !== finalToolName) {
+								console.log(
+									`[${this.profile.name}] Task Switched: ${this.currentTaskName} -> ${finalToolName}`,
+								);
+								this.currentTaskName = finalToolName;
+							}
+						}
+					}
 
 					// 登録済みツール名との照合
 					const registeredNames = Array.from(this.tools.keys());
