@@ -372,7 +372,7 @@ Tool: (The exact name of the tool)`;
 						);
 					}
 
-					const translatedText = translateWithRoleplay(rationale, this.profile);
+					const translatedText = await translateWithRoleplay(rationale, this.profile);
 
 					// Discordへ通知 (タスク変更時、または定期生存報告として)
 					// rationale と foundToolName を渡して、Discord側でリッチな表示にする
