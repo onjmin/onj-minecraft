@@ -1,0 +1,40 @@
+{
+  // 保存時に整形
+  "editor.formatOnSave": true,
+
+  // Biome を formatter として強制
+  "[typescript]": {
+    "editor.defaultFormatter": "biomejs.biome"
+  },
+  "[typescriptreact]": {
+    "editor.defaultFormatter": "biomejs.biome"
+  },
+  "[javascript]": {
+    "editor.defaultFormatter": "biomejs.biome"
+  },
+  "[javascriptreact]": {
+    "editor.defaultFormatter": "biomejs.biome"
+  },
+
+  // JSON/YAMLは標準
+  "[json]": {
+    "editor.defaultFormatter": "vscode.json-language-features"
+  },
+  "[yaml]": {
+    "editor.defaultFormatter": "redhat.vscode-yaml"
+  },
+
+  // ★ Biomeに任せる（neverにしない）
+  "editor.codeActionsOnSave": {
+    "source.organizeImports.biome": "explicit",
+    "source.fixAll.biome": "explicit"
+  },
+
+  // Svelte使用時のみ
+  "svelte.enable-ts-plugin": true,
+
+  "files.associations": {
+    "*.css": "tailwindcss",
+    "*.scss": "tailwindcss"
+  }
+}

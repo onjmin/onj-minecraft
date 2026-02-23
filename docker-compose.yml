@@ -1,0 +1,43 @@
+services:
+  onj-minecraft:
+    build: .
+    # アフガキ環境（8Bモデル並列）でメモリ食い潰しを防ぐ
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 2G
+    restart: always # 8Bがアホ言って死んでも即復帰させる
+    network_mode: "host" # ローカルネットワーク(192.168.x.x)のLLM/MCサーバーと通信するならこれが一番確実
+    env_file: .env # .envの変数を一括でコンテナに注入
+    environment:
+      - SETTINGS_JSON={"auto_open_ui":false}
+      - DISPLAY=:99
+    volumes:
+      - .:/app # 開発時はコード変更を即反映
+      - /app/node_modules # ただし node_modules はコンテナ内のものを使う
+      - ./settings.js:/app/settings.js:ro
+      - ./keys.json:/app/keys.json:ro
+      - ./profiles:/app/profiles
+      - ./bots:/app/bots
+      - ./.env:/app/.env # dotenv読み込み用
+    ports:
+      - "3000-3003:3000-3003"
+      - "8080:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # 複数起動する場合のログ混線防止
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # viaproxy はそのまま（必要時のみ起動）
+  viaproxy:
+    image: ghcr.io/viaversion/viaproxy:latest
+    profiles: ["viaproxy"]
+    volumes:
+      - ./services/viaproxy:/app/run
+    ports:
+      - "25568:25568"
