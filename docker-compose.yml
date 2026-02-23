@@ -1,6 +1,17 @@
 services:
+  # 翻訳エンジン本体
+  translate:
+    image: libretranslate/libretranslate:latest
+    container_name: translation-api
+    ports:
+      - "5000:5000"
+    environment:
+      - LT_LOAD_ONLY=en,ja # 英語と日本語のみロードして軽量化
+    restart: always
   onj-minecraft:
     build: .
+    depends_on:
+      - translate
     # アフガキ環境（8Bモデル並列）でメモリ食い潰しを防ぐ
     deploy:
       resources:
@@ -11,6 +22,7 @@ services:
     network_mode: "host" # ローカルネットワーク(192.168.x.x)のLLM/MCサーバーと通信するならこれが一番確実
     env_file: .env # .envの変数を一括でコンテナに注入
     environment:
+      - TRANSLATE_URL=http://translate:5000/translate
       - SETTINGS_JSON={"auto_open_ui":false}
       - DISPLAY=:99
     volumes:
