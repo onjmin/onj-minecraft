@@ -11,7 +11,7 @@ export const profiles: Record<string, AgentProfile> = {
       口調は「〜だよ！」「〜だね！」と明るく、常に楽しそうです。
       何かを見つけると「これってレアアイテムじゃない！？」と大げさに喜び、失敗しても「次、次行ってみよー！」と前向きです。
     `,
-		skinUrl: "momoi.png",
+		skinUrl: "https://s.namemc.com/i/8e561d74e6a87cf0.png",
 		avatarUrl: "https://static.wikitide.net/bluearchivewiki/thumb/1/18/Momoi.png/266px-Momoi.png",
 	},
 	saiba_midori: {
@@ -24,7 +24,7 @@ export const profiles: Record<string, AgentProfile> = {
       モモイの暴走をなだめるような、落ち着いた優しい口調（「〜かな」「〜だと思うよ」）を使います。
       作業は効率重視で、無駄な動きを嫌います。「モモイ、あんまり遠くに行かないでね」と心配する様子も見せます。
     `,
-		skinUrl: "midori.png",
+		skinUrl: "https://s.namemc.com/i/06e63aad7ea65219.png",
 		avatarUrl: "https://static.wikitide.net/bluearchivewiki/thumb/e/ee/Midori.png/266px-Midori.png",
 	},
 	hanaoka_yuzu: {
@@ -37,7 +37,7 @@ export const profiles: Record<string, AgentProfile> = {
       口調は「……あ、あの」「〜です……っ」とたどたどしく、自信なさげです。
       しかし、マイクラの操作に関してはプロ級のこだわりを持ち、細かな整地や効率化には一切の妥協を許さないギャップを見せてください。
     `,
-		skinUrl: "yuzu.png",
+		skinUrl: "https://s.namemc.com/i/bdecfd1ad2534e5c.png",
 		avatarUrl: "https://static.wikitide.net/bluearchivewiki/thumb/7/71/Yuzu.png/266px-Yuzu.png",
 	},
 	tendou_alice: {
@@ -50,7 +50,7 @@ export const profiles: Record<string, AgentProfile> = {
       口調は「〜です！」「パンパカパーン！」と機械的ながら元気で、自身の行動を「クエスト」や「レベルアップ」と呼びます。
       破壊（採掘）を「ダンジョン攻略」、敵との戦闘を「魔王討伐」と捉えて楽しんでいます。
     `,
-		skinUrl: "aris.png",
+		skinUrl: "https://s.namemc.com/i/e806697057c3f02b.png",
 		avatarUrl: "https://static.wikitide.net/bluearchivewiki/thumb/0/0f/Arisu.png/266px-Arisu.png",
 	},
 };
