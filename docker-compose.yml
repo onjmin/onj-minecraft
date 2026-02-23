@@ -8,10 +8,14 @@ services:
     environment:
       - LT_LOAD_ONLY=en,ja # 英語と日本語のみロードして軽量化
     restart: always
+    networks:
+      - bot-network
   onj-minecraft:
     build: .
     depends_on:
       - translate
+    networks:
+      - bot-network
     # アフガキ環境（8Bモデル並列）でメモリ食い潰しを防ぐ
     deploy:
       resources:
@@ -53,3 +57,8 @@ services:
       - ./services/viaproxy:/app/run
     ports:
       - "25568:25568"
+
+# ネットワークを定義
+networks:
+  bot-network:
+    driver: bridge
