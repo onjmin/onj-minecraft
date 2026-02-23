@@ -1,5 +1,6 @@
 import mineflayer from "mineflayer";
 import { Movements, pathfinder } from "mineflayer-pathfinder";
+import { emitDiscordWebhook } from "./discord-webhook";
 import { llm } from "./llm-client";
 
 const mcDataFactory = require("minecraft-data"); // ファクトリを読み込み
@@ -131,6 +132,14 @@ Tool: (The exact name of the tool to use)`;
 							`[${this.profile.name}] Failed to extract a valid tool from: ${rawContent}`,
 						);
 					}
+
+					// Discordへ通知 (タスク変更時、または定期生存報告として)
+					// rationale と foundToolName を渡して、Discord側でリッチな表示にする
+					await emitDiscordWebhook({
+						username: this.profile.name,
+						content: `**Action:** \`${foundToolName}\`\n**Thought:** ${rationale}`,
+						avatar_url: `https://minotar.net/avatar/${this.profile.name}.png`, // スキンを表示
+					});
 				}
 			} catch (err) {
 				console.error(`[${this.profile.name}] Thinking error:`, err);
