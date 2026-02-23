@@ -334,6 +334,10 @@ Tool: (exact name)`;
 
 					// 2. Chat内容の高度なクリーンアップ
 					if (chatMessage) {
+						// 【重要】もしChatの中に Tool: や Rationale: が混入していたら、その手前で切る
+						// これにより "Hello! Tool: mining" -> "Hello!" となる
+						chatMessage = chatMessage.split(/(?:Tool|Rationale):/i)[0].trim();
+
 						// 複数行返ってきた場合は、最初の1行目だけを対象にする（Tool:などが混入するのを防ぐ）
 						chatMessage = chatMessage.split("\n")[0].trim();
 
