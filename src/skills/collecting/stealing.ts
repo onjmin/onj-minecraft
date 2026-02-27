@@ -114,9 +114,11 @@ export const stealFromChestSkill = createSkill<void, { itemsCount: number; conta
 					containerType: containerBlock.name,
 				});
 			} catch (err) {
-				return skillResult.fail(
-					`Stealing failed: ${err instanceof Error ? err.message : String(err)}`,
-				);
+				const errorMsg = err instanceof Error ? err.message : String(err);
+				if (errorMsg.includes("Cancelled") || errorMsg.includes("stop")) {
+					return skillResult.fail("Stealing cancelled by combat");
+				}
+				return skillResult.fail(`Stealing failed: ${errorMsg}`);
 			}
 		},
 	},

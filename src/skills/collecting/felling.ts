@@ -1,5 +1,4 @@
 import type { Bot } from "mineflayer";
-import { goals } from "mineflayer-pathfinder";
 import type { Vec3 } from "vec3";
 import type { AgentOrchestrator } from "../../core/agent";
 import { createSkill, type SkillResponse, skillResult } from "../types";
@@ -7,7 +6,7 @@ import { createSkill, type SkillResponse, skillResult } from "../types";
 export const fellTreesSkill = createSkill<void, { count: number }>({
 	name: "collecting.felling",
 	description:
-		"Automatically finds and fells nearby trees by moving next to them and digging safely.",
+		"Automatically finds and fells nearby trees using collectBlock plugin. The bot will move to trees and harvest them automatically.",
 	inputSchema: {} as any,
 	handler: async (agent: AgentOrchestrator): Promise<SkillResponse<{ count: number }>> => {
 		const { bot } = agent;
@@ -15,55 +14,35 @@ export const fellTreesSkill = createSkill<void, { count: number }>({
 
 		if (logs.length === 0) return skillResult.fail("No trees found nearby.");
 
-		let felledCount = 0;
-
 		try {
-			// 最も近い対数（ログ）を選択
 			const target = logs[0];
-			const axe = bot.inventory
-				.items()
-				.find((item) => item.name.includes("axe") && !item.name.includes("pickaxe"));
-			if (axe) await bot.equip(axe, "hand");
+			const collectBot = bot as any;
 
-			// --- 改善ポイント 1: GoalGetToBlock ではなく GoalLookAtBlock を使用 ---
-			// ブロックそのものに入るのではなく、隣接した位置で停止するように距離を 3 に設定
-			await agent.smartGoto(new goals.GoalLookAtBlock(target, bot.world, { reach: 3 }));
-
-			// --- 改善ポイント 2: 垂直方向の全スキャン ---
-			// その X, Z 座標に重なっている原木をすべて特定し、高い方から順に掘る
-			const columnLogs: Vec3[] = [];
-			for (let i = 0; i < 6; i++) {
-				// 一般的な木は 5-6 ブロック
-				const pos = target.offset(0, i, 0);
-				const b = bot.blockAt(pos);
-				if (b && isLog(b.name)) columnLogs.push(pos);
-				else if (i > 0) break; // 途切れたら終了（地面より下は見ない）
+			if (!collectBot.collectBlock) {
+				return skillResult.fail("collectBlock plugin not loaded");
 			}
 
-			// 高い位置から掘ることで、自分が原木の上に乗り上げて身動きが取れなくなるのを防ぐ
-			for (const logPos of columnLogs.reverse()) {
-				const block = bot.blockAt(logPos);
-				if (block && bot.canDigBlock(block)) {
-					await bot.dig(block);
-					felledCount++;
-				}
-			}
+			const result = await collectBot.collectBlock.collect(target, {
+				ignoreNoPath: true,
+				enableAutoTool: true,
+			});
+
+			const felledCount = result.length;
 
 			return skillResult.ok(
 				`Successfully felled ${felledCount} blocks at ${target.x}, ${target.z}.`,
-				{
-					count: felledCount,
-				},
+				{ count: felledCount },
 			);
 		} catch (err) {
-			return skillResult.fail(
-				`Felling failed: ${err instanceof Error ? err.message : String(err)}`,
-			);
+			const errorMsg = err instanceof Error ? err.message : String(err);
+			if (errorMsg.includes("Cancelled") || errorMsg.includes("stop")) {
+				return skillResult.fail("Felling cancelled by combat");
+			}
+			return skillResult.fail(`Felling failed: ${errorMsg}`);
 		}
 	},
 });
 
-// ヘルパー: ブロック名判定
 function isLog(name: string): boolean {
 	return (
 		name.endsWith("_log") ||
@@ -82,7 +61,6 @@ export const fellingScanner = {
 				count: 10,
 			})
 			.sort((a, b) => {
-				// 距離順にソートして最も近いものを最初に持ってくる
 				return bot.entity.position.distanceTo(a) - bot.entity.position.distanceTo(b);
 			});
 	},

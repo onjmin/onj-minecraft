@@ -71,10 +71,12 @@ export const huntAnimalsSkill = createSkill<void, { hunted: string; success: boo
 				ate: ate,
 				success: true,
 			});
-		} catch (err) {
-			return skillResult.fail(
-				`Hunting failed: ${err instanceof Error ? err.message : String(err)}`,
-			);
+	} catch (err) {
+		const errorMsg = err instanceof Error ? err.message : String(err);
+		if (errorMsg.includes("Cancelled") || errorMsg.includes("stop")) {
+			return skillResult.fail("Hunting cancelled by combat");
 		}
+		return skillResult.fail(`Hunting failed: ${errorMsg}`);
+	}
 	},
 });

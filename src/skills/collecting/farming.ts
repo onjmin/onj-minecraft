@@ -77,11 +77,13 @@ export const farmTendCropsSkill = createSkill<void, { harvestedCount: number }>(
 				harvestedCount,
 				ate,
 			});
-		} catch (err) {
-			return skillResult.fail(
-				`Farming operation interrupted: ${err instanceof Error ? err.message : String(err)}`,
-			);
+	} catch (err) {
+		const errorMsg = err instanceof Error ? err.message : String(err);
+		if (errorMsg.includes("Cancelled") || errorMsg.includes("stop")) {
+			return skillResult.fail("Farming cancelled by combat");
 		}
+		return skillResult.fail(`Farming failed: ${errorMsg}`);
+	}
 	},
 });
 

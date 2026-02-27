@@ -1,72 +1,52 @@
 import type { Bot } from "mineflayer";
-import { goals } from "mineflayer-pathfinder";
 import type { Vec3 } from "vec3";
 import type { AgentOrchestrator } from "../../core/agent";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
-/**
- * Mining Domain: Autonomous ore extraction.
- * 採掘ドメイン：周囲の鉱石を自動的にスキャンして採掘します。
- */
 export const mineOresSkill = createSkill<void, { minedCount: number }>({
 	name: "collecting.mining",
 	description:
-		"Scans for and mines nearby ores. IMPORTANT: You MUST have a pickaxe equipped or in your inventory. " +
-		"Mining with bare hands is extremely inefficient, takes too long, and results in NO item drops for most ores. " +
-		"If you lack a pickaxe, craft one first instead of using this skill.",
+		"Scans for and mines nearby ores using collectBlock plugin. The bot will automatically select the best tool and mine ores. If you lack a pickaxe, craft one first.",
 	inputSchema: {} as any,
 	handler: async (agent: AgentOrchestrator): Promise<SkillResponse<{ minedCount: number }>> => {
 		const { bot } = agent;
 
-		// 1. Scan for nearby ores
-		// 周囲の鉱石をスキャン
 		const orePositions = miningScanner.findNearbyOres(bot);
 
 		if (orePositions.length === 0) {
 			return skillResult.fail("No valuable ores found nearby. Try moving to a different location.");
 		}
 
-		let minedCount = 0;
-
 		try {
-			for (const pos of orePositions) {
-				// Ensure we have an appropriate skill equipped (if possible)
-				// 適切なツール（ツルハシ等）を装備（簡易実装）
-				const pickaxe = bot.inventory.items().find((item) => item.name.includes("pickaxe"));
-				if (pickaxe) await bot.equip(pickaxe, "hand");
+			const target = orePositions[0];
+			const collectBot = bot as any;
 
-				// Navigate to the ore position
-				// 鉱石の座標まで移動
-				await agent.smartGoto(new goals.GoalGetToBlock(pos.x, pos.y, pos.z));
-
-				const block = bot.blockAt(pos);
-				// Verify the block is still an ore before digging
-				// 掘る前に、そのブロックがまだ鉱石であることを再確認
-				if (block && (block.name.includes("ore") || block.name.includes("raw"))) {
-					await bot.dig(block);
-					minedCount++;
-				}
+			if (!collectBot.collectBlock) {
+				return skillResult.fail("collectBlock plugin not loaded");
 			}
+
+			const result = await collectBot.collectBlock.collect(target, {
+				ignoreNoPath: true,
+				enableAutoTool: true,
+			});
+
+			const minedCount = result.length;
 
 			return skillResult.ok(`Successfully extracted ${minedCount} ore blocks from the area.`, {
 				minedCount,
 			});
 		} catch (err) {
-			return skillResult.fail(
-				`Mining process failed: ${err instanceof Error ? err.message : String(err)}`,
-			);
+			const errorMsg = err instanceof Error ? err.message : String(err);
+			if (errorMsg.includes("Cancelled") || errorMsg.includes("stop")) {
+				return skillResult.fail("Mining cancelled by combat");
+			}
+			return skillResult.fail(`Mining failed: ${errorMsg}`);
 		}
 	},
 });
 
-/**
- * Scanner for identifying valuable blocks
- * 価値のあるブロックを特定するためのスキャナー
- */
 export const miningScanner = {
 	findNearbyOres: (bot: Bot, radius = 16): Vec3[] => {
-		// List of target ores including deepslate variants
-		// 深層岩バリアントを含む対象鉱石のリスト
 		const targetOres = [
 			"coal_ore",
 			"iron_ore",

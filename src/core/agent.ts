@@ -1,5 +1,6 @@
 import mineflayer from "mineflayer";
 import { type goals, Movements, pathfinder } from "mineflayer-pathfinder";
+import { BotStateMachine } from "mineflayer-statemachine";
 import { Vec3 } from "vec3";
 import type { AgentProfile } from "../profiles/types";
 import { emitDiscordWebhook, translateWithRoleplay } from "./discord-webhook";
@@ -28,11 +29,15 @@ export class AgentOrchestrator {
 	private observationHistory: ObservationRecord[] = [];
 	private maxHistory = 5;
 	private lastDamageCause: string = "None";
-	private hasSetSkin: boolean = false; // スキン設定済みフラグ
+	private hasSetSkin: boolean = false;
 	private latestRationale: string = "";
+	private isInCombat: boolean = false;
+	private currentSkillPromise: Promise<void> | null = null;
+	private shouldStopSkill: boolean = false;
+	private combatTarget: any = null;
 
 	private chatHistory: ChatLog[] = [];
-	private maxChatHistory = 10; // 過去10件保持
+	private maxChatHistory = 10;
 
 	constructor(profile: AgentProfile, skillList: any[]) {
 		this.profile = profile;
@@ -52,11 +57,27 @@ export class AgentOrchestrator {
 		this.bot.loadPlugin(require("mineflayer-auto-eat"));
 		this.bot.loadPlugin(require("mineflayer-armor-manager"));
 		this.bot.loadPlugin(require("mineflayer-pvp"));
+		this.bot.loadPlugin(require("mineflayer-collectblock"));
+		this.bot.loadPlugin(require("mineflayer-tool"));
 
 		// 初期設定（一回だけ）
 		(this.bot as any).autoEat.options.priority = "foodPoints";
 		(this.bot as any).autoEat.options.bannedFood = ["rotten_flesh", "pufferfish"];
-		// armor-manager は装備を拾う or ダメージを受けると自動で最強装備に着替えるため、手動コード不要
+
+		// collectBlock設定
+		(this.bot as any).collectBlock.setInventoryFilter((item: any) => {
+			return item.name.includes("axe") || item.name.includes("pickaxe");
+		});
+
+		// tool設定 - 最適なツールを自動選択
+		(this.bot as any).tool.setPrimaryHand();
+
+		// PvP設定 - 敵を自動的に攻撃
+		(this.bot as any).pvp?.setOptions({
+			attackRange: 4,
+			enemyBlacklist: [],
+			halfSpeed: false,
+		});
 
 		// イベント登録
 		this.initEvents();
@@ -178,13 +199,70 @@ export class AgentOrchestrator {
 		if (entity === this.bot.entity) {
 			const attacker = this.bot.nearestEntity(
 				(e) =>
-					(e.type === "mob" || e.type === "player") &&
-					e.position.distanceTo(this.bot.entity.position) < 5,
+					(e.type === "mob" || e.type === "hostile" || e.type === "player") &&
+					e.position.distanceTo(this.bot.entity.position) < 16,
 			);
 			this.lastDamageCause = attacker
 				? `Attacked by ${attacker.name || attacker.type}`
 				: "Taken damage from unknown source";
+
+			if (attacker && (attacker.type === "mob" || attacker.type === "hostile" || attacker.type === "player")) {
+				this.enterCombat(attacker);
+			}
 		}
+	}
+
+	private enterCombat(target: any) {
+		if (this.isInCombat) return;
+
+		console.log(`[${this.profile.minecraftName}] Combat detected! Target: ${target.name || target.type}`);
+		this.isInCombat = true;
+		this.combatTarget = target;
+		this.shouldStopSkill = true;
+
+		if (this.currentSkillPromise) {
+			this.cancelAllTasks();
+		}
+
+		this.startPvp(target);
+	}
+
+	private exitCombat() {
+		if (!this.isInCombat) return;
+
+		console.log(`[${this.profile.minecraftName}] Combat ended. Returning to skill mode.`);
+		this.isInCombat = false;
+		this.combatTarget = null;
+
+		(this.bot as any).pvp?.stop();
+		this.bot.clearControlStates();
+	}
+
+	private startPvp(target: any) {
+		const pvpBot = this.bot as any;
+		if (pvpBot.pvp) {
+			pvpBot.pvp.attack(target);
+		}
+	}
+
+	public cancelAllTasks() {
+		console.log(`[${this.profile.minecraftName}] Cancelling all tasks...`);
+
+		this.shouldStopSkill = true;
+
+		try {
+			this.bot.pathfinder.stop();
+		} catch (e) {}
+
+		try {
+			(this.bot as any).collectBlock.stop();
+		} catch (e) {}
+
+		try {
+			(this.bot as any).pvp?.stop();
+		} catch (e) {}
+
+		this.bot.clearControlStates();
 	}
 
 	private handleEnvironmentCheck() {
@@ -228,6 +306,18 @@ export class AgentOrchestrator {
 		await new Promise((r) => setTimeout(r, Math.random() * 2000));
 
 		while (this.bot && this.bot.entity) {
+			if (this.isInCombat) {
+				await this.checkCombatStatus();
+				await new Promise((r) => setTimeout(r, 500));
+				continue;
+			}
+
+			if (this.shouldStopSkill) {
+				this.shouldStopSkill = false;
+				await new Promise((r) => setTimeout(r, 100));
+				continue;
+			}
+
 			const skill = this.skills.get(this.currentTaskName);
 			if (skill) {
 				try {
@@ -248,8 +338,31 @@ export class AgentOrchestrator {
 				this.currentTaskName = "exploring.exploreLand";
 			}
 
-			// 次の行動までも少しランダム性を入れる
 			await new Promise((r) => setTimeout(r, 1000 + Math.random() * 500));
+		}
+	}
+
+	private async checkCombatStatus() {
+		const pvpBot = this.bot as any;
+
+		if (pvpBot.pvp?.target) {
+			this.isInCombat = true;
+			return;
+		}
+
+		const nearbyHostiles = Object.values(this.bot.entities).filter(
+			(e) =>
+				(e.type === "mob" || e.type === "hostile") &&
+				e.position.distanceTo(this.bot.entity.position) < 16,
+		);
+
+		if (nearbyHostiles.length > 0) {
+			this.enterCombat(nearbyHostiles[0]);
+			return;
+		}
+
+		if (this.isInCombat) {
+			this.exitCombat();
 		}
 	}
 
