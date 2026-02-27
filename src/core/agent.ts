@@ -1,12 +1,11 @@
 import mineflayer from "mineflayer";
 import { type goals, Movements, pathfinder } from "mineflayer-pathfinder";
+import { Vec3 } from "vec3";
 import type { AgentProfile } from "../profiles/types";
 import { emitDiscordWebhook, translateWithRoleplay } from "./discord-webhook";
 import { llm } from "./llm-client";
 
 let lastDiscordEmitAt = 0;
-
-const mcDataFactory = require("minecraft-data");
 
 type ObservationRecord = {
 	action: string;
@@ -442,75 +441,60 @@ Tool: (exact name)`;
 	private isMoving: boolean = false;
 
 	/**
-	 * A* (pathfinder.goto) を実行し、失敗した場合は物理的な強制移動（フォールバック）を行います。
+	 * 強化版 smartGoto: パスファインディングと動的な物理リカバリを組み合わせます。
 	 */
 	public async smartGoto(goal: goals.Goal): Promise<void> {
-		// 1. 同時実行の防止
 		if (this.isMoving) {
-			this.bot.pathfinder.setGoal(null);
 			this.bot.pathfinder.stop();
-			// 少し待って前の Promise が reject 処理を終えるのを待つ
 			await new Promise((r) => setTimeout(r, 100));
 		}
 
 		this.isMoving = true;
+		const maxRetries = 2; // パスが見つからない場合の再試行回数
 
 		try {
-			await Promise.race([
-				this.bot.pathfinder.goto(goal),
-				new Promise((_, reject) =>
-					setTimeout(() => reject(new Error("Pathfinding timeout")), 12000),
-				),
-			]);
-		} catch (err) {
-			this.bot.pathfinder.setGoal(null);
-			this.bot.pathfinder.stop();
+			for (let i = 0; i <= maxRetries; i++) {
+				try {
+					// 1. 通常のパスファインディング実行
+					await Promise.race([
+						this.bot.pathfinder.goto(goal),
+						new Promise((_, reject) =>
+							setTimeout(() => reject(new Error("Pathfinding timeout")), 15000),
+						),
+					]);
+					return; // 成功すれば終了
+				} catch (err) {
+					if (err instanceof Error && err.name === "GoalChanged") return;
 
-			// GoalChanged は「新しい移動が始まった」ことによる中断なので、
-			// ここで fallback を動かすと、新しい移動（新しい smartGoto）と物理操作が競合します。
-			if (err instanceof Error && err.name === "GoalChanged") {
-				console.log(`[${this.profile.minecraftName}] Pathfinding interrupted by a new goal.`);
-				this.isMoving = false; // フラグを戻して終了
-				return;
+					// 2. 失敗時のリカバリ：少し後ろに下がってからジャンプ
+					// 詰まっている可能性が高いため、一度リセットをかける
+					console.log(
+						`[${this.profile.minecraftName}] Path stuck. Attempting recovery step ${i + 1}...`,
+					);
+
+					this.bot.clearControlStates();
+					// 少し後ろに下がる（空間を作る）
+					this.bot.setControlState("back", true);
+					await new Promise((r) => setTimeout(r, 500));
+					this.bot.setControlState("back", false);
+
+					// ターゲットの方向を向いてジャンプ
+					const target = goal as any;
+					if (target.x !== undefined) {
+						await this.bot.lookAt(new Vec3(target.x, this.bot.entity.position.y, target.z));
+						this.bot.setControlState("jump", true);
+						this.bot.setControlState("forward", true);
+						this.bot.setControlState("sprint", true);
+						await new Promise((r) => setTimeout(r, 800));
+						this.bot.clearControlStates();
+					}
+
+					// 再試行ループへ
+				}
 			}
-
-			const target = goal as any;
-			if (typeof target.x === "number" && typeof target.z === "number") {
-				const Vec3 = require("vec3");
-
-				// 目の高さ（eye level）を考慮して向く
-				// bot.entity.height は通常プレイヤーなら 1.8 です。
-				// 目の位置はその 90% 程度の 1.62 あたりになります。
-				const eyePosition = this.bot.entity.position.offset(0, this.bot.entity.height * 0.9, 0);
-				const targetVec = new Vec3(target.x, eyePosition.y, target.z);
-
-				// ターゲットの X, Z はそのままで、高さだけ自分の目の高さに合わせて水平に向く
-				await this.bot.lookAt(targetVec, true);
-
-				// 2. 物理フォールバック（ジャンプ前進）
-				this.bot.setControlState("forward", true);
-				this.bot.setControlState("sprint", true);
-
-				// 2秒間の間、断続的にジャンプを試みる（1マスの段差に強い）
-				const jumpInterval = setInterval(() => {
-					this.bot.setControlState("jump", true);
-					setTimeout(() => this.bot.setControlState("jump", false), 100);
-				}, 300);
-
-				await new Promise((r) => setTimeout(r, 2000));
-				clearInterval(jumpInterval);
-				this.bot.clearControlStates();
-			} else {
-				// 座標がないゴール（GoalFollow等）の場合は、ランダムにジャンプして詰まりを解消
-				console.log(`[${this.profile.minecraftName}] No coordinate in goal. Random jump fallback.`);
-				this.bot.setControlState("jump", true);
-				await new Promise((r) => setTimeout(r, 500));
-				this.bot.clearControlStates();
-			}
-
-			console.log(`[${this.profile.minecraftName}] Fallback movement finished.`);
 		} finally {
 			this.isMoving = false;
+			this.bot.clearControlStates();
 		}
 	}
 }
