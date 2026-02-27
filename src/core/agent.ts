@@ -417,7 +417,7 @@ Tool: (exact name)`;
 
 							// --- 送信処理の中 ---
 							const now = Date.now();
-							if (now - lastDiscordEmitAt >= 30_000) {
+							if (now - lastDiscordEmitAt >= 10_000) {
 								// 最後に送信した時刻を更新
 								lastDiscordEmitAt = now;
 								translateWithRoleplay(rationale, this.profile).then((translatedText) =>
