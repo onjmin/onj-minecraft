@@ -6,18 +6,17 @@ import type { AgentProfile } from "../profiles/types";
 import { emitDiscordWebhook, translateWithRoleplay } from "./discord-webhook";
 import { llm } from "./llm-client";
 
-import autoEat from "mineflayer-auto-eat";
-import armorManager from "mineflayer-armor-manager";
-import pvp from "mineflayer-pvp";
-import collectblock from "mineflayer-collectblock";
-import tool from "mineflayer-tool";
-
-const tryLoad = (bot: any, name: string, pluginObj: any) => {
-	const p = pluginObj?.plugin || (typeof pluginObj === "function" ? pluginObj : null);
+const tryLoad = (bot: any, name: string, mod: any) => {
+	if (!mod) {
+		console.error(`[Error] ${name} module not found`);
+		return;
+	}
+	const p = mod?.plugin || (typeof mod === "function" ? mod : null);
 	if (typeof p === "function") {
 		bot.loadPlugin(p);
+		console.log(`[OK] Loaded ${name}`);
 	} else {
-		console.error(`[Error] ${name} の読み込みに失敗しました:`, pluginObj);
+		console.error(`[Error] ${name} の読み込みに失敗しました:`, typeof mod, Object.keys(mod || {}));
 	}
 };
 
@@ -68,12 +67,12 @@ export class AgentOrchestrator {
 		// インスタンス作成時に一度だけプラグインをロード
 		this.bot.loadPlugin(pathfinder);
 
-		// constructor 内でロード
-		tryLoad(this.bot, "autoEat", autoEat);
-		tryLoad(this.bot, "armorManager", armorManager);
-		tryLoad(this.bot, "pvp", pvp);
-		tryLoad(this.bot, "collectblock", collectblock);
-		tryLoad(this.bot, "tool", tool);
+		// constructor 内でロード (CommonJS require)
+		tryLoad(this.bot, "autoEat", require("mineflayer-auto-eat"));
+		tryLoad(this.bot, "armorManager", require("mineflayer-armor-manager"));
+		tryLoad(this.bot, "pvp", require("mineflayer-pvp"));
+		tryLoad(this.bot, "collectblock", require("mineflayer-collectblock"));
+		tryLoad(this.bot, "tool", require("mineflayer-tool"));
 
 		// 初期設定（一回だけ）
 		if ((this.bot as any).autoEat) {
