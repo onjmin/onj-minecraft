@@ -28,28 +28,6 @@ export async function emitDiscordWebhook(payload: WebhookPayload): Promise<void>
 	}
 }
 
-// 翻訳関数
-export async function translateText(text: string) {
-	try {
-		const response = await fetch("http://localhost:5000/translate", {
-			method: "POST",
-			body: JSON.stringify({
-				q: text,
-				source: "en",
-				target: "ja",
-				format: "text",
-			}),
-			headers: { "Content-Type": "application/json" },
-		});
-
-		const data = await response.json();
-		return data.translatedText;
-	} catch (error) {
-		console.error("Translation Error:", error);
-		return text; // 失敗時は原文を返す
-	}
-}
-
 /**
  * 英語のテキストを、エージェントの性格（roleplayPrompt）に基づいて
  * 日本語になりきり翻訳する。
