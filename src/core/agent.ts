@@ -48,6 +48,16 @@ export class AgentOrchestrator {
 		// インスタンス作成時に一度だけプラグインをロード
 		this.bot.loadPlugin(pathfinder);
 
+		// constructor 内でロード
+		this.bot.loadPlugin(require("mineflayer-auto-eat"));
+		this.bot.loadPlugin(require("mineflayer-armor-manager"));
+		this.bot.loadPlugin(require("mineflayer-pvp"));
+
+		// 初期設定（一回だけ）
+		(this.bot as any).autoEat.options.priority = "foodPoints";
+		(this.bot as any).autoEat.options.bannedFood = ["rotten_flesh", "pufferfish"];
+		// armor-manager は装備を拾う or ダメージを受けると自動で最強装備に着替えるため、手動コード不要
+
 		// イベント登録
 		this.initEvents();
 	}
