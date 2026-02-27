@@ -6,19 +6,19 @@ import type { AgentProfile } from "../profiles/types";
 import { emitDiscordWebhook, translateWithRoleplay } from "./discord-webhook";
 import { llm } from "./llm-client";
 
-import autoEatPkg from "mineflayer-auto-eat";
-import armorManagerPkg from "mineflayer-armor-manager";
-import pvpPkg from "mineflayer-pvp";
-import collectblockPkg from "mineflayer-collectblock";
-import toolPkg from "mineflayer-tool";
+import autoEat from "mineflayer-auto-eat";
+import armorManager from "mineflayer-armor-manager";
+import pvp from "mineflayer-pvp";
+import collectblock from "mineflayer-collectblock";
+import tool from "mineflayer-tool";
 
-const getPlugin = (mod: any) => {
-	if (!mod) return null;
-	if (typeof mod === "function") return mod;
-	if (mod.plugin && typeof mod.plugin === "function") return mod.plugin;
-	if (mod.default && typeof mod.default === "function") return mod.default;
-	if (mod.default?.plugin && typeof mod.default.plugin === "function") return mod.default.plugin;
-	return null;
+const tryLoad = (bot: any, name: string, pluginObj: any) => {
+	const p = pluginObj?.plugin || (typeof pluginObj === "function" ? pluginObj : null);
+	if (typeof p === "function") {
+		bot.loadPlugin(p);
+	} else {
+		console.error(`[Error] ${name} の読み込みに失敗しました:`, pluginObj);
+	}
 };
 
 let lastDiscordEmitAt = 0;
@@ -69,15 +69,11 @@ export class AgentOrchestrator {
 		this.bot.loadPlugin(pathfinder);
 
 		// constructor 内でロード
-		const pluginSources = [pathfinder, autoEatPkg, armorManagerPkg, pvpPkg, collectblockPkg, toolPkg];
-		for (const src of pluginSources) {
-			const plugin = getPlugin(src);
-			if (plugin) {
-				this.bot.loadPlugin(plugin);
-			} else {
-				console.error(`[Error] Failed to load plugin:`, src);
-			}
-		}
+		tryLoad(this.bot, "autoEat", autoEat);
+		tryLoad(this.bot, "armorManager", armorManager);
+		tryLoad(this.bot, "pvp", pvp);
+		tryLoad(this.bot, "collectblock", collectblock);
+		tryLoad(this.bot, "tool", tool);
 
 		// 初期設定（一回だけ）
 		if ((this.bot as any).autoEat) {
@@ -86,19 +82,25 @@ export class AgentOrchestrator {
 		}
 
 		// collectBlock設定
-		(this.bot as any).collectBlock.setInventoryFilter((item: any) => {
-			return item.name.includes("axe") || item.name.includes("pickaxe");
-		});
+		if ((this.bot as any).collectBlock) {
+			(this.bot as any).collectBlock.setInventoryFilter((item: any) => {
+				return item.name.includes("axe") || item.name.includes("pickaxe");
+			});
+		}
 
 		// tool設定 - 最適なツールを自動選択
-		(this.bot as any).tool.setPrimaryHand();
+		if ((this.bot as any).tool) {
+			(this.bot as any).tool.setPrimaryHand();
+		}
 
 		// PvP設定 - 敵を自動的に攻撃
-		(this.bot as any).pvp?.setOptions({
-			attackRange: 4,
-			enemyBlacklist: [],
-			halfSpeed: false,
-		});
+		if ((this.bot as any).pvp) {
+			(this.bot as any).pvp.setOptions({
+				attackRange: 4,
+				enemyBlacklist: [],
+				halfSpeed: false,
+			});
+		}
 
 		// イベント登録
 		this.initEvents();
