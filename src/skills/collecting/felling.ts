@@ -22,8 +22,8 @@ export const fellTreesSkill = createSkill<void, { count: number }>({
 				return skillResult.fail("collectBlock plugin not loaded");
 			}
 
-			const result = await collectBot.collectBlock.collect(target, {
-				ignoreNoPath: true,
+			const result = await collectBot.collectBlock.collect(logs, {
+				ignoreNoPath: false, // パスが見つからない場合はちゃんとエラーを出す
 				enableAutoTool: true,
 			});
 

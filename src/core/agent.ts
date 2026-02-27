@@ -204,6 +204,10 @@ export class AgentOrchestrator {
 		this.bot.pathfinder.setMovements(movements);
 		this.bot.pathfinder.thinkTimeout = 5000;
 		this.bot.pathfinder.tickTimeout = 100;
+
+		if ((this.bot as any).collectBlock) {
+			(this.bot as any).collectBlock.movements = movements;
+		}
 	}
 
 	/**
