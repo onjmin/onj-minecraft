@@ -23,7 +23,7 @@ export const fellTreesSkill = createSkill<void, { count: number }>({
 			}
 
 			const result = await collectBot.collectBlock.collect(logs, {
-				ignoreNoPath: false, // パスが見つからない場合はちゃんとエラーを出す
+				ignoreNoPath: true,
 				enableAutoTool: true,
 			});
 

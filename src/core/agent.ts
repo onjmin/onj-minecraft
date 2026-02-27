@@ -177,8 +177,27 @@ export class AgentOrchestrator {
 		movements.allowSprinting = true;
 		movements.canDig = true;
 		movements.allow1by1towers = true;
-		movements.allowParkour = true;
+		movements.allowParkour = true; // ジャンプが必要な地形に対応
 		movements.allowFreeMotion = true;
+		movements.maxDropDown = 4; // 4ブロックまでの落下を許容
+
+		// --- 修正ポイント：破壊不可能なリストから「土」や「葉っぱ」を除去する ---
+		const diggableNames = ["dirt", "grass_block", "sand", "gravel", "oak_leaves", "birch_leaves"];
+
+		// 破壊不可能なブロックのセットから、掘削したいブロックを削除
+		diggableNames.forEach((name) => {
+			const block = this.bot.registry.blocksByName[name];
+			if (block) {
+				movements.blocksCantBreak.delete(block.id);
+			}
+		});
+
+		// --- 葉っぱを「空気」扱いにして通り抜けを許可する ---
+		Object.values(this.bot.registry.blocks).forEach((block) => {
+			if (block.name.endsWith("_leaves")) {
+				movements.emptyBlocks.add(block.id);
+			}
+		});
 
 		// 1. 基本となる足場ブロックの定義
 		const buildableBlockNames = ["dirt", "cobblestone", "stone", "netherrack"];
