@@ -1,19 +1,19 @@
 import mineflayer from "mineflayer";
+import * as armorManagerMod from "mineflayer-armor-manager";
+import * as autoEatMod from "mineflayer-auto-eat";
+import * as collectblockMod from "mineflayer-collectblock";
 import { type goals, Movements, pathfinder } from "mineflayer-pathfinder";
+import * as pvpMod from "mineflayer-pvp";
 import { BotStateMachine } from "mineflayer-statemachine";
+import * as toolMod from "mineflayer-tool";
 import { Vec3 } from "vec3";
 import type { AgentProfile } from "../profiles/types";
 import { emitDiscordWebhook, translateWithRoleplay } from "./discord-webhook";
 import { llm } from "./llm-client";
 
-import * as autoEatMod from "mineflayer-auto-eat";
-import * as armorManagerMod from "mineflayer-armor-manager";
-import * as pvpMod from "mineflayer-pvp";
-import * as collectblockMod from "mineflayer-collectblock";
-import * as toolMod from "mineflayer-tool";
-
-const loadPlugin = (mod: any) => {
-	return mod?.plugin || mod?.default || mod;
+const getPlugin = (mod: any) => {
+	const plugin = mod?.plugin || mod?.default || mod;
+	return typeof plugin === "function" ? plugin : null;
 };
 
 let lastDiscordEmitAt = 0;
@@ -64,11 +64,15 @@ export class AgentOrchestrator {
 		this.bot.loadPlugin(pathfinder);
 
 		// constructor 内でロード
-		this.bot.loadPlugin(loadPlugin(autoEatMod));
-		this.bot.loadPlugin(loadPlugin(armorManagerMod));
-		this.bot.loadPlugin(loadPlugin(pvpMod));
-		this.bot.loadPlugin(loadPlugin(collectblockMod));
-		this.bot.loadPlugin(loadPlugin(toolMod));
+		const plugins = [autoEatMod, armorManagerMod, pvpMod, collectblockMod, toolMod];
+		for (const p of plugins) {
+			const pluginFunc = getPlugin(p);
+			if (pluginFunc) {
+				this.bot.loadPlugin(pluginFunc);
+			} else {
+				console.warn(`[Warning] Failed to load plugin:`, p);
+			}
+		}
 
 		// 初期設定（一回だけ）
 		(this.bot as any).autoEat.options.priority = "foodPoints";
@@ -216,7 +220,10 @@ export class AgentOrchestrator {
 				? `Attacked by ${attacker.name || attacker.type}`
 				: "Taken damage from unknown source";
 
-			if (attacker && (attacker.type === "mob" || attacker.type === "hostile" || attacker.type === "player")) {
+			if (
+				attacker &&
+				(attacker.type === "mob" || attacker.type === "hostile" || attacker.type === "player")
+			) {
 				this.enterCombat(attacker);
 			}
 		}
@@ -225,7 +232,9 @@ export class AgentOrchestrator {
 	private enterCombat(target: any) {
 		if (this.isInCombat) return;
 
-		console.log(`[${this.profile.minecraftName}] Combat detected! Target: ${target.name || target.type}`);
+		console.log(
+			`[${this.profile.minecraftName}] Combat detected! Target: ${target.name || target.type}`,
+		);
 		this.isInCombat = true;
 		this.combatTarget = target;
 		this.shouldStopSkill = true;
