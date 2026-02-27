@@ -1,4 +1,5 @@
 import type { Bot } from "mineflayer";
+import { goals } from "mineflayer-pathfinder";
 import type { Vec3 } from "vec3";
 import type { AgentOrchestrator } from "../../core/agent";
 import { createSkill, type SkillResponse, skillResult } from "../types";
@@ -17,6 +18,19 @@ export const fellTreesSkill = createSkill<void, { count: number }>({
 		try {
 			const target = logs[0];
 			const collectBot = bot as any;
+
+			// 【修正1】まず、ターゲットの木の1ブロック隣まで自力で移動する
+			// collectBlockに頼らず、リカバリ機能のある agent.smartGoto を使う
+			const goal = new goals.GoalNear(target.x, target.y, target.z, 2);
+			await agent.smartGoto(goal);
+
+			// 【修正2】移動後、改めて「手が届く範囲のログ」に絞ってcollectを実行
+			// これにより、collectBlockが複雑なパス計算をすることを防ぐ
+			const reachableLogs = fellingScanner.findNearbyLogs(bot, 4);
+
+			if (reachableLogs.length === 0) {
+				return skillResult.fail("Reached the area, but target is no longer reachable.");
+			}
 
 			if (!collectBot.collectBlock) {
 				return skillResult.fail("collectBlock plugin not loaded");

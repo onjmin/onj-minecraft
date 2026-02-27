@@ -160,8 +160,6 @@ export class AgentOrchestrator {
 				this.chatHistory.shift();
 			}
 
-			console.log(`[Chat Log] ${username}: ${message}`);
-
 			// オプション: 話しかけられたら即座に再考フェーズへ（30秒待たずに反応したい場合）
 			// this.triggerThinking();
 		});
@@ -630,52 +628,26 @@ Skill: (exact name)`;
 	public async smartGoto(goal: goals.Goal): Promise<void> {
 		if (this.isMoving) {
 			this.bot.pathfinder.stop();
-			await new Promise((r) => setTimeout(r, 100));
+			this.bot.clearControlStates();
 		}
-
 		this.isMoving = true;
-		const maxRetries = 2; // パスが見つからない場合の再試行回数
 
 		try {
-			for (let i = 0; i <= maxRetries; i++) {
-				try {
-					// 1. 通常のパスファインディング実行
-					await Promise.race([
-						this.bot.pathfinder.goto(goal),
-						new Promise((_, reject) =>
-							setTimeout(() => reject(new Error("Pathfinding timeout")), 15000),
-						),
-					]);
-					return; // 成功すれば終了
-				} catch (err) {
-					if (err instanceof Error && err.name === "GoalChanged") return;
+			// タイムアウトを短く設定し、ダメならすぐリカバリに回す
+			await this.bot.pathfinder.goto(goal).catch(async (err) => {
+				if (err.name === "GoalChanged") return;
 
-					// 2. 失敗時のリカバリ：少し後ろに下がってからジャンプ
-					// 詰まっている可能性が高いため、一度リセットをかける
-					console.log(
-						`[${this.profile.minecraftName}] Path stuck. Attempting recovery step ${i + 1}...`,
-					);
+				console.log(`[Recovery] Executing jump-forward...`);
+				// 詰まっている方向を向く
+				this.bot.setControlState("forward", true);
+				this.bot.setControlState("jump", true);
+				this.bot.setControlState("sprint", true);
+				await new Promise((r) => setTimeout(r, 1000));
+				this.bot.clearControlStates();
 
-					this.bot.clearControlStates();
-					// 少し後ろに下がる（空間を作る）
-					this.bot.setControlState("back", true);
-					await new Promise((r) => setTimeout(r, 500));
-					this.bot.setControlState("back", false);
-
-					// ターゲットの方向を向いてジャンプ
-					const target = goal as any;
-					if (target.x !== undefined) {
-						await this.bot.lookAt(new Vec3(target.x, this.bot.entity.position.y, target.z));
-						this.bot.setControlState("jump", true);
-						this.bot.setControlState("forward", true);
-						this.bot.setControlState("sprint", true);
-						await new Promise((r) => setTimeout(r, 800));
-						this.bot.clearControlStates();
-					}
-
-					// 再試行ループへ
-				}
-			}
+				// リカバリ後、もう一度だけ試行
+				await this.bot.pathfinder.goto(goal);
+			});
 		} finally {
 			this.isMoving = false;
 			this.bot.clearControlStates();
