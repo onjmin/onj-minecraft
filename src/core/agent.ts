@@ -11,7 +11,16 @@ const tryLoad = (bot: any, name: string, mod: any) => {
 		console.error(`[Error] ${name} module not found`);
 		return;
 	}
-	const p = mod?.plugin || (typeof mod === "function" ? mod : null);
+	// autoEat は loader オブジェクトを返すことがあるため特別な処理
+	let p = mod?.plugin || (typeof mod === "function" ? mod : null);
+	// loader オブジェクトが返ってきた場合
+	if (!p && mod?.loader && typeof mod.loader === "function") {
+		p = mod.loader;
+	}
+	// default プロパティを確認
+	if (!p && mod?.default) {
+		p = typeof mod.default === "function" ? mod.default : mod.default?.plugin;
+	}
 	if (typeof p === "function") {
 		bot.loadPlugin(p);
 		console.log(`[OK] Loaded ${name}`);
