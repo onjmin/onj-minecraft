@@ -1,4 +1,5 @@
 import type { Bot } from "mineflayer";
+import { goals } from "mineflayer-pathfinder";
 import type { Vec3 } from "vec3";
 import type { AgentOrchestrator } from "../../core/agent";
 import { createSkill, type SkillResponse, skillResult } from "../types";
@@ -6,7 +7,9 @@ import { createSkill, type SkillResponse, skillResult } from "../types";
 export const mineOresSkill = createSkill<void, { minedCount: number }>({
 	name: "collecting.mining",
 	description:
-		"Scans for and mines nearby ores using collectBlock plugin. The bot will automatically select the best tool and mine ores. If you lack a pickaxe, craft one first.",
+		"Scans for and mines nearby ores. IMPORTANT: You MUST have a pickaxe equipped or in your inventory. " +
+		"Mining with bare hands is extremely inefficient, takes too long, and results in NO item drops for most ores. " +
+		"If you lack a pickaxe, craft one first instead of using this skill.",
 	inputSchema: {} as any,
 	handler: async (agent: AgentOrchestrator): Promise<SkillResponse<{ minedCount: number }>> => {
 		const { bot } = agent;
@@ -17,20 +20,23 @@ export const mineOresSkill = createSkill<void, { minedCount: number }>({
 			return skillResult.fail("No valuable ores found nearby. Try moving to a different location.");
 		}
 
+		let minedCount = 0;
+		const toolPlugin = (bot as any).tool;
+
 		try {
-			const target = orePositions[0];
-			const collectBot = bot as any;
+			for (const pos of orePositions.slice(0, 3)) {
+				const goal = new goals.GoalNear(pos.x, pos.y, pos.z, 2);
+				await agent.smartGoto(goal);
 
-			if (!collectBot.collectBlock) {
-				return skillResult.fail("collectBlock plugin not loaded");
+				const block = bot.blockAt(pos);
+				if (block && (block.name.includes("ore") || block.name.includes("raw"))) {
+					if (toolPlugin) {
+						await toolPlugin.equipForBlock(block);
+					}
+					await bot.dig(block);
+					minedCount++;
+				}
 			}
-
-			const result = await collectBot.collectBlock.collect(target, {
-				ignoreNoPath: true,
-				enableAutoTool: true,
-			});
-
-			const minedCount = result.length;
 
 			return skillResult.ok(`Successfully extracted ${minedCount} ore blocks from the area.`, {
 				minedCount,

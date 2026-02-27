@@ -7,7 +7,7 @@ import { createSkill, type SkillResponse, skillResult } from "../types";
 export const fellTreesSkill = createSkill<void, { count: number }>({
 	name: "collecting.felling",
 	description:
-		"Automatically finds and fells nearby trees using collectBlock plugin. The bot will move to trees and harvest them automatically.",
+		"Automatically finds and fells nearby trees by moving next to them and digging safely.",
 	inputSchema: {} as any,
 	handler: async (agent: AgentOrchestrator): Promise<SkillResponse<{ count: number }>> => {
 		const { bot } = agent;
@@ -15,37 +15,39 @@ export const fellTreesSkill = createSkill<void, { count: number }>({
 
 		if (logs.length === 0) return skillResult.fail("No trees found nearby.");
 
+		let felledCount = 0;
+
 		try {
 			const target = logs[0];
-			const collectBot = bot as any;
+			const toolPlugin = (bot as any).tool;
 
-			// 【修正1】まず、ターゲットの木の1ブロック隣まで自力で移動する
-			// collectBlockに頼らず、リカバリ機能のある agent.smartGoto を使う
 			const goal = new goals.GoalNear(target.x, target.y, target.z, 2);
 			await agent.smartGoto(goal);
 
-			// 【修正2】移動後、改めて「手が届く範囲のログ」に絞ってcollectを実行
-			// これにより、collectBlockが複雑なパス計算をすることを防ぐ
-			const reachableLogs = fellingScanner.findNearbyLogs(bot, 4);
-
-			if (reachableLogs.length === 0) {
-				return skillResult.fail("Reached the area, but target is no longer reachable.");
+			const columnLogs: Vec3[] = [];
+			for (let i = 0; i < 6; i++) {
+				const pos = target.offset(0, i, 0);
+				const b = bot.blockAt(pos);
+				if (b && isLog(b.name)) columnLogs.push(pos);
+				else if (i > 0) break;
 			}
 
-			if (!collectBot.collectBlock) {
-				return skillResult.fail("collectBlock plugin not loaded");
+			for (const logPos of columnLogs.reverse()) {
+				const block = bot.blockAt(logPos);
+				if (block && bot.canDigBlock(block)) {
+					if (toolPlugin) {
+						await toolPlugin.equipForBlock(block);
+					}
+					await bot.dig(block);
+					felledCount++;
+				}
 			}
-
-			const result = await collectBot.collectBlock.collect(logs, {
-				ignoreNoPath: true,
-				enableAutoTool: true,
-			});
-
-			const felledCount = result.length;
 
 			return skillResult.ok(
 				`Successfully felled ${felledCount} blocks at ${target.x}, ${target.z}.`,
-				{ count: felledCount },
+				{
+					count: felledCount,
+				},
 			);
 		} catch (err) {
 			const errorMsg = err instanceof Error ? err.message : String(err);
