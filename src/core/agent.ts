@@ -6,6 +6,16 @@ import type { AgentProfile } from "../profiles/types";
 import { emitDiscordWebhook, translateWithRoleplay } from "./discord-webhook";
 import { llm } from "./llm-client";
 
+import * as autoEatMod from "mineflayer-auto-eat";
+import * as armorManagerMod from "mineflayer-armor-manager";
+import * as pvpMod from "mineflayer-pvp";
+import * as collectblockMod from "mineflayer-collectblock";
+import * as toolMod from "mineflayer-tool";
+
+const loadPlugin = (mod: any) => {
+	return mod?.plugin || mod?.default || mod;
+};
+
 let lastDiscordEmitAt = 0;
 
 type ObservationRecord = {
@@ -54,30 +64,11 @@ export class AgentOrchestrator {
 		this.bot.loadPlugin(pathfinder);
 
 		// constructor 内でロード
-		const autoEatPlugin = require("mineflayer-auto-eat");
-		const armorManagerPlugin = require("mineflayer-armor-manager");
-		const pvpPlugin = require("mineflayer-pvp");
-		const collectblockPlugin = require("mineflayer-collectblock");
-		const toolPlugin = require("mineflayer-tool");
-
-		const loadPlugin = (plugin: any) => {
-			if (typeof plugin === "function") {
-				return plugin;
-			}
-			if (plugin && typeof plugin.default === "function") {
-				return plugin.default;
-			}
-			if (plugin && typeof plugin.plugin === "function") {
-				return plugin.plugin;
-			}
-			throw new Error(`Invalid plugin: ${JSON.stringify(plugin)}`);
-		};
-
-		this.bot.loadPlugin(loadPlugin(autoEatPlugin));
-		this.bot.loadPlugin(loadPlugin(armorManagerPlugin));
-		this.bot.loadPlugin(loadPlugin(pvpPlugin));
-		this.bot.loadPlugin(loadPlugin(collectblockPlugin));
-		this.bot.loadPlugin(loadPlugin(toolPlugin));
+		this.bot.loadPlugin(loadPlugin(autoEatMod));
+		this.bot.loadPlugin(loadPlugin(armorManagerMod));
+		this.bot.loadPlugin(loadPlugin(pvpMod));
+		this.bot.loadPlugin(loadPlugin(collectblockMod));
+		this.bot.loadPlugin(loadPlugin(toolMod));
 
 		// 初期設定（一回だけ）
 		(this.bot as any).autoEat.options.priority = "foodPoints";
