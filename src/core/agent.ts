@@ -60,11 +60,24 @@ export class AgentOrchestrator {
 		const collectblockPlugin = require("mineflayer-collectblock");
 		const toolPlugin = require("mineflayer-tool");
 
-		this.bot.loadPlugin(autoEatPlugin.default || autoEatPlugin);
-		this.bot.loadPlugin(armorManagerPlugin.default || armorManagerPlugin);
-		this.bot.loadPlugin(pvpPlugin.default || pvpPlugin);
-		this.bot.loadPlugin(collectblockPlugin.default || collectblockPlugin);
-		this.bot.loadPlugin(toolPlugin.default || toolPlugin);
+		const loadPlugin = (plugin: any) => {
+			if (typeof plugin === "function") {
+				return plugin;
+			}
+			if (plugin && typeof plugin.default === "function") {
+				return plugin.default;
+			}
+			if (plugin && typeof plugin.plugin === "function") {
+				return plugin.plugin;
+			}
+			throw new Error(`Invalid plugin: ${JSON.stringify(plugin)}`);
+		};
+
+		this.bot.loadPlugin(loadPlugin(autoEatPlugin));
+		this.bot.loadPlugin(loadPlugin(armorManagerPlugin));
+		this.bot.loadPlugin(loadPlugin(pvpPlugin));
+		this.bot.loadPlugin(loadPlugin(collectblockPlugin));
+		this.bot.loadPlugin(loadPlugin(toolPlugin));
 
 		// 初期設定（一回だけ）
 		(this.bot as any).autoEat.options.priority = "foodPoints";
