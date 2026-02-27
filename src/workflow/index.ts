@@ -1,17 +1,17 @@
 import { AgentOrchestrator } from "../core/agent";
 import { profiles } from "../profiles";
-import { farmTendCropsTool } from "../tools/collecting/farming";
-import { fellTreesTool } from "../tools/collecting/felling";
-import { huntAnimalsTool } from "../tools/collecting/hunting";
-import { mineOresTool } from "../tools/collecting/mining";
-import { stealFromChestTool } from "../tools/collecting/stealing";
-import { craftSmeltingTool } from "../tools/crafting/smelting";
-import { craftStorageTool } from "../tools/crafting/storage";
-import { craftToolTool } from "../tools/crafting/tool";
-import { craftWeaponTool } from "../tools/crafting/weapon";
-import { exploreLandTool } from "../tools/exploring/land";
-import { exploreSeaTool } from "../tools/exploring/sea";
-import { exploreUndergroundTool } from "../tools/exploring/underground";
+import { farmTendCropsTool } from "../skills/collecting/farming";
+import { fellTreesTool } from "../skills/collecting/felling";
+import { huntAnimalsTool } from "../skills/collecting/hunting";
+import { mineOresTool } from "../skills/collecting/mining";
+import { stealFromChestTool } from "../skills/collecting/stealing";
+import { craftSmeltingTool } from "../skills/crafting/smelting";
+import { craftStorageTool } from "../skills/crafting/storage";
+import { craftToolTool } from "../skills/crafting/tool";
+import { craftWeaponTool } from "../skills/crafting/weapon";
+import { exploreLandTool } from "../skills/exploring/land";
+import { exploreSeaTool } from "../skills/exploring/sea";
+import { exploreUndergroundTool } from "../skills/exploring/underground";
 
 const allTools = [
 	// --- Collecting Domain (With integrated Eat/Equip routine) ---
