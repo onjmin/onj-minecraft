@@ -1,20 +1,20 @@
 import type { Bot } from "mineflayer";
 import type { AgentOrchestrator } from "../../core/agent";
-import { createTool, type ToolResponse, toolResult } from "../types";
+import { createSkill, type SkillResponse, skillResult } from "../types";
 import { ensureCraftingTable, ensureSticks } from "./util";
 
 /**
  * Crafting Domain: Equipment maintenance.
  * クラフトドメイン：装備の維持管理。持っている素材から最適なツールを1つ作成します。
  */
-export const craftToolTool = createTool<void, { item: string; material: string }>({
+export const craftToolSkill = createSkill<void, { item: string; material: string }>({
 	name: "crafting.tool",
 	description:
 		"Checks inventory and crafts the best possible tool (pickaxe, axe, shovel, or hoe) that is missing or needs an upgrade.",
 	inputSchema: {} as any,
 	handler: async (
 		agent: AgentOrchestrator,
-	): Promise<ToolResponse<{ item: string; material: string }>> => {
+	): Promise<SkillResponse<{ item: string; material: string }>> => {
 		const { bot } = agent;
 
 		// 【ここに追加】ツールの材料を確定させる前に、まず棒を確保する
@@ -23,28 +23,28 @@ export const craftToolTool = createTool<void, { item: string; material: string }
 		if (!sticksReady) {
 			// 棒が作れなかった（板材も原木もない）場合は、エラーではなく
 			// 「素材不足」として失敗させることで、LLMに伐採などを促す
-			return toolResult.fail(
+			return skillResult.fail(
 				"Insufficient materials: Need sticks (or wood to make them) to craft tools.",
 			);
 		}
 
 		// 1. 次に作るべきツールと素材を判定
-		const target = craftingManager.determineNextTool(bot);
+		const target = craftingManager.determineNextSkill(bot);
 
 		if (!target) {
-			return toolResult.fail(
+			return skillResult.fail(
 				"No tools to craft. Already have the best possible equipment with current materials.",
 			);
 		}
 
-		const itemName = `${target.material}_${target.toolType}`;
+		const itemName = `${target.material}_${target.skillType}`;
 
 		try {
 			// 2. 作業台の確保
 			const craftingTable = await ensureCraftingTable(agent.bot);
 
 			if (!craftingTable) {
-				return toolResult.fail(
+				return skillResult.fail(
 					"Crafting table is not nearby. Please place one to proceed with maintenance.",
 				);
 			}
@@ -54,17 +54,17 @@ export const craftToolTool = createTool<void, { item: string; material: string }
 			const recipes = bot.recipesFor(item.id, null, 1, craftingTable);
 
 			if (recipes.length === 0) {
-				return toolResult.fail(`Insufficient materials or no recipe for ${itemName}.`);
+				return skillResult.fail(`Insufficient materials or no recipe for ${itemName}.`);
 			}
 
 			await bot.craft(recipes[0], 1, craftingTable);
 
-			return toolResult.ok(`Upgraded equipment: Crafted 1 ${itemName}.`, {
-				item: target.toolType,
+			return skillResult.ok(`Upgraded equipment: Crafted 1 ${itemName}.`, {
+				item: target.skillType,
 				material: target.material,
 			});
 		} catch (err) {
-			return toolResult.fail(
+			return skillResult.fail(
 				`Crafting interrupted: ${err instanceof Error ? err.message : String(err)}`,
 			);
 		}
@@ -81,7 +81,7 @@ export const craftingManager = {
 	// 優先順位: ピッケル > オノ > シャベル > クワ
 	types: ["pickaxe", "axe", "shovel", "hoe"],
 
-	determineNextTool: (bot: Bot): { toolType: string; material: string } | null => {
+	determineNextSkill: (bot: Bot): { skillType: string; material: string } | null => {
 		const items = bot.inventory.items();
 
 		for (const type of craftingManager.types) {
@@ -109,7 +109,7 @@ export const craftingManager = {
 
 				// 素材が足りているか（ツール作成には最低3個あればどのツールも作れる想定）
 				if (resource && resource.count >= 3) {
-					return { toolType: type, material: mat };
+					return { skillType: type, material: mat };
 				}
 			}
 		}

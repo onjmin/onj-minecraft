@@ -23,7 +23,7 @@ type ChatLog = {
 export class AgentOrchestrator {
 	public bot: mineflayer.Bot;
 	private profile: AgentProfile;
-	private tools: Map<string, any>;
+	private skills: Map<string, any>;
 	private currentTaskName: string = "idle";
 	private observationHistory: ObservationRecord[] = [];
 	private maxHistory = 5;
@@ -34,9 +34,9 @@ export class AgentOrchestrator {
 	private chatHistory: ChatLog[] = [];
 	private maxChatHistory = 10; // 過去10件保持
 
-	constructor(profile: AgentProfile, toolList: any[]) {
+	constructor(profile: AgentProfile, skillList: any[]) {
 		this.profile = profile;
-		this.tools = new Map(toolList.map((t) => [t.name, t]));
+		this.skills = new Map(skillList.map((t) => [t.name, t]));
 
 		this.bot = mineflayer.createBot({
 			host: process.env.MINECRAFT_HOST,
@@ -218,10 +218,10 @@ export class AgentOrchestrator {
 		await new Promise((r) => setTimeout(r, Math.random() * 2000));
 
 		while (this.bot && this.bot.entity) {
-			const tool = this.tools.get(this.currentTaskName);
-			if (tool) {
+			const skill = this.skills.get(this.currentTaskName);
+			if (skill) {
 				try {
-					const result = await tool.handler(this, {});
+					const result = await skill.handler(this, {});
 					this.pushHistory({
 						action: this.currentTaskName,
 						rationale: this.latestRationale || "Continuing task",
@@ -249,7 +249,7 @@ export class AgentOrchestrator {
 	 */
 	private async startThinkingLoop() {
 		while (this.bot && this.bot.entity) {
-			const toolsContext = Array.from(this.tools.values())
+			const skillsContext = Array.from(this.skills.values())
 				.map((t) => `- ${t.name}: ${t.description}`)
 				.join("\n");
 
@@ -334,30 +334,32 @@ ${chatLogContext}
 ## PAST OBSERVATIONS
 ${historyText}
 
-## AVAILABLE TOOLS
-${toolsContext}
+## AVAILABLE SKILLS
+${skillsContext}
 
 ## OUTPUT FORMAT
 Rationale: (logic)
 Chat: (message to send in Minecraft, if any. empty if silent)
-Tool: (exact name)`;
+Skill: (exact name)`;
 
 			try {
 				const rawContent = await llm.complete(systemPrompt);
 				if (rawContent) {
 					// 1. 各セクションを抽出（次のキーワードまたは終端まで）
-					const rationaleMatch = rawContent.match(/Rationale:\s*([\s\S]*?)(?=\n(?:Chat|Tool):|$)/i);
-					const chatMatch = rawContent.match(/Chat:\s*([\s\S]*?)(?=\n(?:Rationale|Tool):|$)/i);
-					const toolMatch = rawContent.match(/Tool:\s*([a-zA-Z0-9._-]+)/i);
+					const rationaleMatch = rawContent.match(
+						/Rationale:\s*([\s\S]*?)(?=\n(?:Chat|Skill):|$)/i,
+					);
+					const chatMatch = rawContent.match(/Chat:\s*([\s\S]*?)(?=\n(?:Rationale|Skill):|$)/i);
+					const skillMatch = rawContent.match(/Skill:\s*([a-zA-Z0-9._-]+)/i);
 
 					const rationale = rationaleMatch ? rationaleMatch[1].trim() : "No reasoning.";
 					let chatMessage = chatMatch ? chatMatch[1].trim() : "";
-					const foundToolName = toolMatch ? toolMatch[1].trim() : null;
+					const foundSkillName = skillMatch ? skillMatch[1].trim() : null;
 
 					// 2. Chat内容の高度なクリーンアップ
 					if (chatMessage) {
-						// 1. キーワード混入対策: "Tool:" や "Rationale:" 以降をカット
-						chatMessage = chatMessage.split(/(?:Tool|Rationale):/i)[0].trim();
+						// 1. キーワード混入対策: "Skill:" や "Rationale:" 以降をカット
+						chatMessage = chatMessage.split(/(?:Skill|Rationale):/i)[0].trim();
 
 						// 2. 複数行対策: 最初の1行目のみ取得
 						chatMessage = chatMessage.split("\n")[0].trim();
@@ -397,9 +399,9 @@ Tool: (exact name)`;
 					}
 
 					// --- ツールの実行とDiscord通知(思考) ---
-					if (foundToolName && this.tools.has(foundToolName)) {
-						if (this.currentTaskName !== foundToolName) {
-							this.currentTaskName = foundToolName;
+					if (foundSkillName && this.skills.has(foundSkillName)) {
+						if (this.currentTaskName !== foundSkillName) {
+							this.currentTaskName = foundSkillName;
 							this.latestRationale = rationale;
 
 							console.log(
@@ -411,7 +413,7 @@ Tool: (exact name)`;
 									timeZone: "Asia/Tokyo",
 								}).format(new Date()),
 								this.profile.displayName,
-								foundToolName,
+								foundSkillName,
 								rationale,
 							);
 
@@ -423,7 +425,7 @@ Tool: (exact name)`;
 								translateWithRoleplay(rationale, this.profile).then((translatedText) =>
 									emitDiscordWebhook({
 										username: this.profile.displayName,
-										content: `**Action:** \`${foundToolName}\`\n**Thought:** ${translatedText}${chatMessage === "" ? "" : `\n**Chat:** ${chatMessage}`}`,
+										content: `**Action:** \`${foundSkillName}\`\n**Thought:** ${translatedText}${chatMessage === "" ? "" : `\n**Chat:** ${chatMessage}`}`,
 										avatar_url: this.profile.avatarUrl,
 									}),
 								);

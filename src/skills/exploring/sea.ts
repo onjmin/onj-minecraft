@@ -1,6 +1,6 @@
 import { goals } from "mineflayer-pathfinder";
 import type { AgentOrchestrator } from "../../core/agent";
-import { createTool, type ToolResponse, toolResult } from "../types";
+import { createSkill, type SkillResponse, skillResult } from "../types";
 
 const Vec3 = require("vec3");
 
@@ -8,11 +8,11 @@ const Vec3 = require("vec3");
  * Exploring Domain: Ocean/Sea exploration.
  * 探索ドメイン（海）：ボートを使用して海を渡り、沈没船や対岸を探します。
  */
-export const exploreSeaTool = createTool<void, { usedBoat: boolean }>({
+export const exploreSeaSkill = createSkill<void, { usedBoat: boolean }>({
 	name: "exploring.explore_sea",
 	description: "Explores the ocean. Automatically attempts to use a boat for efficient travel.",
 	inputSchema: {} as any,
-	handler: async (agent: AgentOrchestrator): Promise<ToolResponse<{ usedBoat: boolean }>> => {
+	handler: async (agent: AgentOrchestrator): Promise<SkillResponse<{ usedBoat: boolean }>> => {
 		let usedBoat = false;
 
 		const { bot } = agent;
@@ -69,12 +69,12 @@ export const exploreSeaTool = createTool<void, { usedBoat: boolean }>({
 			// ボートに乗った状態でも GoalXZ で移動可能
 			await agent.smartGoto(new goals.GoalXZ(x, z));
 
-			return toolResult.ok(
+			return skillResult.ok(
 				`Navigating the ocean towards ${x}, ${z}. ${usedBoat ? "Using a boat." : "Swimming."}`,
 				{ usedBoat },
 			);
 		} catch (err) {
-			return toolResult.fail(
+			return skillResult.fail(
 				`Sea exploration failed: ${err instanceof Error ? err.message : String(err)}`,
 			);
 		}

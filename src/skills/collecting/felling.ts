@@ -2,18 +2,18 @@ import type { Bot } from "mineflayer";
 import { goals } from "mineflayer-pathfinder";
 import type { Vec3 } from "vec3";
 import type { AgentOrchestrator } from "../../core/agent";
-import { createTool, type ToolResponse, toolResult } from "../types";
+import { createSkill, type SkillResponse, skillResult } from "../types";
 
-export const fellTreesTool = createTool<void, { count: number }>({
+export const fellTreesSkill = createSkill<void, { count: number }>({
 	name: "collecting.felling",
 	description:
 		"Automatically finds and fells nearby trees by moving next to them and digging safely.",
 	inputSchema: {} as any,
-	handler: async (agent: AgentOrchestrator): Promise<ToolResponse<{ count: number }>> => {
+	handler: async (agent: AgentOrchestrator): Promise<SkillResponse<{ count: number }>> => {
 		const { bot } = agent;
 		const logs = fellingScanner.findNearbyLogs(bot);
 
-		if (logs.length === 0) return toolResult.fail("No trees found nearby.");
+		if (logs.length === 0) return skillResult.fail("No trees found nearby.");
 
 		let felledCount = 0;
 
@@ -49,14 +49,16 @@ export const fellTreesTool = createTool<void, { count: number }>({
 				}
 			}
 
-			return toolResult.ok(
+			return skillResult.ok(
 				`Successfully felled ${felledCount} blocks at ${target.x}, ${target.z}.`,
 				{
 					count: felledCount,
 				},
 			);
 		} catch (err) {
-			return toolResult.fail(`Felling failed: ${err instanceof Error ? err.message : String(err)}`);
+			return skillResult.fail(
+				`Felling failed: ${err instanceof Error ? err.message : String(err)}`,
+			);
 		}
 	},
 });

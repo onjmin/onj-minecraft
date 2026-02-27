@@ -1,6 +1,6 @@
 import { goals } from "mineflayer-pathfinder";
 import type { AgentOrchestrator } from "../../core/agent";
-import { createTool, type ToolResponse, toolResult } from "../types";
+import { createSkill, type SkillResponse, skillResult } from "../types";
 
 // Dynamic require to avoid namespace issues
 // ランタイムでの競合を避けるための動的インポート
@@ -10,7 +10,7 @@ const Vec3 = require("vec3");
  * Exploring Domain: Underground/Cave exploration.
  * 探索ドメイン（地下）：洞窟内を探索し、必要に応じて松明を設置して明かりを確保します。
  */
-export const exploreUndergroundTool = createTool<void, { torchPlaced: boolean }>({
+export const exploreUndergroundSkill = createSkill<void, { torchPlaced: boolean }>({
 	name: "exploring.explore_underground",
 	description:
 		"Navigates through caves or tunnels and places torches in low light. " +
@@ -18,7 +18,7 @@ export const exploreUndergroundTool = createTool<void, { torchPlaced: boolean }>
 		"as you will be unable to mine through obstructions, collect ores you find, or create escape routes. " +
 		"Ensure you have a pickaxe and torches before starting.",
 	inputSchema: {} as any,
-	handler: async (agent: AgentOrchestrator): Promise<ToolResponse<{ torchPlaced: boolean }>> => {
+	handler: async (agent: AgentOrchestrator): Promise<SkillResponse<{ torchPlaced: boolean }>> => {
 		let torchPlaced = false;
 
 		const { bot } = agent;
@@ -59,7 +59,7 @@ export const exploreUndergroundTool = createTool<void, { torchPlaced: boolean }>
 
 					agent.smartGoto(goal);
 
-					return toolResult.ok(
+					return skillResult.ok(
 						`Moved deeper into the cave at ${targetPos.x}, ${targetPos.y}, ${targetPos.z}`,
 						{ torchPlaced },
 					);
@@ -75,11 +75,11 @@ export const exploreUndergroundTool = createTool<void, { torchPlaced: boolean }>
 			}
 
 			// 3. Fallback: もし周囲に空気ブロックが見つからない場合、少し下を掘るかランダム移動
-			return toolResult.fail(
+			return skillResult.fail(
 				"No clear cave path found nearby. Try moving to a different Y level manually.",
 			);
 		} catch (err) {
-			return toolResult.fail(
+			return skillResult.fail(
 				`Underground navigation failed: ${err instanceof Error ? err.message : String(err)}`,
 			);
 		}

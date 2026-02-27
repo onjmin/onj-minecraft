@@ -2,25 +2,25 @@ import type { Bot } from "mineflayer";
 import { goals } from "mineflayer-pathfinder";
 import type { Vec3 } from "vec3";
 import type { AgentOrchestrator } from "../../core/agent";
-import { createTool, type ToolResponse, toolResult } from "../types";
+import { createSkill, type SkillResponse, skillResult } from "../types";
 
 /**
  * Farming Domain: Autonomous crop management.
  * 農業ドメイン：作物の自動管理（収穫と再植え付け）を行います。
  */
-export const farmTendCropsTool = createTool<void, { harvestedCount: number }>({
+export const farmTendCropsSkill = createSkill<void, { harvestedCount: number }>({
 	name: "collecting.farming",
 	description:
 		"Automatically harvests fully grown crops and replants seeds in the vicinity. Decisions are made autonomously.",
 	inputSchema: {} as any,
-	handler: async (agent: AgentOrchestrator): Promise<ToolResponse<{ harvestedCount: number }>> => {
+	handler: async (agent: AgentOrchestrator): Promise<SkillResponse<{ harvestedCount: number }>> => {
 		const { bot } = agent;
 		// 1. Scan for harvestable crops (metadata 7)
 		// 収穫可能な成熟した作物（メタデータ7）をスキャン
 		const targets = farmingScanner.findHarvestableCrops(bot);
 
 		if (targets.length === 0) {
-			return toolResult.fail("No mature crops found to harvest.");
+			return skillResult.fail("No mature crops found to harvest.");
 		}
 
 		let harvestedCount = 0;
@@ -73,12 +73,12 @@ export const farmTendCropsTool = createTool<void, { harvestedCount: number }>({
 				}
 			}
 
-			return toolResult.ok(`Managed ${harvestedCount} crops${ate ? " and ate" : ""}.`, {
+			return skillResult.ok(`Managed ${harvestedCount} crops${ate ? " and ate" : ""}.`, {
 				harvestedCount,
 				ate,
 			});
 		} catch (err) {
-			return toolResult.fail(
+			return skillResult.fail(
 				`Farming operation interrupted: ${err instanceof Error ? err.message : String(err)}`,
 			);
 		}

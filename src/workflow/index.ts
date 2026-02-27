@@ -1,36 +1,36 @@
 import { AgentOrchestrator } from "../core/agent";
 import { profiles } from "../profiles";
-import { farmTendCropsTool } from "../skills/collecting/farming";
-import { fellTreesTool } from "../skills/collecting/felling";
-import { huntAnimalsTool } from "../skills/collecting/hunting";
-import { mineOresTool } from "../skills/collecting/mining";
-import { stealFromChestTool } from "../skills/collecting/stealing";
-import { craftSmeltingTool } from "../skills/crafting/smelting";
-import { craftStorageTool } from "../skills/crafting/storage";
-import { craftToolTool } from "../skills/crafting/tool";
-import { craftWeaponTool } from "../skills/crafting/weapon";
-import { exploreLandTool } from "../skills/exploring/land";
-import { exploreSeaTool } from "../skills/exploring/sea";
-import { exploreUndergroundTool } from "../skills/exploring/underground";
+import { farmTendCropsSkill } from "../skills/collecting/farming";
+import { fellTreesSkill } from "../skills/collecting/felling";
+import { huntAnimalsSkill } from "../skills/collecting/hunting";
+import { mineOresSkill } from "../skills/collecting/mining";
+import { stealFromChestSkill } from "../skills/collecting/stealing";
+import { craftSmeltingSkill } from "../skills/crafting/smelting";
+import { craftStorageSkill } from "../skills/crafting/storage";
+import { craftToolSkill } from "../skills/crafting/tool";
+import { craftWeaponSkill } from "../skills/crafting/weapon";
+import { exploreLandSkill } from "../skills/exploring/land";
+import { exploreSeaSkill } from "../skills/exploring/sea";
+import { exploreUndergroundSkill } from "../skills/exploring/underground";
 
-const allTools = [
+const allSkills = [
 	// --- Collecting Domain (With integrated Eat/Equip routine) ---
-	farmTendCropsTool, // 収穫 + 再植え付け + 食事
-	huntAnimalsTool, // 狩猟 + 回収 + 食事
-	mineOresTool, // 採掘
-	fellTreesTool, // 伐採
-	stealFromChestTool, // 略奪 + 装備更新 + 食事
+	farmTendCropsSkill, // 収穫 + 再植え付け + 食事
+	huntAnimalsSkill, // 狩猟 + 回収 + 食事
+	mineOresSkill, // 採掘
+	fellTreesSkill, // 伐採
+	stealFromChestSkill, // 略奪 + 装備更新 + 食事
 
 	// --- Exploring Domain ---
-	exploreLandTool, // 陸上探索
-	exploreSeaTool, // 海上探索
-	exploreUndergroundTool, // 地下探索
+	exploreLandSkill, // 陸上探索
+	exploreSeaSkill, // 海上探索
+	exploreUndergroundSkill, // 地下探索
 
-	// --- Crafting Domain (The "One-at-a-time" Iterative tools) ---
-	craftToolTool, // 道具作成
-	craftWeaponTool, // 武器作成
-	craftStorageTool, // チェスト作成
-	craftSmeltingTool, // 精錬開始
+	// --- Crafting Domain (The "One-at-a-time" Iterative skills) ---
+	craftToolSkill, // 道具作成
+	craftWeaponSkill, // 武器作成
+	craftStorageSkill, // チェスト作成
+	craftSmeltingSkill, // 精錬開始
 ];
 /**
  * Initialize and start all agents
@@ -38,7 +38,7 @@ const allTools = [
  */
 (async () => {
 	for (const profile of Object.values(profiles)) {
-		new AgentOrchestrator(profile, allTools);
+		new AgentOrchestrator(profile, allSkills);
 		await new Promise((resolve) => setTimeout(resolve, 5000));
 	}
 })();

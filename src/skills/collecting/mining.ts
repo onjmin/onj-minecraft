@@ -2,20 +2,20 @@ import type { Bot } from "mineflayer";
 import { goals } from "mineflayer-pathfinder";
 import type { Vec3 } from "vec3";
 import type { AgentOrchestrator } from "../../core/agent";
-import { createTool, type ToolResponse, toolResult } from "../types";
+import { createSkill, type SkillResponse, skillResult } from "../types";
 
 /**
  * Mining Domain: Autonomous ore extraction.
  * 採掘ドメイン：周囲の鉱石を自動的にスキャンして採掘します。
  */
-export const mineOresTool = createTool<void, { minedCount: number }>({
+export const mineOresSkill = createSkill<void, { minedCount: number }>({
 	name: "collecting.mining",
 	description:
 		"Scans for and mines nearby ores. IMPORTANT: You MUST have a pickaxe equipped or in your inventory. " +
 		"Mining with bare hands is extremely inefficient, takes too long, and results in NO item drops for most ores. " +
-		"If you lack a pickaxe, craft one first instead of using this tool.",
+		"If you lack a pickaxe, craft one first instead of using this skill.",
 	inputSchema: {} as any,
-	handler: async (agent: AgentOrchestrator): Promise<ToolResponse<{ minedCount: number }>> => {
+	handler: async (agent: AgentOrchestrator): Promise<SkillResponse<{ minedCount: number }>> => {
 		const { bot } = agent;
 
 		// 1. Scan for nearby ores
@@ -23,14 +23,14 @@ export const mineOresTool = createTool<void, { minedCount: number }>({
 		const orePositions = miningScanner.findNearbyOres(bot);
 
 		if (orePositions.length === 0) {
-			return toolResult.fail("No valuable ores found nearby. Try moving to a different location.");
+			return skillResult.fail("No valuable ores found nearby. Try moving to a different location.");
 		}
 
 		let minedCount = 0;
 
 		try {
 			for (const pos of orePositions) {
-				// Ensure we have an appropriate tool equipped (if possible)
+				// Ensure we have an appropriate skill equipped (if possible)
 				// 適切なツール（ツルハシ等）を装備（簡易実装）
 				const pickaxe = bot.inventory.items().find((item) => item.name.includes("pickaxe"));
 				if (pickaxe) await bot.equip(pickaxe, "hand");
@@ -48,11 +48,11 @@ export const mineOresTool = createTool<void, { minedCount: number }>({
 				}
 			}
 
-			return toolResult.ok(`Successfully extracted ${minedCount} ore blocks from the area.`, {
+			return skillResult.ok(`Successfully extracted ${minedCount} ore blocks from the area.`, {
 				minedCount,
 			});
 		} catch (err) {
-			return toolResult.fail(
+			return skillResult.fail(
 				`Mining process failed: ${err instanceof Error ? err.message : String(err)}`,
 			);
 		}

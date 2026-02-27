@@ -1,5 +1,5 @@
 import type { AgentOrchestrator } from "../../core/agent";
-import { createTool, type ToolResponse, toolResult } from "../types";
+import { createSkill, type SkillResponse, skillResult } from "../types";
 import { ensureFurnace } from "./util";
 
 /**
@@ -7,20 +7,20 @@ import { ensureFurnace } from "./util";
  * 精錬ドメイン：原料の加工。
  * かまどを確保し、レシピデータに基づいて焼けるアイテムと燃料を自動選別して投入します。
  */
-export const craftSmeltingTool = createTool<void, { item: string; amount: number }>({
+export const craftSmeltingSkill = createSkill<void, { item: string; amount: number }>({
 	name: "crafting.smelting",
 	description:
 		"Automatically identifies smeltable items and fuels using recipe data, and starts the smelting process.",
 	inputSchema: {} as any,
 	handler: async (
 		agent: AgentOrchestrator,
-	): Promise<ToolResponse<{ item: string; amount: number }>> => {
+	): Promise<SkillResponse<{ item: string; amount: number }>> => {
 		const { bot } = agent;
 
 		// 1. かまどの確保（util.ts の共通関数を使用）
 		const furnaceBlock = await ensureFurnace(bot);
 		if (!furnaceBlock) {
-			return toolResult.fail(
+			return skillResult.fail(
 				"Could not secure a furnace. Cobblestone (8) and a crafting table are required.",
 			);
 		}
@@ -35,7 +35,7 @@ export const craftSmeltingTool = createTool<void, { item: string; amount: number
 		});
 
 		if (!smeltable) {
-			return toolResult.fail("No items in inventory can be smelted in a furnace.");
+			return skillResult.fail("No items in inventory can be smelted in a furnace.");
 		}
 
 		// 3. 燃料（Fuel）の厳密な判定
@@ -53,7 +53,7 @@ export const craftSmeltingTool = createTool<void, { item: string; amount: number
 		});
 
 		if (!fuel) {
-			return toolResult.fail("No suitable fuel found in inventory.");
+			return skillResult.fail("No suitable fuel found in inventory.");
 		}
 
 		try {
@@ -68,7 +68,7 @@ export const craftSmeltingTool = createTool<void, { item: string; amount: number
 
 			furnace.close();
 
-			return toolResult.ok(
+			return skillResult.ok(
 				`Started smelting ${smeltable.count}x ${smeltable.name} using ${fuel.name}.`,
 				{
 					item: smeltable.name,
@@ -76,7 +76,7 @@ export const craftSmeltingTool = createTool<void, { item: string; amount: number
 				},
 			);
 		} catch (err) {
-			return toolResult.fail(
+			return skillResult.fail(
 				`Smelting action failed: ${err instanceof Error ? err.message : String(err)}`,
 			);
 		}

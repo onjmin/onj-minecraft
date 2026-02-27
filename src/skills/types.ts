@@ -7,47 +7,47 @@ type NoSnakeCase<T> = {
 		: T[K];
 };
 
-export interface ToolField {
+export interface SkillField {
 	type: "string" | "number" | "boolean";
 	description: string;
 	isRawData?: true; // STEP 2で隠蔽し、STEP 3で注入するフラグ
 }
 
 // 成功時と失敗時を型レベルで分離する
-export type ToolResponse<T = void> =
+export type SkillResponse<T = void> =
 	| { success: true; summary: string; data: T; error?: never }
 	| { success: false; summary: string; data?: never; error: string };
 
-export interface ToolDefinition<T, R = void> {
+export interface SkillDefinition<T, R = void> {
 	name: string;
 	description: string;
-	inputSchema: Record<keyof T, ToolField>;
-	handler: (agent: AgentOrchestrator, args: T) => Promise<ToolResponse<R>>;
+	inputSchema: Record<keyof T, SkillField>;
+	handler: (agent: AgentOrchestrator, args: T) => Promise<SkillResponse<R>>;
 }
 
-export function createTool<T extends NoSnakeCase<T>, R = void>(
-	definition: ToolDefinition<T, R>,
-): ToolDefinition<T, R> {
+export function createSkill<T extends NoSnakeCase<T>, R = void>(
+	definition: SkillDefinition<T, R>,
+): SkillDefinition<T, R> {
 	return definition;
 }
 
-export const toolResult = {
+export const skillResult = {
 	// R が void の場合は data を省略可能にするためのオーバーロード
-	ok: <R>(summary: string, data: R): ToolResponse<R> => ({
+	ok: <R>(summary: string, data: R): SkillResponse<R> => ({
 		success: true,
 		summary,
 		data,
 	}),
 	// 戻り値データがない(void)場合のヘルパー
-	okVoid: (summary: string): ToolResponse<void> => ({
+	okVoid: (summary: string): SkillResponse<void> => ({
 		success: true,
 		summary,
 		data: undefined,
 	}),
 	// fail は data を持たず、error を必須にする。
-	// R が何であっても代入可能なように ToolResponse<any> ではなく
+	// R が何であっても代入可能なように SkillResponse<any> ではなく
 	// Union 型の構造を利用する
-	fail: (error: string): ToolResponse<never> => ({
+	fail: (error: string): SkillResponse<never> => ({
 		success: false,
 		summary: `Error: ${error}`,
 		error,

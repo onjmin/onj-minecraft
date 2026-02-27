@@ -1,19 +1,19 @@
 import { goals } from "mineflayer-pathfinder";
 import type { AgentOrchestrator } from "../../core/agent";
-import { createTool, type ToolResponse, toolResult } from "../types";
+import { createSkill, type SkillResponse, skillResult } from "../types";
 
 /**
  * Collecting Domain: Hunting passive animals.
  * 収集ドメイン（狩猟）：食料や素材を得るために、周囲の動物を狩ります。
  */
-export const huntAnimalsTool = createTool<void, { hunted: string; success: boolean }>({
+export const huntAnimalsSkill = createSkill<void, { hunted: string; success: boolean }>({
 	name: "collecting.hunting",
 	description:
 		"Finds and hunts nearby animals (cows, pigs, sheep, chickens) for food and materials.",
 	inputSchema: {} as any,
 	handler: async (
 		agent: AgentOrchestrator,
-	): Promise<ToolResponse<{ hunted: string; success: boolean }>> => {
+	): Promise<SkillResponse<{ hunted: string; success: boolean }>> => {
 		const { bot } = agent;
 
 		// 1. Target animals (passive mobs)
@@ -24,7 +24,7 @@ export const huntAnimalsTool = createTool<void, { hunted: string; success: boole
 		});
 
 		if (!target) {
-			return toolResult.fail("No animals found nearby to hunt.");
+			return skillResult.fail("No animals found nearby to hunt.");
 		}
 
 		try {
@@ -66,13 +66,15 @@ export const huntAnimalsTool = createTool<void, { hunted: string; success: boole
 				}
 			}
 
-			return toolResult.ok(`Successfully hunted a ${target.name}.`, {
+			return skillResult.ok(`Successfully hunted a ${target.name}.`, {
 				hunted: target.name || "unknown",
 				ate: ate,
 				success: true,
 			});
 		} catch (err) {
-			return toolResult.fail(`Hunting failed: ${err instanceof Error ? err.message : String(err)}`);
+			return skillResult.fail(
+				`Hunting failed: ${err instanceof Error ? err.message : String(err)}`,
+			);
 		}
 	},
 });
