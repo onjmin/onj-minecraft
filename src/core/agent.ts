@@ -1,19 +1,24 @@
 import mineflayer from "mineflayer";
-import * as armorManagerMod from "mineflayer-armor-manager";
-import * as autoEatMod from "mineflayer-auto-eat";
-import * as collectblockMod from "mineflayer-collectblock";
 import { type goals, Movements, pathfinder } from "mineflayer-pathfinder";
-import * as pvpMod from "mineflayer-pvp";
 import { BotStateMachine } from "mineflayer-statemachine";
-import * as toolMod from "mineflayer-tool";
 import { Vec3 } from "vec3";
 import type { AgentProfile } from "../profiles/types";
 import { emitDiscordWebhook, translateWithRoleplay } from "./discord-webhook";
 import { llm } from "./llm-client";
 
+import autoEatPkg from "mineflayer-auto-eat";
+import armorManagerPkg from "mineflayer-armor-manager";
+import pvpPkg from "mineflayer-pvp";
+import collectblockPkg from "mineflayer-collectblock";
+import toolPkg from "mineflayer-tool";
+
 const getPlugin = (mod: any) => {
-	const plugin = mod?.plugin || mod?.default || mod;
-	return typeof plugin === "function" ? plugin : null;
+	if (!mod) return null;
+	if (typeof mod === "function") return mod;
+	if (mod.plugin && typeof mod.plugin === "function") return mod.plugin;
+	if (mod.default && typeof mod.default === "function") return mod.default;
+	if (mod.default?.plugin && typeof mod.default.plugin === "function") return mod.default.plugin;
+	return null;
 };
 
 let lastDiscordEmitAt = 0;
@@ -64,19 +69,21 @@ export class AgentOrchestrator {
 		this.bot.loadPlugin(pathfinder);
 
 		// constructor 内でロード
-		const plugins = [autoEatMod, armorManagerMod, pvpMod, collectblockMod, toolMod];
-		for (const p of plugins) {
-			const pluginFunc = getPlugin(p);
-			if (pluginFunc) {
-				this.bot.loadPlugin(pluginFunc);
+		const pluginSources = [pathfinder, autoEatPkg, armorManagerPkg, pvpPkg, collectblockPkg, toolPkg];
+		for (const src of pluginSources) {
+			const plugin = getPlugin(src);
+			if (plugin) {
+				this.bot.loadPlugin(plugin);
 			} else {
-				console.warn(`[Warning] Failed to load plugin:`, p);
+				console.error(`[Error] Failed to load plugin:`, src);
 			}
 		}
 
 		// 初期設定（一回だけ）
-		(this.bot as any).autoEat.options.priority = "foodPoints";
-		(this.bot as any).autoEat.options.bannedFood = ["rotten_flesh", "pufferfish"];
+		if ((this.bot as any).autoEat) {
+			(this.bot as any).autoEat.options.priority = "foodPoints";
+			(this.bot as any).autoEat.options.bannedFood = ["rotten_flesh", "pufferfish"];
+		}
 
 		// collectBlock設定
 		(this.bot as any).collectBlock.setInventoryFilter((item: any) => {
