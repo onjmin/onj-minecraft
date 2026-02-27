@@ -54,11 +54,17 @@ export class AgentOrchestrator {
 		this.bot.loadPlugin(pathfinder);
 
 		// constructor 内でロード
-		this.bot.loadPlugin(require("mineflayer-auto-eat"));
-		this.bot.loadPlugin(require("mineflayer-armor-manager"));
-		this.bot.loadPlugin(require("mineflayer-pvp"));
-		this.bot.loadPlugin(require("mineflayer-collectblock"));
-		this.bot.loadPlugin(require("mineflayer-tool"));
+		const autoEatPlugin = require("mineflayer-auto-eat");
+		const armorManagerPlugin = require("mineflayer-armor-manager");
+		const pvpPlugin = require("mineflayer-pvp");
+		const collectblockPlugin = require("mineflayer-collectblock");
+		const toolPlugin = require("mineflayer-tool");
+
+		this.bot.loadPlugin(autoEatPlugin.default || autoEatPlugin);
+		this.bot.loadPlugin(armorManagerPlugin.default || armorManagerPlugin);
+		this.bot.loadPlugin(pvpPlugin.default || pvpPlugin);
+		this.bot.loadPlugin(collectblockPlugin.default || collectblockPlugin);
+		this.bot.loadPlugin(toolPlugin.default || toolPlugin);
 
 		// 初期設定（一回だけ）
 		(this.bot as any).autoEat.options.priority = "foodPoints";
