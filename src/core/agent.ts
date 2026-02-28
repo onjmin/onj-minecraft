@@ -621,7 +621,6 @@ Skill: (exact name)`;
 	}
 
 	private isMoving: boolean = false;
-	private doorInterval: NodeJS.Timeout | null = null;
 
 	public async smartGoto(goal: goals.Goal): Promise<void> {
 		if (this.isMoving) {
@@ -632,135 +631,26 @@ Skill: (exact name)`;
 
 		this.isMoving = true;
 
-		const nonDestructiveMovements = new Movements(this.bot);
-		nonDestructiveMovements.digCost = 10;
-		nonDestructiveMovements.placeCost = 2;
-		nonDestructiveMovements.canDig = true;
-		nonDestructiveMovements.allowParkour = true;
-		nonDestructiveMovements.allow1by1towers = true;
-		nonDestructiveMovements.allowFreeMotion = true;
+		const movements = new Movements(this.bot);
+		movements.canDig = true;
+		movements.allowParkour = true;
+		movements.allow1by1towers = true;
+		movements.allowFreeMotion = true;
+		movements.allowSprinting = true;
 
-		const destructiveMovements = new Movements(this.bot);
-		destructiveMovements.canDig = true;
-		destructiveMovements.allowParkour = true;
-		destructiveMovements.allow1by1towers = true;
-		destructiveMovements.allowFreeMotion = true;
-
-		let finalMovements = destructiveMovements;
-
-		const pathfindTimeout = 1000;
-		const nonDestPath = await this.bot.pathfinder.getPathTo(nonDestructiveMovements, goal, pathfindTimeout);
-		if (nonDestPath.status === "success") {
-			finalMovements = nonDestructiveMovements;
-			console.log(`[Pathfinding] Found non-destructive path`);
-		} else {
-			const destPath = await this.bot.pathfinder.getPathTo(destructiveMovements, goal, pathfindTimeout);
-			if (destPath.status === "success") {
-				console.log(`[Pathfinding] Found destructive path`);
-			} else {
-				console.log(`[Pathfinding] No path found, attempting anyway`);
-			}
-		}
-
-		const doorCheckInterval = this.startDoorInterval();
-
-		this.bot.pathfinder.setMovements(finalMovements);
+		this.bot.pathfinder.setMovements(movements);
 
 		try {
 			await this.bot.pathfinder.goto(goal);
 		} catch (err) {
 			if (err instanceof Error && err.name === "GoalChanged") {
-				clearInterval(doorCheckInterval);
 				this.isMoving = false;
 				return;
 			}
 			console.log(`[Pathfinding] Error: ${err instanceof Error ? err.message : String(err)}`);
-
-			// フォールバック: 強制的にジャンプしながら進む
-			this.bot.pathfinder.stop();
-			this.bot.clearControlStates();
-
-			const targetPos = this.getGoalPosition(goal);
-			if (targetPos) {
-				await this.bot.lookAt(targetPos);
-			}
-
-			this.bot.setControlState("forward", true);
-			this.bot.setControlState("jump", true);
-			this.bot.setControlState("sprint", true);
-			await new Promise((r) => setTimeout(r, 1000));
-			this.bot.clearControlStates();
 		} finally {
-			clearInterval(doorCheckInterval);
 			this.isMoving = false;
 			this.bot.clearControlStates();
 		}
-	}
-
-	private getGoalPosition(goal: goals.Goal): Vec3 | null {
-		const g = goal as any;
-		if (g.x !== undefined && g.y !== undefined && g.z !== undefined) {
-			return new Vec3(g.x, g.y, g.z);
-		}
-		if (g.goal && g.goal.x !== undefined) {
-			return new Vec3(g.goal.x, g.goal.y, g.goal.z);
-		}
-		return null;
-	}
-
-	private startDoorInterval(): NodeJS.Timeout {
-		let prevPos = this.bot.entity.position.clone();
-		let prevCheck = Date.now();
-		let stuckTime = 0;
-
-		const interval = setInterval(() => {
-			if (!this.bot.entity) return;
-
-			const now = Date.now();
-			if (this.bot.entity.position.distanceTo(prevPos) >= 0.1) {
-				stuckTime = 0;
-			} else {
-				stuckTime += now - prevCheck;
-			}
-
-			if (stuckTime > 1200) {
-				console.log(`[DoorCheck] Bot stuck for ${stuckTime}ms, trying to open doors`);
-
-				const positions = [
-					this.bot.entity.position.clone(),
-					this.bot.entity.position.offset(0, 0, 1),
-					this.bot.entity.position.offset(0, 0, -1),
-					this.bot.entity.position.offset(1, 0, 0),
-					this.bot.entity.position.offset(-1, 0, 0),
-				];
-
-				const elevatedPositions = positions.map((p) => p.offset(0, 1, 0));
-				positions.push(...elevatedPositions);
-				positions.push(this.bot.entity.position.offset(0, 2, 0));
-				positions.push(this.bot.entity.position.offset(0, -1, 0));
-
-				for (const pos of positions) {
-					const block = this.bot.blockAt(pos);
-					if (
-						block &&
-						block.name &&
-						!block.name.includes("iron") &&
-						(block.name.includes("door") ||
-							block.name.includes("fence_gate") ||
-							block.name.includes("trapdoor"))
-					) {
-						this.bot.activateBlock(block);
-						break;
-					}
-				}
-				stuckTime = 0;
-			}
-
-			prevPos = this.bot.entity.position.clone();
-			prevCheck = now;
-		}, 200);
-
-		this.doorInterval = interval;
-		return interval;
 	}
 }
