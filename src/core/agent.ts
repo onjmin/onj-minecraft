@@ -655,15 +655,50 @@ Skill: (exact name)`;
 
 		this.bot.pathfinder.setMovements(movements);
 
+		let goalStr: string;
+		if (goal && typeof goal === "object") {
+			if ("x" in goal && goal.x !== undefined) {
+				goalStr = `(${goal.x}, ${goal.y}, ${goal.z})`;
+			} else {
+				goalStr = goal.constructor.name;
+			}
+		} else {
+			goalStr = String(goal);
+		}
+		console.log(`[Pathfinding] Starting path to goal: ${goalStr}`);
+		console.log(`[Pathfinding] Bot position: ${this.bot.entity.position}`);
+
+		const startPos = this.bot.entity.position.clone();
+		let lastPos = startPos.clone();
+		let stuckCount = 0;
+		const checkStuck = setInterval(() => {
+			const currentPos = this.bot.entity.position;
+			if (currentPos.distanceTo(lastPos) < 0.1) {
+				stuckCount++;
+			} else {
+				stuckCount = 0;
+			}
+			if (stuckCount >= 5) {
+				console.log(`[Pathfinding] Stuck detected! Position: ${currentPos}`);
+				this.bot.pathfinder.stop();
+			}
+			lastPos = currentPos.clone();
+		}, 500);
+
 		try {
 			await this.bot.pathfinder.goto(goal);
+			console.log(`[Pathfinding] Reached goal successfully!`);
 		} catch (err) {
 			if (err instanceof Error && err.name === "GoalChanged") {
 				this.isMoving = false;
 				return;
 			}
 			console.log(`[Pathfinding] Error: ${err instanceof Error ? err.message : String(err)}`);
+			console.log(`[Pathfinding] Current pos after error: ${this.bot.entity.position}`);
+			throw new Error(`Pathfinding failed: ${err instanceof Error ? err.message : String(err)}`);
 		} finally {
+			clearInterval(checkStuck);
+			this.isMoving = false;
 			this.isMoving = false;
 			this.bot.clearControlStates();
 		}

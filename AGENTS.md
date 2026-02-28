@@ -26,12 +26,6 @@ docker run --rm -v $(pwd)/node_modules:/output onj-minecraft cp -r /app/node_mod
 #### 4. docker-compose.yml
 - volumes設定で `/app/node_modules` を除外し、build結果のnode_modulesを優先させる
 
-#### 5. 動作確認
-```bash
-docker compose up -d
-docker compose logs
-```
-
 ### ソース修正時の参考
 
  `/home/loq26/workspace/mindcraft` は動作実績のあるプロジェクト。修正時は必ずmindcraftの 实现を比較参考すること。
