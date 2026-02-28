@@ -635,8 +635,16 @@ Skill: (exact name)`;
 		const nonDestructiveMovements = new Movements(this.bot);
 		nonDestructiveMovements.digCost = 10;
 		nonDestructiveMovements.placeCost = 2;
+		nonDestructiveMovements.canDig = true;
+		nonDestructiveMovements.allowParkour = true;
+		nonDestructiveMovements.allow1by1towers = true;
+		nonDestructiveMovements.allowFreeMotion = true;
 
 		const destructiveMovements = new Movements(this.bot);
+		destructiveMovements.canDig = true;
+		destructiveMovements.allowParkour = true;
+		destructiveMovements.allow1by1towers = true;
+		destructiveMovements.allowFreeMotion = true;
 
 		let finalMovements = destructiveMovements;
 
@@ -667,11 +675,37 @@ Skill: (exact name)`;
 				return;
 			}
 			console.log(`[Pathfinding] Error: ${err instanceof Error ? err.message : String(err)}`);
+
+			// フォールバック: 強制的にジャンプしながら進む
+			this.bot.pathfinder.stop();
+			this.bot.clearControlStates();
+
+			const targetPos = this.getGoalPosition(goal);
+			if (targetPos) {
+				await this.bot.lookAt(targetPos);
+			}
+
+			this.bot.setControlState("forward", true);
+			this.bot.setControlState("jump", true);
+			this.bot.setControlState("sprint", true);
+			await new Promise((r) => setTimeout(r, 1000));
+			this.bot.clearControlStates();
 		} finally {
 			clearInterval(doorCheckInterval);
 			this.isMoving = false;
 			this.bot.clearControlStates();
 		}
+	}
+
+	private getGoalPosition(goal: goals.Goal): Vec3 | null {
+		const g = goal as any;
+		if (g.x !== undefined && g.y !== undefined && g.z !== undefined) {
+			return new Vec3(g.x, g.y, g.z);
+		}
+		if (g.goal && g.goal.x !== undefined) {
+			return new Vec3(g.goal.x, g.goal.y, g.goal.z);
+		}
+		return null;
 	}
 
 	private startDoorInterval(): NodeJS.Timeout {
