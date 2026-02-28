@@ -637,6 +637,21 @@ Skill: (exact name)`;
 		movements.allow1by1towers = true;
 		movements.allowFreeMotion = true;
 		movements.allowSprinting = true;
+		movements.maxDropDown = 4;
+		movements.scafoldingBlocks = [
+			"dirt",
+			"cobblestone",
+			"gravel",
+			"sand",
+			"grass_block",
+			"stone",
+			"bricks",
+			"nether_brick",
+			"blackstone",
+			"deepslate",
+		];
+		movements.digCost = 1;
+		movements.placeCost = 2;
 
 		this.bot.pathfinder.setMovements(movements);
 

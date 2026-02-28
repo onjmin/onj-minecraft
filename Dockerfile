@@ -5,10 +5,17 @@ WORKDIR /app
 
 # pnpmのバージョンを package.json と一致させる
 RUN corepack enable && corepack prepare pnpm@10.17.1 --activate
+RUN apt-get update && apt-get install -y patch && rm -rf /var/lib/apt/lists/*
 COPY package.json pnpm-lock.yaml ./
+COPY patches patches/
 
 # 開発依存(tsx等)も含めてインストール（CI/CDやビルド用）
-RUN pnpm install --frozen-lockfile
+RUN pnpm install
+
+# mineflayer-pathfinderにpatchを適用
+RUN cp patches/mineflayer-pathfinder+2.4.5.patch node_modules/mineflayer-pathfinder/ && \
+    cd node_modules/mineflayer-pathfinder && \
+    patch -p1 < mineflayer-pathfinder+2.4.5.patch
 
 # --- Runtime Stage ---
 FROM node:24-bookworm-slim AS runner
