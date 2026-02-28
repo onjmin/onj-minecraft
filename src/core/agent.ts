@@ -621,6 +621,8 @@ Skill: (exact name)`;
 	}
 
 	private isMoving: boolean = false;
+	private lastPosition: Vec3 | null = null;
+	private stuckCounter: number = 0;
 
 	/**
 	 * 強化版 smartGoto: パスファインディングと動的な物理リカバリを組み合わせます。
@@ -629,28 +631,78 @@ Skill: (exact name)`;
 		if (this.isMoving) {
 			this.bot.pathfinder.stop();
 			this.bot.clearControlStates();
+			await new Promise((r) => setTimeout(r, 200));
 		}
+
 		this.isMoving = true;
+		this.stuckCounter = 0;
+		this.lastPosition = this.bot.entity.position.clone();
+
+		const movementMonitor = setInterval(() => {
+			if (!this.bot.entity) return;
+			const current = this.bot.entity.position;
+			if (this.lastPosition && current.distanceTo(this.lastPosition) < 0.1) {
+				this.stuckCounter++;
+				if (this.stuckCounter > 10) {
+					console.log(`[Stuck Detection] Bot seems stuck, triggering recovery`);
+					this.bot.pathfinder.stop();
+				}
+			} else {
+				this.stuckCounter = 0;
+			}
+			this.lastPosition = current.clone();
+		}, 500);
 
 		try {
-			// タイムアウトを短く設定し、ダメならすぐリカバリに回す
-			await this.bot.pathfinder.goto(goal).catch(async (err) => {
-				if (err.name === "GoalChanged") return;
+			const timeoutMs = 8000;
+			await Promise.race([
+				this.bot.pathfinder.goto(goal),
+				new Promise((_, reject) => setTimeout(() => reject(new Error("Pathfinding timeout")), timeoutMs)),
+			]);
+		} catch (err) {
+			if (err instanceof Error && err.name === "GoalChanged") return;
 
-				console.log(`[Recovery] Executing jump-forward...`);
-				// 詰まっている方向を向く
-				this.bot.setControlState("forward", true);
-				this.bot.setControlState("jump", true);
-				this.bot.setControlState("sprint", true);
-				await new Promise((r) => setTimeout(r, 1000));
-				this.bot.clearControlStates();
+			console.log(`[Recovery] Pathfinding failed: ${err instanceof Error ? err.message : String(err)}`);
 
-				// リカバリ後、もう一度だけ試行
-				await this.bot.pathfinder.goto(goal);
-			});
+			this.bot.pathfinder.stop();
+			this.bot.clearControlStates();
+
+			if (this.lastPosition) {
+				const targetPos = this.getGoalPosition(goal);
+				if (targetPos) {
+					await this.bot.lookAt(targetPos);
+				}
+			}
+
+			this.bot.setControlState("forward", true);
+			this.bot.setControlState("jump", true);
+			this.bot.setControlState("sprint", true);
+			await new Promise((r) => setTimeout(r, 800));
+			this.bot.clearControlStates();
+
+			try {
+				await Promise.race([
+					this.bot.pathfinder.goto(goal),
+					new Promise((_, reject) => setTimeout(() => reject(new Error("Retry timeout")), 5000)),
+				]);
+			} catch {
+				console.log(`[Recovery] Retry also failed, giving up`);
+			}
 		} finally {
+			clearInterval(movementMonitor);
 			this.isMoving = false;
 			this.bot.clearControlStates();
 		}
+	}
+
+	private getGoalPosition(goal: goals.Goal): Vec3 | null {
+		const g = goal as any;
+		if (g.x !== undefined && g.y !== undefined && g.z !== undefined) {
+			return new Vec3(g.x, g.y, g.z);
+		}
+		if (g.goal && g.goal.x !== undefined) {
+			return new Vec3(g.goal.x, g.goal.y, g.goal.z);
+		}
+		return null;
 	}
 }
