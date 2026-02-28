@@ -28,7 +28,7 @@ docker run --rm -v $(pwd)/node_modules:/output onj-minecraft cp -r /app/node_mod
 
 ### ソース修正時の参考
 
- `/home/loq26/workspace/mindcraft` は動作実績のあるプロジェクト。修正時は必ずmindcraftの 实现を比較参考すること。
+ `/home/loq26/workspace/mindcraft` は動作実績のあるプロジェクト。修正時はmindcraftを比較参考すること。
 
 #### 参考になるポイント
 - smartGoto / pathfinder の設定
