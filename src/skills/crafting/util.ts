@@ -1,6 +1,6 @@
 import type { Bot } from "mineflayer";
 import { Vec3 } from "vec3";
-import { AgentOrchestrator } from "../../core/agent";
+import type { AgentOrchestrator } from "../../core/agent";
 
 type Block = NonNullable<ReturnType<Bot["blockAt"]>>;
 
@@ -9,7 +9,7 @@ type Block = NonNullable<ReturnType<Bot["blockAt"]>>;
  * @returns 確保された作業台のBlockオブジェクト、確保失敗時は null
  */
 export async function ensureCraftingTable(agent: AgentOrchestrator): Promise<Block | null> {
-	const {bot} = agent
+	const { bot } = agent;
 
 	// 1. 周辺スキャン
 	const tableBlock = bot.findBlock({
@@ -35,11 +35,11 @@ export async function ensureCraftingTable(agent: AgentOrchestrator): Promise<Blo
 
 			if (!logItem) return null;
 
-			const recipes = bot.recipesAll(logItem.type, null, null);
-			const plankRecipe = recipes.find((r) => {
-				const output = bot.registry.items[r.result.id];
-				return output.name.endsWith("_planks");
-			});
+			const logBaseName = logItem.name.replace(/_log|_stem|_wood$/, "");
+			const plankItemName = `${logBaseName}_planks`;
+			const plankItem = bot.registry.itemsByName[plankItemName];
+			const recipes = bot.recipesFor(plankItem?.id, null, 1, null);
+			const plankRecipe = recipes[0];
 
 			if (!plankRecipe) return null;
 			await bot.craft(plankRecipe, 1);
@@ -79,8 +79,8 @@ export async function ensureCraftingTable(agent: AgentOrchestrator): Promise<Blo
  * @returns 確保されたかまどのBlockオブジェクト、確保失敗時は null
  */
 export async function ensureFurnace(agent: AgentOrchestrator): Promise<Block | null> {
-	const {bot} = agent
-	
+	const { bot } = agent;
+
 	// 1. 周辺スキャン
 	const furnaceBlock = bot.findBlock({
 		matching: bot.registry.blocksByName.furnace.id,
@@ -134,14 +134,18 @@ export async function ensureFurnace(agent: AgentOrchestrator): Promise<Block | n
  * @returns 確保成功時は true
  */
 export async function ensureSticks(agent: AgentOrchestrator, count = 4): Promise<boolean> {
-	const {bot} = agent
-	
+	const { bot } = agent;
+
 	// 1. インベントリ確認
 	const sticks = bot.inventory.items().find((i) => i.name === "stick");
+	agent.log(
+		`[ensureSticks] sticks found=${!!sticks}, count=${sticks?.count || 0}, required=${count}`,
+	);
 	if (sticks && sticks.count >= count) return true;
 
 	// 2. なければ作る（板材 -> 棒）
 	let planks = bot.inventory.items().find((i) => i.name.endsWith("_planks"));
+	agent.log(`[ensureSticks] planks: found=${!!planks}, count=${planks?.count || 0}`);
 
 	// 板材がない場合は原木から作る（再帰的に板材を確保するようなロジック）
 	if (!planks || planks.count < 2) {
@@ -149,17 +153,34 @@ export async function ensureSticks(agent: AgentOrchestrator, count = 4): Promise
 			.items()
 			.find((i) => i.name.endsWith("_log") || i.name.endsWith("_stem") || i.name.endsWith("_wood"));
 
-		if (!logItem) return false; // 原木もなければ不可
+		agent.log(
+			`[ensureSticks] logs: found=${!!logItem}, name=${logItem?.name}, count=${logItem?.count || 0}`,
+		);
 
-		const recipes = bot.recipesAll(logItem.type, null, null);
-		const plankRecipe = recipes.find((r) => {
-			const output = bot.registry.items[r.result.id];
-			return output.name.endsWith("_planks");
-		});
+		if (!logItem) {
+			agent.log(`[ensureSticks] FAIL: No logs in inventory`);
+			return false; // 原木もなければ不可
+		}
 
+		// 原木の種類に合わせて板材名を作る (birch_log -> birch_planks)
+		const logBaseName = logItem.name.replace(/_log|_stem|_wood$/, "");
+		const plankItemName = `${logBaseName}_planks`;
+		agent.log(`[ensureSticks] Looking for plank: ${plankItemName}`);
+		const plankItem = bot.registry.itemsByName[plankItemName];
+		agent.log(`[ensureSticks] plankItem: ${plankItem?.name}, id=${plankItem?.id}`);
+		const recipes = bot.recipesFor(plankItem?.id, null, 1, null);
+		agent.log(`[ensureSticks] Found ${recipes.length} plank recipes, idUsed=${plankItem?.id}`);
+
+		const plankRecipe = recipes[0];
+
+		agent.log(`[ensureSticks] plankRecipe: found=${!!plankRecipe}`);
 		if (!plankRecipe) return false;
+
 		await bot.craft(plankRecipe, 1);
 		planks = bot.inventory.items().find((i) => i.name.endsWith("_planks"));
+		agent.log(
+			`[ensureSticks] After crafting planks: found=${!!planks}, count=${planks?.count || 0}`,
+		);
 	}
 
 	// 3. 棒をクラフト（2枚の板材から4本の棒）
@@ -171,11 +192,16 @@ export async function ensureSticks(agent: AgentOrchestrator, count = 4): Promise
 			null, // 棒は作業台不要
 		)[0];
 
+		agent.log(`[ensureSticks] stickRecipe: found=${!!stickRecipe}`);
+
 		if (stickRecipe) {
 			await bot.craft(stickRecipe, Math.ceil(count / 4));
+			const sticksAfter = bot.inventory.items().find((i) => i.name === "stick");
+			agent.log(`[ensureSticks] After crafting sticks: count=${sticksAfter?.count || 0}`);
 			return true;
 		}
 	}
 
+	agent.log(`[ensureSticks] FAIL: Cannot craft sticks`);
 	return false;
 }

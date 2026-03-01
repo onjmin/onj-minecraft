@@ -11,7 +11,7 @@ export const craftSmeltingSkill = createSkill<void, { item: string; amount: numb
 	description:
 		"Automatically identifies smeltable items and fuels using recipe data, and starts the smelting process.",
 	inputSchema: {} as any,
-	handler: async ({agent, signal}): Promise<SkillResponse<{ item: string; amount: number }>> => {
+	handler: async ({ agent, signal }): Promise<SkillResponse<{ item: string; amount: number }>> => {
 		const { bot } = agent;
 
 		// 1. かまどの確保（util.ts の共通関数を使用）
@@ -27,7 +27,7 @@ export const craftSmeltingSkill = createSkill<void, { item: string; amount: numb
 		// 2. 精錬対象（Input）の厳密な判定
 		// かまどのレシピデータにそのアイテムが材料として含まれているかを確認
 		const smeltable = items.find((item) => {
-			const recipes = bot.recipesAll(item.type, null, furnaceBlock);
+			const recipes = bot.recipesAll(item.type, -1, 1, furnaceBlock);
 			return recipes.length > 0;
 		});
 
