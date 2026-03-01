@@ -415,17 +415,18 @@ export class AgentOrchestrator {
 					let result: SkillResponse | undefined;
 
 					try {
-						this.log(`${this.profile.displayName} ${skill.name}`);
+						this.log(`${skill.name} start`);
 						result = await skill.handler({
 							agent: this,
 							signal: controller.signal,
 						});
 					} catch (err) {
-						this.log(`${this.profile.displayName} ${skill.name} Aborted`);
+						this.log(`${skill.name} aborted`);
 						if (err instanceof Error && err?.message !== "Aborted") {
 							throw err;
 						}
 					}
+					this.log(`${skill.name} end`);
 
 					if (!result) {
 						this.log("result of handler is undefined");
@@ -634,8 +635,6 @@ Skill: (exact name)`;
 						// ゲーム内チャットに送信
 						this.bot.chat(chatMessage);
 					}
-
-					this.log(`${this.profile.displayName} ${foundSkillName}: ${rationale}`);
 
 					// --- ツールの実行とDiscord通知(思考) ---
 					if (foundSkillName && this.skills.has(foundSkillName)) {
