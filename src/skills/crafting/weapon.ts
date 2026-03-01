@@ -1,6 +1,6 @@
 import type { Bot } from "mineflayer";
 import { createSkill, type SkillResponse, skillResult } from "../types";
-import { ensureCraftingTable, ensureSticks } from "./util";
+import { ensureCraftingTable, ensurePlanks, ensureSticks } from "./util";
 
 /**
  * Crafting Domain: Weapon and Armor maintenance.
@@ -12,11 +12,13 @@ export const craftWeaponSkill = createSkill<void, { item: string; material: stri
 	description:
 		"Automatically crafts the best weapon or armor (Sword > Shield > Armor) you don't have yet.",
 	inputSchema: {} as any,
-	handler: async ({agent, signal}): Promise<SkillResponse<{ item: string; material: string }>> => {
+	handler: async ({
+		agent,
+		signal,
+	}): Promise<SkillResponse<{ item: string; material: string }>> => {
 		const { bot } = agent;
 
-		// 【ここに追加】ツールの材料を確定させる前に、まず棒を確保する
-		// ツール作成には最低2本必要なので、確保を試みる
+		// 棒を確保（武器作成には最低2本必要）
 		const sticksReady = await ensureSticks(agent, 2);
 		if (!sticksReady) {
 			// 棒が作れなかった（板材も原木もない）場合は、エラーではなく
@@ -25,6 +27,9 @@ export const craftWeaponSkill = createSkill<void, { item: string; material: stri
 				"Insufficient materials: Need sticks (or wood to make them) to craft skills.",
 			);
 		}
+
+		// 板材を事前に確保（木武器の場合は2枚以上必要）
+		await ensurePlanks(agent, 2);
 
 		// 1. 次に作るべき装備を判定
 		const target = craftingManager.determineNextWeapon(agent);
@@ -81,6 +86,14 @@ export const craftingManager = {
 				if (!hasShield && iron && planks && planks.count >= 1) {
 					return { skillType: "shield", material: "iron" };
 				}
+				// 原木からも作れる
+				const logs = items.find(
+					(it) =>
+						it.name.endsWith("_log") || it.name.endsWith("_stem") || it.name.endsWith("_wood"),
+				);
+				if (!hasShield && iron && logs) {
+					return { skillType: "shield", material: "iron" };
+				}
 				continue;
 			}
 
@@ -96,36 +109,39 @@ export const craftingManager = {
 
 			for (let i = 0; i < craftingManager.materials.length; i++) {
 				const mat = craftingManager.materials[i];
-				if (i >= currentBestIdx) break;
+				// currentBestIdx=999 は「持っていない」→スキップしない
+				if (currentBestIdx !== 999 && i >= currentBestIdx) continue;
 
 				// 金の防具は基本作らないようにスキップ（金ツールは作る場合があるが防具は効率が悪いため）
 				if (mat === "gold") continue;
 
-				const resourceName =
-					mat === "wooden" ? "oak_planks" : mat === "stone" ? "cobblestone" : `${mat}_ingot`;
-				const resource = items.find((it) => it.name === resourceName || it.name === mat);
-
-				// 必要素材数の簡易チェック（剣:2, メット:5, チェスト:8, レギンス:7, ブーツ:4）
-				const REQUIRED_MATERIALS = {
-					sword: 2,
-					helmet: 5,
-					chestplate: 8,
-					leggings: 7,
-					boots: 4,
-				} as const;
-
-				type EquipmentType = keyof typeof REQUIRED_MATERIALS;
-
-				// 判定ロジック
-				// type をあらかじめ EquipmentType | string として受けている想定
-				const required = REQUIRED_MATERIALS[type as EquipmentType] ?? 0;
-
-				if (resource && resource.count >= required) {
-					return { skillType: type, material: mat };
+				if (mat === "wooden") {
+					// 木素材: 板材または原木
+					const planks = items.find((it) => it.name.endsWith("_planks"));
+					const logs = items.find(
+						(it) =>
+							it.name.endsWith("_log") || it.name.endsWith("_stem") || it.name.endsWith("_wood"),
+					);
+					if (planks || logs) {
+						return { skillType: type, material: mat };
+					}
+				} else if (mat === "stone") {
+					const resourceName = "cobblestone";
+					const resource = items.find((it) => it.name === resourceName);
+					const REQUIRED = { sword: 2, helmet: 5, chestplate: 8, leggings: 7, boots: 4 };
+					if (resource && resource.count >= (REQUIRED as any)[type]) {
+						return { skillType: type, material: mat };
+					}
+				} else {
+					const resourceName = `${mat}_ingot`;
+					const resource = items.find((it) => it.name === resourceName);
+					const REQUIRED = { sword: 2, helmet: 5, chestplate: 8, leggings: 7, boots: 4 };
+					if (resource && resource.count >= (REQUIRED as any)[type]) {
+						return { skillType: type, material: mat };
+					}
 				}
 			}
 		}
 		return null;
 	},
-	// ... 前回の determineNextSkill もここにある
 };

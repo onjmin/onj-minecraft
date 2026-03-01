@@ -1,6 +1,6 @@
 import type { Bot } from "mineflayer";
 import { createSkill, type SkillResponse, skillResult } from "../types";
-import { ensureCraftingTable, ensureSticks } from "./util";
+import { ensureCraftingTable, ensurePlanks, ensureSticks } from "./util";
 
 /**
  * Crafting Domain: Equipment maintenance.
@@ -17,9 +17,9 @@ export const craftToolSkill = createSkill<void, { item: string; material: string
 	}): Promise<SkillResponse<{ item: string; material: string }>> => {
 		const { bot } = agent;
 
-		// 【ここに追加】ツールの材料を確定させる前に、まず棒を確保する
-		// ツール作成には最低2本必要なので、確保を試みる
 		agent.log(`[craftTool] Starting tool crafting...`);
+
+		// 棒を確保（ツール作成には最低2本必要）
 		const sticksReady = await ensureSticks(agent, 2);
 		agent.log(`[craftTool] Sticks ready: ${sticksReady}`);
 		if (!sticksReady) {
@@ -29,6 +29,9 @@ export const craftToolSkill = createSkill<void, { item: string; material: string
 				"Insufficient materials: Need sticks (or wood to make them) to craft tools.",
 			);
 		}
+		
+		// 板材を事前に確保（木ツールの場合は3枚必要）
+		await ensurePlanks(agent, 3);
 
 		// 1. 次に作るべきツールと素材を判定
 		const target = craftingManager.determineNextSkill(bot);
@@ -91,36 +94,86 @@ export const craftingManager = {
 
 	determineNextSkill: (bot: Bot): { skillType: string; material: string } | null => {
 		const items = bot.inventory.items();
+		console.log(
+			`[craftingManager] Inventory items: ${items.map((i) => `${i.name}:${i.count}`).join(", ")}`,
+		);
 
 		for (const type of craftingManager.types) {
+			console.log(`[craftingManager] Checking tool type: ${type}`);
+
 			// 現在そのカテゴリで持っている最高の素材を特定
 			let currentBestIdx = 999;
 			for (const item of items) {
 				if (item.name.endsWith(`_${type}`)) {
 					const mat = item.name.split("_")[0];
 					const idx = craftingManager.materials.indexOf(mat);
+					console.log(`[craftingManager] Found tool: ${item.name}, mat=${mat}, idx=${idx}`);
 					if (idx !== -1 && idx < currentBestIdx) currentBestIdx = idx;
 				}
 			}
+			console.log(
+				`[craftingManager] Current best for ${type}: idx=${currentBestIdx === 999 ? "none" : currentBestIdx}`,
+			);
 
 			// 作成可能な最高の素材をチェック
 			for (let i = 0; i < craftingManager.materials.length; i++) {
 				const mat = craftingManager.materials[i];
 
-				// 既に同等以上のものを持っていればこのツール種別はパス
-				if (i >= currentBestIdx) break;
+				// 既に同等以上の素材を持っていればスキップ
+				// currentBestIdx=999 は「持っていない」→スキップしない
+				if (currentBestIdx !== 999 && i >= currentBestIdx) {
+					console.log(`[craftingManager] Skip ${mat} (i=${i} >= currentBestIdx=${currentBestIdx})`);
+					continue;
+				}
 
-				// 素材アイテム名への変換（木だけ例外）
-				const resourceName =
-					mat === "wooden" ? "oak_planks" : mat === "stone" ? "cobblestone" : `${mat}_ingot`;
-				const resource = items.find((it) => it.name === resourceName || it.name === mat);
+				let requiredCount: number;
 
-				// 素材が足りているか（ツール作成には最低3個あればどのツールも作れる想定）
-				if (resource && resource.count >= 3) {
-					return { skillType: type, material: mat };
+				if (mat === "wooden") {
+					// 木ツール: 板材4つ以上、または原木1つ以上（板材に変換可能）
+					requiredCount = 4;
+					// インベントリにある任意の板材をチェック
+					const planks = items.find((it) => it.name.endsWith("_planks") && it.count >= 4);
+					const logs = items.find(
+						(it) =>
+							it.name.endsWith("_log") || it.name.endsWith("_stem") || it.name.endsWith("_wood"),
+					);
+					if (planks) {
+						console.log(`[craftingManager] CAN CRAFT: wooden_${type} with ${planks.name}`);
+						return { skillType: type, material: mat };
+					} else if (logs && logs.count >= 1) {
+						// 原木が1つあれば板材4つになるので作成可能
+						console.log(
+							`[craftingManager] CAN CRAFT: wooden_${type} (will convert from ${logs.name})`,
+						);
+						return { skillType: type, material: mat };
+					}
+					console.log(`[craftingManager] No planks or logs found`);
+				} else if (mat === "stone") {
+					requiredCount = 3;
+					const resourceName = "cobblestone";
+					const resource = items.find((it) => it.name === resourceName || it.name === mat);
+					console.log(
+						`[craftingManager] Checking ${mat}: resource=${resource?.name}, have=${resource?.count}, need=${requiredCount}`,
+					);
+					if (resource && resource.count >= requiredCount) {
+						console.log(`[craftingManager] CAN CRAFT: ${mat}_${type}`);
+						return { skillType: type, material: mat };
+					}
+				} else {
+					requiredCount = 3;
+					const resourceName = `${mat}_ingot`;
+					const resource = items.find((it) => it.name === resourceName || it.name === mat);
+					console.log(
+						`[craftingManager] Checking ${mat}: resource=${resource?.name}, have=${resource?.count}, need=${requiredCount}`,
+					);
+					if (resource && resource.count >= requiredCount) {
+						console.log(`[craftingManager] CAN CRAFT: ${mat}_${type}`);
+						return { skillType: type, material: mat };
+					}
 				}
 			}
 		}
+		console.log(`[craftingManager] No tool to craft`);
 		return null;
 	},
 };

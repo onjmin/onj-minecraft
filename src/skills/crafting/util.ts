@@ -271,3 +271,50 @@ export async function ensureSticks(agent: MinecraftAgent, count = 4): Promise<bo
 	agent.log(`[ensureSticks] FAIL: Cannot craft sticks`);
 	return false;
 }
+
+/**
+ * 共通ロジック：板材を確保する（原木から変換）
+ * @param agent エージェント
+ * @param minCount 必要な板材の数
+ * @returns 確保成功時は true
+ */
+export async function ensurePlanks(agent: MinecraftAgent, minCount = 4): Promise<boolean> {
+	const { bot } = agent;
+
+	const planks = bot.inventory.items().find((i) => i.name.endsWith("_planks"));
+	if (planks && planks.count >= minCount) {
+		agent.log(`[ensurePlanks] Already have enough planks: ${planks.count}`);
+		return true;
+	}
+
+	const logItem = bot.inventory
+		.items()
+		.find((i) => i.name.endsWith("_log") || i.name.endsWith("_stem") || i.name.endsWith("_wood"));
+
+	if (!logItem) {
+		agent.log(`[ensurePlanks] FAIL: No logs in inventory`);
+		return false;
+	}
+
+	// 原木の種類に合わせて板材名を作る
+	const logBaseName = logItem.name.replace(/_log|_stem|_wood$/, "");
+	const plankItemName = `${logBaseName}_planks`;
+	const plankItem = bot.registry.itemsByName[plankItemName];
+
+	agent.log(`[ensurePlanks] Converting ${logItem.name} to ${plankItemName}`);
+
+	const recipes = bot.recipesFor(plankItem?.id, null, 1, null);
+	if (recipes.length === 0) {
+		agent.log(`[ensurePlanks] FAIL: No recipe for ${plankItemName}`);
+		return false;
+	}
+
+	// 必要な板材の数に合わせて原木の数を変える（1原木 = 4板材）
+	const logsNeeded = Math.ceil(minCount / 4);
+	await bot.craft(recipes[0], logsNeeded);
+
+	const planksAfter = bot.inventory.items().find((i) => i.name.endsWith("_planks"));
+	agent.log(`[ensurePlanks] After crafting: count=${planksAfter?.count || 0}`);
+
+	return planksAfter && planksAfter.count >= minCount;
+}

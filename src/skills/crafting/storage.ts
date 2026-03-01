@@ -1,5 +1,5 @@
 import { createSkill, type SkillResponse, skillResult } from "../types";
-import { ensureCraftingTable } from "./util";
+import { ensureCraftingTable, ensurePlanks } from "./util";
 
 /**
  * Crafting Domain: Storage management.
@@ -10,8 +10,14 @@ export const craftStorageSkill = createSkill<void, { item: string; count: number
 	name: "crafting.storage",
 	description: "Crafts 1 chest from planks. Can be repeated to build up storage.",
 	inputSchema: {} as any,
-	handler: async ({agent, signal}): Promise<SkillResponse<{ item: string; count: number }>> => {
+	handler: async ({ agent, signal }): Promise<SkillResponse<{ item: string; count: number }>> => {
 		const { bot } = agent;
+		
+		// 板材を事前に確保（チェストは8板材必要）
+		const planksReady = await ensurePlanks(agent, 8);
+		if (!planksReady) {
+			return skillResult.fail("Insufficient materials: Need planks (or logs) to craft chest.");
+		}
 
 		// 1. 作業台の確保（共通関数を利用）
 		const table = await ensureCraftingTable(agent);
