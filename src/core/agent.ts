@@ -595,7 +595,7 @@ Skill: (exact name)`;
 
 					const rationale = rationaleMatch ? rationaleMatch[1].trim() : "No reasoning.";
 					let chatMessage = chatMatch ? chatMatch[1].trim() : "";
-					let foundSkillName = skillMatch ? skillMatch[1].trim() : null;
+					const foundSkillName = skillMatch ? skillMatch[1].trim() : null;
 
 					// 2. Chat内容の高度なクリーンアップ
 					if (chatMessage) {
@@ -849,27 +849,6 @@ Skill: (exact name)`;
 				stuckCount = 0;
 			}
 			if (stuckCount >= 5) {
-				const pos = this.bot.entity.position;
-
-				const from = `(${pos.x.toFixed(0)}, ${pos.y.toFixed(0)}, ${pos.z.toFixed(0)})`;
-
-				const gx = (goal as any).x;
-				const gy = (goal as any).y;
-				const gz = (goal as any).z;
-
-				const gxStr = typeof gx === "number" ? gx.toFixed(0) : "?";
-				const gyStr = typeof gy === "number" ? gy.toFixed(0) : "?";
-				const gzStr = typeof gz === "number" ? gz.toFixed(0) : "?";
-
-				const to = `(${gxStr}, ${gyStr}, ${gzStr})`;
-
-				const hasGoalPos =
-					typeof gx === "number" && typeof gy === "number" && typeof gz === "number";
-
-				const dist = hasGoalPos ? pos.distanceTo(new Vec3(gx, gy, gz)).toFixed(1) : "?";
-
-				this.log(`Pathfinding Stuck: From:${from} To:${to} Dist:${dist}m`);
-
 				this.bot.setControlState("jump", true);
 				setTimeout(() => this.bot.setControlState("jump", false), 200);
 			}
