@@ -176,9 +176,6 @@ export class AgentOrchestrator {
 			if (this.chatHistory.length > this.maxChatHistory) {
 				this.chatHistory.shift();
 			}
-
-			// オプション: 話しかけられたら即座に再考フェーズへ（30秒待たずに反応したい場合）
-			// this.triggerThinking();
 		});
 	}
 
@@ -597,6 +594,8 @@ Skill: (exact name)`;
 					let chatMessage = chatMatch ? chatMatch[1].trim() : "";
 					const foundSkillName = skillMatch ? skillMatch[1].trim() : null;
 
+					this.log(`${foundSkillName} ${rationale}`);
+
 					// 2. Chat内容の高度なクリーンアップ
 					if (chatMessage) {
 						// 1. キーワード混入対策: "Skill:" や "Rationale:" 以降をカット
@@ -671,7 +670,7 @@ Skill: (exact name)`;
 
 	private cancelCurrentExecution() {
 		if (this.currentAbort) {
-			this.currentAbort.abort();
+			this.currentAbort.abort("New task assigned by thinking loop");
 		}
 
 		try {
