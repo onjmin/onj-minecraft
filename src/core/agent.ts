@@ -690,12 +690,12 @@ Skill: (exact name)`;
 
 	private isMoving: boolean = false;
 
-	private checkAbort(signal: AbortSignal | undefined) {
+	private checkAbort(signal: AbortSignal | undefined): boolean {
 		if (signal?.aborted) {
-			const err = new Error("Aborted");
-			err.name = "AbortError";
-			throw err;
+			console.log("Abort detected, stopping execution...");
+			return true;
 		}
+		return false;
 	}
 
 	public async safeSetControlState(
@@ -703,12 +703,16 @@ Skill: (exact name)`;
 		value: boolean,
 		signal?: AbortSignal,
 	): Promise<void> {
-		this.checkAbort(signal);
+		if (this.checkAbort(signal)) {
+			throw new Error("Aborted");
+		}
 		this.bot.setControlState(control, value);
 	}
 
 	public async safeDig(block: any, signal?: AbortSignal): Promise<void> {
-		this.checkAbort(signal);
+		if (this.checkAbort(signal)) {
+			throw new Error("Aborted");
+		}
 		const p = new Promise<void>((resolve, reject) => {
 			const onAbort = () => {
 				this.bot.stopDigging();
@@ -724,7 +728,9 @@ Skill: (exact name)`;
 			signal?.addEventListener("abort", abortHandler);
 
 			this.bot.once("blockBreakProgressObserved", () => {
-				this.checkAbort(signal);
+				if (this.checkAbort(signal)) {
+					this.bot.stopDigging();
+				}
 			});
 
 			this.bot.once("diggingComplete", () => {
@@ -750,7 +756,9 @@ Skill: (exact name)`;
 		});
 
 		while (true) {
-			this.checkAbort(signal);
+			if (this.checkAbort(signal)) {
+				throw new Error("Aborted");
+			}
 			try {
 				await p;
 				return;
@@ -768,11 +776,15 @@ Skill: (exact name)`;
 	}
 
 	public async safeAttack(target: any, signal?: AbortSignal): Promise<void> {
-		this.checkAbort(signal);
+		if (this.checkAbort(signal)) {
+			throw new Error("Aborted");
+		}
 
 		const attackLoop = async () => {
 			while (true) {
-				this.checkAbort(signal);
+				if (this.checkAbort(signal)) {
+					throw new Error("Aborted");
+				}
 				try {
 					await this.bot.attack(target);
 				} catch (err) {
@@ -801,7 +813,9 @@ Skill: (exact name)`;
 	}
 
 	public async safeGoto(goal: goals.Goal, signal?: AbortSignal): Promise<void> {
-		this.checkAbort(signal);
+		if (this.checkAbort(signal)) {
+			throw new Error("Aborted");
+		}
 
 		if (this.currentGoal && this.currentGoal.equals?.(goal)) {
 			return;
@@ -834,7 +848,10 @@ Skill: (exact name)`;
 		let lastPos = startPos.clone();
 		let stuckCount = 0;
 		const checkStuck = setInterval(() => {
-			this.checkAbort(signal);
+			if (this.checkAbort(signal)) {
+				clearInterval(checkStuck);
+				return;
+			}
 			const currentPos = this.bot.entity.position;
 			if (currentPos.distanceTo(lastPos) < 0.1) {
 				stuckCount++;
@@ -853,7 +870,9 @@ Skill: (exact name)`;
 
 		try {
 			do {
-				this.checkAbort(signal);
+				if (this.checkAbort(signal)) {
+					throw new Error("Aborted");
+				}
 				try {
 					await this.bot.pathfinder.goto(goal);
 					console.log(`[Pathfinding] Reached goal successfully!`);
@@ -876,4 +895,3 @@ Skill: (exact name)`;
 		return this.safeGoto(goal, this.currentAbort?.signal);
 	}
 }
-
