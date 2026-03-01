@@ -48,6 +48,7 @@ export const huntAnimalsSkill = createSkill<void, { hunted: string; success: boo
 			// ドロップアイテムを拾うために少し待機して移動（脊髄反射）
 			await new Promise((r) => setTimeout(r, 800));
 			await agent.abortableGoto(signal, new goals.GoalNear(pos.x, pos.y, pos.z, 1));
+			await agent.pickupNearbyItems();
 
 			let ate = false;
 

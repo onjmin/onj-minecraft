@@ -16,7 +16,7 @@ export const craftToolSkill = createSkill<void, { item: string; material: string
 
 		// 【ここに追加】ツールの材料を確定させる前に、まず棒を確保する
 		// ツール作成には最低2本必要なので、確保を試みる
-		const sticksReady = await ensureSticks(bot, 2);
+		const sticksReady = await ensureSticks(agent, 2);
 		if (!sticksReady) {
 			// 棒が作れなかった（板材も原木もない）場合は、エラーではなく
 			// 「素材不足」として失敗させることで、LLMに伐採などを促す
@@ -38,7 +38,7 @@ export const craftToolSkill = createSkill<void, { item: string; material: string
 
 		try {
 			// 2. 作業台の確保
-			const craftingTable = await ensureCraftingTable(agent.bot);
+			const craftingTable = await ensureCraftingTable(agent);
 
 			if (!craftingTable) {
 				return skillResult.fail(

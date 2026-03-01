@@ -14,7 +14,7 @@ export const craftStorageSkill = createSkill<void, { item: string; count: number
 		const { bot } = agent;
 
 		// 1. 作業台の確保（共通関数を利用）
-		const table = await ensureCraftingTable(bot);
+		const table = await ensureCraftingTable(agent);
 		if (!table) {
 			return skillResult.fail("Could not secure a crafting table for storage crafting.");
 		}

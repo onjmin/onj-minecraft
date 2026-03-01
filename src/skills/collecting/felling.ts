@@ -39,6 +39,7 @@ export const fellTreesSkill = createSkill<void, { count: number }>({
 					}
 					await agent.abortableDig(signal, block);
 					felledCount++;
+					await agent.pickupNearbyItems();
 				}
 			}
 

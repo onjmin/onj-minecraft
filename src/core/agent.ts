@@ -878,4 +878,21 @@ Skill: (exact name)`;
 			this.bot.clearControlStates();
 		}
 	}
+
+	public async pickupNearbyItems(): Promise<void> {
+		const collectBlock = (this.bot as any).collectBlock;
+		if (!collectBlock) {
+			const items = this.bot.nearbyEntities.filter((e) => e.objectType === "Item");
+			for (const item of items) {
+				try {
+					await this.bot.collectItem(item);
+				} catch {
+					await this.bot.entityCollect(item);
+				}
+			}
+			return;
+		}
+
+		await collectBlock.collectNearby();
+	}
 }

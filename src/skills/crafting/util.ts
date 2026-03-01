@@ -1,5 +1,6 @@
 import type { Bot } from "mineflayer";
 import { Vec3 } from "vec3";
+import { AgentOrchestrator } from "../../core/agent";
 
 type Block = NonNullable<ReturnType<Bot["blockAt"]>>;
 
@@ -7,7 +8,9 @@ type Block = NonNullable<ReturnType<Bot["blockAt"]>>;
  * 共通ロジック：作業台を確保する（周辺スキャン -> 作成 -> 設置）
  * @returns 確保された作業台のBlockオブジェクト、確保失敗時は null
  */
-export async function ensureCraftingTable(bot: Bot): Promise<Block | null> {
+export async function ensureCraftingTable(agent: AgentOrchestrator): Promise<Block | null> {
+	const {bot} = agent
+
 	// 1. 周辺スキャン
 	const tableBlock = bot.findBlock({
 		matching: bot.registry.blocksByName.crafting_table.id,
@@ -75,7 +78,9 @@ export async function ensureCraftingTable(bot: Bot): Promise<Block | null> {
  * 共通ロジック：かまどを確保する（周辺スキャン -> 作成 -> 設置）
  * @returns 確保されたかまどのBlockオブジェクト、確保失敗時は null
  */
-export async function ensureFurnace(bot: Bot): Promise<Block | null> {
+export async function ensureFurnace(agent: AgentOrchestrator): Promise<Block | null> {
+	const {bot} = agent
+	
 	// 1. 周辺スキャン
 	const furnaceBlock = bot.findBlock({
 		matching: bot.registry.blocksByName.furnace.id,
@@ -95,7 +100,7 @@ export async function ensureFurnace(bot: Bot): Promise<Block | null> {
 		if (!cobble || cobble.count < 8) return null;
 
 		// かまど作成には作業台が必要
-		const table = await ensureCraftingTable(bot);
+		const table = await ensureCraftingTable(agent);
 		if (!table) return null;
 
 		const furnaceRecipe = bot.recipesFor(bot.registry.itemsByName.furnace.id, null, 1, table)[0];
@@ -128,7 +133,9 @@ export async function ensureFurnace(bot: Bot): Promise<Block | null> {
  * 作業台は不要ですが、材料（板材/原木）がない場合は作成を試みます。
  * @returns 確保成功時は true
  */
-export async function ensureSticks(bot: Bot, count = 4): Promise<boolean> {
+export async function ensureSticks(agent: AgentOrchestrator, count = 4): Promise<boolean> {
+	const {bot} = agent
+	
 	// 1. インベントリ確認
 	const sticks = bot.inventory.items().find((i) => i.name === "stick");
 	if (sticks && sticks.count >= count) return true;

@@ -15,7 +15,7 @@ export const craftSmeltingSkill = createSkill<void, { item: string; amount: numb
 		const { bot } = agent;
 
 		// 1. かまどの確保（util.ts の共通関数を使用）
-		const furnaceBlock = await ensureFurnace(bot);
+		const furnaceBlock = await ensureFurnace(agent);
 		if (!furnaceBlock) {
 			return skillResult.fail(
 				"Could not secure a furnace. Cobblestone (8) and a crafting table are required.",
