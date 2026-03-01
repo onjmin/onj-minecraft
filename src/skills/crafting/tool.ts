@@ -11,12 +11,17 @@ export const craftToolSkill = createSkill<void, { item: string; material: string
 	description:
 		"Checks inventory and crafts the best possible tool (pickaxe, axe, shovel, or hoe) that is missing or needs an upgrade.",
 	inputSchema: {} as any,
-	handler: async ({agent, signal}): Promise<SkillResponse<{ item: string; material: string }>> => {
+	handler: async ({
+		agent,
+		signal,
+	}): Promise<SkillResponse<{ item: string; material: string }>> => {
 		const { bot } = agent;
 
 		// 【ここに追加】ツールの材料を確定させる前に、まず棒を確保する
 		// ツール作成には最低2本必要なので、確保を試みる
+		agent.log(`[craftTool] Starting tool crafting...`);
 		const sticksReady = await ensureSticks(agent, 2);
+		agent.log(`[craftTool] Sticks ready: ${sticksReady}`);
 		if (!sticksReady) {
 			// 棒が作れなかった（板材も原木もない）場合は、エラーではなく
 			// 「素材不足」として失敗させることで、LLMに伐採などを促す
@@ -27,6 +32,9 @@ export const craftToolSkill = createSkill<void, { item: string; material: string
 
 		// 1. 次に作るべきツールと素材を判定
 		const target = craftingManager.determineNextSkill(bot);
+		agent.log(
+			`[craftTool] Target tool: ${target ? `${target.material}_${target.skillType}` : "none"}`,
+		);
 
 		if (!target) {
 			return skillResult.fail(
@@ -39,6 +47,7 @@ export const craftToolSkill = createSkill<void, { item: string; material: string
 		try {
 			// 2. 作業台の確保
 			const craftingTable = await ensureCraftingTable(agent);
+			agent.log(`[craftTool] Crafting table: ${craftingTable ? "found" : "not found"}`);
 
 			if (!craftingTable) {
 				return skillResult.fail(
@@ -49,12 +58,14 @@ export const craftToolSkill = createSkill<void, { item: string; material: string
 			// 3. レシピの取得とクラフト
 			const item = bot.registry.itemsByName[itemName];
 			const recipes = bot.recipesFor(item.id, null, 1, craftingTable);
+			agent.log(`[craftTool] Found ${recipes.length} recipes for ${itemName}`);
 
 			if (recipes.length === 0) {
 				return skillResult.fail(`Insufficient materials or no recipe for ${itemName}.`);
 			}
 
 			await bot.craft(recipes[0], 1, craftingTable);
+			agent.log(`[craftTool] SUCCESS: Crafted ${itemName}`);
 
 			return skillResult.ok(`Upgraded equipment: Crafted 1 ${itemName}.`, {
 				item: target.skillType,
