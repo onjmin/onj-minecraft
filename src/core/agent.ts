@@ -405,7 +405,7 @@ export class AgentOrchestrator {
 			const skill = this.skills.get(this.currentTaskName);
 			if (skill) {
 				try {
-					if (this.currentAbort) {
+					if (this.currentAbort && !this.currentAbort.signal.aborted) {
 						this.currentAbort.abort();
 					}
 
@@ -813,26 +813,6 @@ Skill: (exact name)`;
 	}
 
 	public async abortableGoto(signal: AbortSignal, goal: goals.Goal): Promise<void> {
-		const g = goal as any;
-		const currentPos = this.bot.entity.position;
-
-		const isValidNumber = (v: unknown): v is number => typeof v === "number" && !Number.isNaN(v);
-
-		const safeX = isValidNumber(g.x) ? g.x : currentPos.x;
-		const safeY = isValidNumber(g.y) ? g.y : currentPos.y;
-		const safeZ = isValidNumber(g.z) ? g.z : currentPos.z;
-
-		let finalGoal = goal;
-
-		if (!isValidNumber(g.x) || !isValidNumber(g.y) || !isValidNumber(g.z)) {
-			this.log(
-				`Pathfinding: Invalid Goal detected! Auto-correcting to: (${safeX.toFixed(1)}, ${safeY.toFixed(1)}, ${safeZ.toFixed(1)})`,
-			);
-			finalGoal = new goals.GoalNear(safeX, safeY, safeZ, 1);
-		}
-
-		goal = finalGoal;
-
 		if (this.checkAbort(signal)) {
 			throw new Error("Aborted");
 		}
@@ -851,23 +831,6 @@ Skill: (exact name)`;
 
 		this.isMoving = true;
 
-		let goalStr: string;
-		if (goal && typeof goal === "object" && "x" in goal && "y" in goal && "z" in goal) {
-			const { x, y, z } = goal as {
-				x: unknown;
-				y: unknown;
-				z: unknown;
-			};
-
-			goalStr = `(${x}, ${y}, ${z})`;
-		} else if (goal && typeof goal === "object") {
-			goalStr = goal.constructor.name;
-		} else {
-			goalStr = String(goal);
-		}
-		this.log(`Pathfinding: Starting path to goal: ${goalStr}`);
-		this.log(`Pathfinding: Bot position: ${this.bot.entity.position}`);
-
 		const startPos = this.bot.entity.position.clone();
 		let lastPos = startPos.clone();
 		let stuckCount = 0;
@@ -885,18 +848,24 @@ Skill: (exact name)`;
 			if (stuckCount >= 5) {
 				const pos = this.bot.entity.position;
 
-				const from = `(${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)})`;
+				const from = `(${pos.x.toFixed(0)}, ${pos.y.toFixed(0)}, ${pos.z.toFixed(0)})`;
 
 				const gx = (goal as any).x;
 				const gy = (goal as any).y;
 				const gz = (goal as any).z;
 
+				const gxStr = typeof gx === "number" ? gx.toFixed(0) : "?";
+				const gyStr = typeof gy === "number" ? gy.toFixed(0) : "?";
+				const gzStr = typeof gz === "number" ? gz.toFixed(0) : "?";
+
+				const to = `(${gxStr}, ${gyStr}, ${gzStr})`;
+
 				const hasGoalPos =
 					typeof gx === "number" && typeof gy === "number" && typeof gz === "number";
 
-				const to = hasGoalPos ? `(${gx.toFixed(1)}, ${gy.toFixed(1)}, ${gz.toFixed(1)})` : "(?)";
-
-				const dist = hasGoalPos ? pos.distanceTo(new Vec3(gx, gy, gz)).toFixed(1) : "?";
+				const dist = hasGoalPos
+					? pos.distanceTo(new Vec3(gx, gy, gz)).toFixed(1)
+					: "?";
 
 				this.log(`Pathfinding Stuck: From:${from} To:${to} Dist:${dist}m`);
 

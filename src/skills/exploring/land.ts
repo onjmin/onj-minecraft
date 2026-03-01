@@ -3,85 +3,89 @@ import { Vec3 } from "vec3";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
 export const exploreLandSkill = createSkill<void, { x: number; z: number }>({
-	name: "exploring.explore_land",
-	description:
-		"Explores the surface by sampling nearby safe ground. Avoids walls and steep cliffs.",
-	inputSchema: {} as any,
-	handler: async ({ agent, signal }): Promise<SkillResponse<{ x: number; z: number }>> => {
-		const { bot } = agent;
+    name: "exploring.explore_land",
+    description: "Explores the nearby surface by sampling safe ground, prioritizing the forward direction.",
+    inputSchema: {} as any,
+    handler: async ({ agent, signal }): Promise<SkillResponse<{ x: number; z: number }>> => {
+        const { bot } = agent;
+        const currentPos = bot.entity.position;
+        const currentY = Math.floor(currentPos.y);
+        const yaw = bot.entity.yaw; // 現在の向き
 
-		// --- 1. インテリジェント・サンプリング ---
-		const candidates: Vec3[] = [];
-		const radius = 15;
-		const currentY = Math.floor(bot.entity.position.y);
+        // --- 1. 段階的・方向優先サンプリング ---
+        // 遠く(16)から近く(4)へ、あるいはその逆でも良いですが、
+        // 「探索」なら少し遠め(12~16)を最初に狙い、ダメなら手前に落とすのが自然です。
+        const radii = [16, 8, 4];
+        let targetPos: Vec3 | null = null;
 
-		for (let i = 0; i < 20; i++) {
-			const dx = Math.floor((Math.random() - 0.5) * radius * 2);
-			const dz = Math.floor((Math.random() - 0.5) * radius * 2);
-			const tx = Math.floor(bot.entity.position.x + dx);
-			const tz = Math.floor(bot.entity.position.z + dz);
+        search: for (const radius of radii) {
+            const attempts = 8;
+            for (let i = 0; i < attempts; i++) {
+                // 前方優先ロジック: 
+                // 完全にランダムではなく、現在の視線方向に ±90度のバイアスをかける
+                const angleOffset = (Math.random() - 0.5) * Math.PI; // ±90度
+                const finalAngle = yaw + angleOffset;
+                
+                const dist = radius * (0.5 + Math.random() * 0.5); // 半径の50%〜100%の距離
+                const dx = Math.floor(-Math.sin(finalAngle) * dist);
+                const dz = Math.floor(-Math.cos(finalAngle) * dist);
+                
+                const tx = Math.floor(currentPos.x + dx);
+                const tz = Math.floor(currentPos.z + dz);
 
-			// getHighestBlockYAt の代替ロジック：
-			// 現在の高さから上下5ブロックの範囲で地面を探す
-			let foundY: number | null = null;
-			for (let dy = 5; dy >= -5; dy--) {
-				const checkPos = new Vec3(tx, currentY + dy, tz);
-				const block = bot.blockAt(checkPos);
-				const up1 = bot.blockAt(checkPos.offset(0, 1, 0));
-				const up2 = bot.blockAt(checkPos.offset(0, 2, 0));
+                // 地面探索ロジック
+                let foundY: number | null = null;
+                for (let dy = 5; dy >= -5; dy--) {
+                    const checkPos = new Vec3(tx, currentY + dy, tz);
+                    const block = bot.blockAt(checkPos);
+                    const up1 = bot.blockAt(checkPos.offset(0, 1, 0));
+                    const up2 = bot.blockAt(checkPos.offset(0, 2, 0));
 
-				// 「足場が実体」かつ「その上が2マス空き」ならそこを地面とする
-				if (
-					block &&
-					block.boundingBox === "block" &&
-					up1?.boundingBox === "empty" &&
-					up2?.boundingBox === "empty"
-				) {
-					foundY = currentY + dy + 1;
-					break;
-				}
-			}
+                    if (block?.boundingBox === "block" && 
+                        up1?.boundingBox === "empty" && 
+                        up2?.boundingBox === "empty") {
+                        
+                        // 危険ブロック（溶岩・水）を避ける
+                        const groundBlock = block;
+                        if (groundBlock.name !== "water" && groundBlock.name !== "lava") {
+                            foundY = currentY + dy + 1;
+                            break;
+                        }
+                    }
+                }
 
-			if (foundY === null) continue;
+                if (foundY !== null) {
+                    targetPos = new Vec3(tx, foundY, tz);
+                    break search; // 見つかったら即座に決定
+                }
+            }
+        }
 
-			const finalPos = new Vec3(tx, foundY, tz);
-			const groundBlock = bot.blockAt(finalPos.offset(0, -1, 0));
+        if (!targetPos) {
+            return skillResult.fail("No safe ground found in sampling.");
+        }
 
-			// 水などは除外
-			if (groundBlock && groundBlock.name !== "water" && groundBlock.name !== "lava") {
-				candidates.push(finalPos);
-			}
-		}
+        const { x, y, z } = targetPos;
 
-		const targetPos =
-			candidates.length > 0 ? candidates[Math.floor(Math.random() * candidates.length)] : null;
+        try {
+            // --- 2. XZ平面による移動 (Yはパスファインダーに任せる) ---
+            // これにより、段差の上を指定して「登れない！」となる事故を防げます
+            await Promise.race([
+                agent.abortableGoto(signal, new goals.GoalNearXZ(x, z, 1)),
+                new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 20000)),
+            ]);
 
-		if (!targetPos) {
-			return skillResult.fail("No safe ground found in sampling.");
-		}
+            return skillResult.ok("Reached destination.", { x, z });
+        } catch (err) {
+            // --- 3. リカバリ (スタック解除) ---
+            bot.clearControlStates();
+            // 失敗時は少し後ろに下がってジャンプ（挟まり防止）
+            bot.setControlState("back", true);
+            bot.setControlState("jump", true);
+            await new Promise((r) => setTimeout(r, 500));
+            bot.clearControlStates();
 
-		const { x, y, z } = targetPos;
-
-		try {
-			// --- 2. 3次元目的地による移動 ---
-			await Promise.race([
-				agent.abortableGoto(signal, new goals.GoalNear(x, y, z, 1)),
-				new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 30000)),
-			]);
-
-			return skillResult.ok("Reached destination.", { x, z });
-		} catch {
-			// --- 3. リカバリ処理 ---
-			bot.clearControlStates();
-			const escapeYaw = bot.entity.yaw + (Math.random() > 0.5 ? 1 : -1);
-			await bot.look(escapeYaw, bot.entity.pitch, true);
-			bot.setControlState("forward", true);
-			bot.setControlState("jump", true);
-
-			await new Promise((r) => setTimeout(r, 600));
-			bot.clearControlStates();
-
-			return skillResult.fail("Movement failed.");
-		}
-	},
+            return skillResult.fail("Movement failed or timed out.");
+        }
+    },
 });
