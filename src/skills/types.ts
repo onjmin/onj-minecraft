@@ -22,7 +22,7 @@ export interface SkillDefinition<T, R = void> {
 	name: string;
 	description: string;
 	inputSchema: Record<keyof T, SkillField>;
-	handler: (agent: AgentOrchestrator, args: T) => Promise<SkillResponse<R>>;
+	handler: ({agent, signal, args}: {agent: AgentOrchestrator, signal: AbortSignal, args: T}) => Promise<SkillResponse<R>>;
 }
 
 export function createSkill<T extends NoSnakeCase<T>, R = void>(

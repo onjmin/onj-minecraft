@@ -1,5 +1,4 @@
 import { goals } from "mineflayer-pathfinder";
-import type { AgentOrchestrator } from "../../core/agent";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
 /**
@@ -11,9 +10,10 @@ export const huntAnimalsSkill = createSkill<void, { hunted: string; success: boo
 	description:
 		"Finds and hunts nearby animals (cows, pigs, sheep, chickens) for food and materials.",
 	inputSchema: {} as any,
-	handler: async (
-		agent: AgentOrchestrator,
-	): Promise<SkillResponse<{ hunted: string; success: boolean }>> => {
+	handler: async ({
+		agent,
+		signal,
+	}): Promise<SkillResponse<{ hunted: string; success: boolean }>> => {
 		const { bot } = agent;
 
 		// 1. Target animals (passive mobs)
@@ -42,7 +42,7 @@ export const huntAnimalsSkill = createSkill<void, { hunted: string; success: boo
 
 			// Attack the entity
 			// 攻撃実行
-			await bot.attack(target);
+			await agent.safeAttack(target, signal);
 
 			// 4. Wait a moment and collect drops (Reflex)
 			// ドロップアイテムを拾うために少し待機して移動（脊髄反射）
@@ -71,12 +71,12 @@ export const huntAnimalsSkill = createSkill<void, { hunted: string; success: boo
 				ate: ate,
 				success: true,
 			});
-	} catch (err) {
-		const errorMsg = err instanceof Error ? err.message : String(err);
-		if (errorMsg.includes("Cancelled") || errorMsg.includes("stop")) {
-			return skillResult.fail("Hunting cancelled by combat");
+		} catch (err) {
+			const errorMsg = err instanceof Error ? err.message : String(err);
+			if (errorMsg.includes("Cancelled") || errorMsg.includes("stop")) {
+				return skillResult.fail("Hunting cancelled by combat");
+			}
+			return skillResult.fail(`Hunting failed: ${errorMsg}`);
 		}
-		return skillResult.fail(`Hunting failed: ${errorMsg}`);
-	}
 	},
 });

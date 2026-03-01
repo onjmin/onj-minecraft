@@ -1,4 +1,3 @@
-import type { AgentOrchestrator } from "../../core/agent";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 import { ensureCraftingTable } from "./util";
 
@@ -11,9 +10,7 @@ export const craftStorageSkill = createSkill<void, { item: string; count: number
 	name: "crafting.storage",
 	description: "Crafts 1 chest from planks. Can be repeated to build up storage.",
 	inputSchema: {} as any,
-	handler: async (
-		agent: AgentOrchestrator,
-	): Promise<SkillResponse<{ item: string; count: number }>> => {
+	handler: async ({agent, signal}): Promise<SkillResponse<{ item: string; count: number }>> => {
 		const { bot } = agent;
 
 		// 1. 作業台の確保（共通関数を利用）

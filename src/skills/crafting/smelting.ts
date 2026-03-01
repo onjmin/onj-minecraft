@@ -1,4 +1,3 @@
-import type { AgentOrchestrator } from "../../core/agent";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 import { ensureFurnace } from "./util";
 
@@ -12,9 +11,7 @@ export const craftSmeltingSkill = createSkill<void, { item: string; amount: numb
 	description:
 		"Automatically identifies smeltable items and fuels using recipe data, and starts the smelting process.",
 	inputSchema: {} as any,
-	handler: async (
-		agent: AgentOrchestrator,
-	): Promise<SkillResponse<{ item: string; amount: number }>> => {
+	handler: async ({agent, signal}): Promise<SkillResponse<{ item: string; amount: number }>> => {
 		const { bot } = agent;
 
 		// 1. かまどの確保（util.ts の共通関数を使用）

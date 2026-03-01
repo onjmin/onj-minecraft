@@ -62,6 +62,11 @@ export class AgentOrchestrator {
 	private chatHistory: ChatLog[] = [];
 	private maxChatHistory = 10;
 
+	private taskGeneration = 0;
+	private currentGoal: goals.Goal | null = null;
+
+	private currentAbort?: AbortController;
+
 	constructor(profile: AgentProfile, skillList: any[]) {
 		this.profile = profile;
 		this.skills = new Map(skillList.map((t) => [t.name, t]));
@@ -307,12 +312,24 @@ export class AgentOrchestrator {
 
 		this.shouldStopSkill = true;
 
+		if (this.currentAbort) {
+			this.currentAbort.abort();
+		}
+
+		try {
+			this.bot.pathfinder.setGoal(null);
+		} catch (e) {}
+
 		try {
 			this.bot.pathfinder.stop();
 		} catch (e) {}
 
 		try {
-			(this.bot as any).collectBlock.stop();
+			this.bot.stopDigging();
+		} catch (e) {}
+
+		try {
+			(this.bot as any).collectBlock?.stop();
 		} catch (e) {}
 
 		try {
@@ -378,7 +395,29 @@ export class AgentOrchestrator {
 			const skill = this.skills.get(this.currentTaskName);
 			if (skill) {
 				try {
-					const result = await skill.handler(this, {});
+					const myGen = this.taskGeneration;
+					if (this.currentAbort) {
+						this.currentAbort.abort();
+					}
+
+					const controller = new AbortController();
+					this.currentAbort = controller;
+
+					let result;
+
+					try {
+						result = await skill.handler({
+							agent: this,
+							signal: controller.signal,
+						});
+					} catch (err) {
+						if (err instanceof Error && err?.message !== "Aborted") {
+							throw err;
+						}
+					}
+
+					if (myGen !== this.taskGeneration) return;
+
 					this.pushHistory({
 						action: this.currentTaskName,
 						rationale: this.latestRationale || "Continuing task",
@@ -407,11 +446,14 @@ export class AgentOrchestrator {
 			return;
 		}
 
-		const nearbyHostiles = Object.values(this.bot.entities).filter(
-			(e) =>
-				(e.type === "mob" || e.type === "hostile") &&
-				e.position.distanceTo(this.bot.entity.position) < 16,
-		);
+		const nearbyHostiles = [];
+		for (const id in this.bot.entities) {
+			const e = this.bot.entities[id];
+			if (e.type !== "mob" && e.type !== "hostile") continue;
+			if (e.position.distanceTo(this.bot.entity.position) < 16) {
+				nearbyHostiles.push(e);
+			}
+		}
 
 		if (nearbyHostiles.length > 0) {
 			this.enterCombat(nearbyHostiles[0]);
@@ -428,6 +470,7 @@ export class AgentOrchestrator {
 	 * 大脳ループ：定期的に状況を評価し、方針を更新する
 	 */
 	private async startThinkingLoop() {
+		this.taskGeneration++;
 		while (this.bot && this.bot.entity) {
 			const skillsContext = Array.from(this.skills.values())
 				.map((t) => `- ${t.name}: ${t.description}`)
@@ -580,6 +623,7 @@ Skill: (exact name)`;
 
 					// --- ツールの実行とDiscord通知(思考) ---
 					if (foundSkillName && this.skills.has(foundSkillName)) {
+						this.cancelCurrentExecution();
 						if (this.currentTaskName !== foundSkillName) {
 							this.currentTaskName = foundSkillName;
 							this.latestRationale = rationale;
@@ -620,9 +664,151 @@ Skill: (exact name)`;
 		}
 	}
 
+	private cancelCurrentExecution() {
+		this.taskGeneration++;
+
+		if (this.currentAbort) {
+			this.currentAbort.abort();
+		}
+
+		try {
+			this.bot.pathfinder.setGoal(null);
+		} catch (e) {}
+
+		try {
+			this.bot.pathfinder.stop();
+		} catch (e) {}
+
+		try {
+			this.bot.stopDigging();
+		} catch (e) {}
+
+		for (const key of Object.keys(this.bot.controlState)) {
+			this.bot.setControlState(key as any, false);
+		}
+	}
+
 	private isMoving: boolean = false;
 
-	public async smartGoto(goal: goals.Goal): Promise<void> {
+	private checkAbort(signal: AbortSignal | undefined) {
+		if (signal?.aborted) {
+			const err = new Error("Aborted");
+			err.name = "AbortError";
+			throw err;
+		}
+	}
+
+	public async safeSetControlState(
+		control: string,
+		value: boolean,
+		signal?: AbortSignal,
+	): Promise<void> {
+		this.checkAbort(signal);
+		this.bot.setControlState(control, value);
+	}
+
+	public async safeDig(block: any, signal?: AbortSignal): Promise<void> {
+		this.checkAbort(signal);
+		const p = new Promise<void>((resolve, reject) => {
+			const onAbort = () => {
+				this.bot.stopDigging();
+				reject(new Error("Aborted"));
+			};
+
+			if (signal?.aborted) {
+				onAbort();
+				return;
+			}
+
+			const abortHandler = () => onAbort();
+			signal?.addEventListener("abort", abortHandler);
+
+			this.bot.once("blockBreakProgressObserved", () => {
+				this.checkAbort(signal);
+			});
+
+			this.bot.once("diggingComplete", () => {
+				signal?.removeEventListener("abort", abortHandler);
+				resolve();
+			});
+
+			this.bot.once("diggingAborted", () => {
+				signal?.removeEventListener("abort", abortHandler);
+				reject(new Error("Digging aborted"));
+			});
+
+			this.bot
+				.dig(block)
+				.then(() => {
+					signal?.removeEventListener("abort", abortHandler);
+					resolve();
+				})
+				.catch((err) => {
+					signal?.removeEventListener("abort", abortHandler);
+					reject(err);
+				});
+		});
+
+		while (true) {
+			this.checkAbort(signal);
+			try {
+				await p;
+				return;
+			} catch (err) {
+				if (err instanceof Error && err.name === "AbortError") {
+					throw err;
+				}
+				const errorMsg = err instanceof Error ? err.message : String(err);
+				if (errorMsg.includes("Cancelled") || errorMsg.includes("stop")) {
+					throw new Error("Aborted");
+				}
+				throw err;
+			}
+		}
+	}
+
+	public async safeAttack(target: any, signal?: AbortSignal): Promise<void> {
+		this.checkAbort(signal);
+
+		const attackLoop = async () => {
+			while (true) {
+				this.checkAbort(signal);
+				try {
+					await this.bot.attack(target);
+				} catch (err) {
+					const errorMsg = err instanceof Error ? err.message : String(err);
+					if (errorMsg.includes("Cancelled") || errorMsg.includes("stop")) {
+						throw new Error("Aborted");
+					}
+				}
+				await new Promise((r) => setTimeout(r, 250));
+			}
+		};
+
+		const attackPromise = attackLoop();
+
+		if (signal) {
+			signal.addEventListener(
+				"abort",
+				() => {
+					this.bot.attack(target);
+				},
+				{ once: true },
+			);
+		}
+
+		return attackPromise;
+	}
+
+	public async safeGoto(goal: goals.Goal, signal?: AbortSignal): Promise<void> {
+		this.checkAbort(signal);
+
+		if (this.currentGoal && this.currentGoal.equals?.(goal)) {
+			return;
+		}
+
+		this.currentGoal = goal;
+
 		if (this.isMoving) {
 			this.bot.pathfinder.stop();
 			this.bot.clearControlStates();
@@ -630,30 +816,6 @@ Skill: (exact name)`;
 		}
 
 		this.isMoving = true;
-
-		const movements = new Movements(this.bot);
-		movements.canDig = true;
-		movements.allowParkour = true;
-		movements.allow1by1towers = true;
-		movements.allowFreeMotion = true;
-		movements.allowSprinting = true;
-		movements.maxDropDown = 4;
-		movements.scafoldingBlocks = [
-			"dirt",
-			"cobblestone",
-			"gravel",
-			"sand",
-			"grass_block",
-			"stone",
-			"bricks",
-			"nether_brick",
-			"blackstone",
-			"deepslate",
-		];
-		movements.digCost = 1;
-		movements.placeCost = 2;
-
-		this.bot.pathfinder.setMovements(movements);
 
 		let goalStr: string;
 		if (goal && typeof goal === "object") {
@@ -672,6 +834,7 @@ Skill: (exact name)`;
 		let lastPos = startPos.clone();
 		let stuckCount = 0;
 		const checkStuck = setInterval(() => {
+			this.checkAbort(signal);
 			const currentPos = this.bot.entity.position;
 			if (currentPos.distanceTo(lastPos) < 0.1) {
 				stuckCount++;
@@ -680,27 +843,37 @@ Skill: (exact name)`;
 			}
 			if (stuckCount >= 5) {
 				console.log(`[Pathfinding] Stuck detected! Position: ${currentPos}`);
-				this.bot.pathfinder.stop();
+				this.bot.setControlState("jump", true);
+				setTimeout(() => this.bot.setControlState("jump", false), 200);
 			}
 			lastPos = currentPos.clone();
 		}, 500);
 
+		let retry = 0;
+
 		try {
-			await this.bot.pathfinder.goto(goal);
-			console.log(`[Pathfinding] Reached goal successfully!`);
-		} catch (err) {
-			if (err instanceof Error && err.name === "GoalChanged") {
-				this.isMoving = false;
-				return;
-			}
-			console.log(`[Pathfinding] Error: ${err instanceof Error ? err.message : String(err)}`);
-			console.log(`[Pathfinding] Current pos after error: ${this.bot.entity.position}`);
-			throw new Error(`Pathfinding failed: ${err instanceof Error ? err.message : String(err)}`);
+			do {
+				this.checkAbort(signal);
+				try {
+					await this.bot.pathfinder.goto(goal);
+					console.log(`[Pathfinding] Reached goal successfully!`);
+					break;
+				} catch (err) {
+					console.log(`[Pathfinding] Error: ${err instanceof Error ? err.message : String(err)}`);
+					console.log(`[Pathfinding] Current pos after error: ${this.bot.entity.position}`);
+					await new Promise((r) => setTimeout(r, 1000 * retry));
+				}
+				retry++;
+			} while (retry < 3);
 		} finally {
 			clearInterval(checkStuck);
-			this.isMoving = false;
 			this.isMoving = false;
 			this.bot.clearControlStates();
 		}
 	}
+
+	public async smartGoto(goal: goals.Goal): Promise<void> {
+		return this.safeGoto(goal, this.currentAbort?.signal);
+	}
 }
+

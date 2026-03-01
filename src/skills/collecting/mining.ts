@@ -1,7 +1,6 @@
 import type { Bot } from "mineflayer";
 import { goals } from "mineflayer-pathfinder";
 import type { Vec3 } from "vec3";
-import type { AgentOrchestrator } from "../../core/agent";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
 export const mineOresSkill = createSkill<void, { minedCount: number }>({
@@ -11,7 +10,7 @@ export const mineOresSkill = createSkill<void, { minedCount: number }>({
 		"Mining with bare hands is extremely inefficient, takes too long, and results in NO item drops for most ores. " +
 		"If you lack a pickaxe, craft one first instead of using this skill.",
 	inputSchema: {} as any,
-	handler: async (agent: AgentOrchestrator): Promise<SkillResponse<{ minedCount: number }>> => {
+	handler: async ({ agent, signal }): Promise<SkillResponse<{ minedCount: number }>> => {
 		const { bot } = agent;
 
 		const orePositions = miningScanner.findNearbyOres(bot);
@@ -33,7 +32,7 @@ export const mineOresSkill = createSkill<void, { minedCount: number }>({
 					if (toolPlugin) {
 						await toolPlugin.equipForBlock(block);
 					}
-					await bot.dig(block);
+					await agent.safeDig(block, signal);
 					minedCount++;
 				}
 			}

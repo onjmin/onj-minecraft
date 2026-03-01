@@ -1,5 +1,4 @@
 import { goals } from "mineflayer-pathfinder";
-import type { AgentOrchestrator } from "../../core/agent";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
 /**
@@ -11,9 +10,7 @@ export const stealFromChestSkill = createSkill<void, { itemsCount: number; conta
 		name: "collecting.stealing",
 		description: "Finds a nearby chest or barrel, opens it, and takes all items inside.",
 		inputSchema: {} as any,
-		handler: async (
-			agent: AgentOrchestrator,
-		): Promise<SkillResponse<{ itemsCount: number; containerType: string }>> => {
+		handler: async ({agent, signal}): Promise<SkillResponse<{ itemsCount: number; containerType: string }>> => {
 			const { bot } = agent;
 
 			// 1. 周辺のコンテナ（チェスト、樽、トラップチェスト）をスキャン

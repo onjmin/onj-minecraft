@@ -1,7 +1,6 @@
 import type { Bot } from "mineflayer";
 import { goals } from "mineflayer-pathfinder";
 import type { Vec3 } from "vec3";
-import type { AgentOrchestrator } from "../../core/agent";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
 export const fellTreesSkill = createSkill<void, { count: number }>({
@@ -9,7 +8,7 @@ export const fellTreesSkill = createSkill<void, { count: number }>({
 	description:
 		"Automatically finds and fells nearby trees by moving next to them and digging safely.",
 	inputSchema: {} as any,
-	handler: async (agent: AgentOrchestrator): Promise<SkillResponse<{ count: number }>> => {
+	handler: async ({ agent, signal }): Promise<SkillResponse<{ count: number }>> => {
 		const { bot } = agent;
 		const logs = fellingScanner.findNearbyLogs(bot);
 
@@ -38,7 +37,7 @@ export const fellTreesSkill = createSkill<void, { count: number }>({
 					if (toolPlugin) {
 						await toolPlugin.equipForBlock(block);
 					}
-					await bot.dig(block);
+					await agent.safeDig(block, signal);
 					felledCount++;
 				}
 			}

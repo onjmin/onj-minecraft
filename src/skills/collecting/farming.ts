@@ -1,7 +1,6 @@
 import type { Bot } from "mineflayer";
 import { goals } from "mineflayer-pathfinder";
 import type { Vec3 } from "vec3";
-import type { AgentOrchestrator } from "../../core/agent";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
 /**
@@ -13,7 +12,7 @@ export const farmTendCropsSkill = createSkill<void, { harvestedCount: number }>(
 	description:
 		"Automatically harvests fully grown crops and replants seeds in the vicinity. Decisions are made autonomously.",
 	inputSchema: {} as any,
-	handler: async (agent: AgentOrchestrator): Promise<SkillResponse<{ harvestedCount: number }>> => {
+	handler: async ({ agent, signal }): Promise<SkillResponse<{ harvestedCount: number }>> => {
 		const { bot } = agent;
 		// 1. Scan for harvestable crops (metadata 7)
 		// 収穫可能な成熟した作物（メタデータ7）をスキャン
@@ -36,7 +35,7 @@ export const farmTendCropsSkill = createSkill<void, { harvestedCount: number }>(
 				// まだ収穫可能か再確認
 				if (block && block.metadata === 7) {
 					const cropName = block.name;
-					await bot.dig(block);
+					await agent.safeDig(block, signal);
 					harvestedCount++;
 
 					// 2. Attempt to replant if seeds are available
@@ -77,13 +76,13 @@ export const farmTendCropsSkill = createSkill<void, { harvestedCount: number }>(
 				harvestedCount,
 				ate,
 			});
-	} catch (err) {
-		const errorMsg = err instanceof Error ? err.message : String(err);
-		if (errorMsg.includes("Cancelled") || errorMsg.includes("stop")) {
-			return skillResult.fail("Farming cancelled by combat");
+		} catch (err) {
+			const errorMsg = err instanceof Error ? err.message : String(err);
+			if (errorMsg.includes("Cancelled") || errorMsg.includes("stop")) {
+				return skillResult.fail("Farming cancelled by combat");
+			}
+			return skillResult.fail(`Farming failed: ${errorMsg}`);
 		}
-		return skillResult.fail(`Farming failed: ${errorMsg}`);
-	}
 	},
 });
 

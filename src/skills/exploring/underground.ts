@@ -1,5 +1,4 @@
 import { goals } from "mineflayer-pathfinder";
-import type { AgentOrchestrator } from "../../core/agent";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
 // Dynamic require to avoid namespace issues
@@ -18,7 +17,7 @@ export const exploreUndergroundSkill = createSkill<void, { torchPlaced: boolean 
 		"as you will be unable to mine through obstructions, collect ores you find, or create escape routes. " +
 		"Ensure you have a pickaxe and torches before starting.",
 	inputSchema: {} as any,
-	handler: async (agent: AgentOrchestrator): Promise<SkillResponse<{ torchPlaced: boolean }>> => {
+	handler: async ({ agent, signal }): Promise<SkillResponse<{ torchPlaced: boolean }>> => {
 		let torchPlaced = false;
 
 		const { bot } = agent;
@@ -70,7 +69,7 @@ export const exploreUndergroundSkill = createSkill<void, { torchPlaced: boolean 
 			console.log(`[${bot.username}] No cave found. Digging down...`);
 			const down = bot.blockAt(bot.entity.position.offset(0, -1, 0));
 			if (down && down.name !== "air" && down.name !== "bedrock") {
-				await bot.dig(down);
+				await agent.safeDig(down, signal);
 				// 掘った後に少し待つ、または smartGoto で座標を更新
 			}
 

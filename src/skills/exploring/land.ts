@@ -1,5 +1,4 @@
 import { goals } from "mineflayer-pathfinder";
-import type { AgentOrchestrator } from "../../core/agent";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
 /**
@@ -11,7 +10,7 @@ export const exploreLandSkill = createSkill<void, { x: number; z: number }>({
 	description:
 		"Explores the surface to find villages, animals, or structures. Best used in daylight.",
 	inputSchema: {} as any,
-	handler: async (agent: AgentOrchestrator): Promise<SkillResponse<{ x: number; z: number }>> => {
+	handler: async ({ agent, signal }): Promise<SkillResponse<{ x: number; z: number }>> => {
 		const { bot } = agent;
 
 		const angle = Math.random() * Math.PI * 2;
@@ -34,8 +33,8 @@ export const exploreLandSkill = createSkill<void, { x: number; z: number }>({
 			// 4. リカバリ処理の強化
 			// 詰まった時は単なるジャンプだけでなく、少し横にずれるなどの動作を加える
 			bot.clearControlStates();
-			bot.setControlState("jump", true);
-			bot.setControlState("forward", true);
+			await agent.safeSetControlState("jump", true, signal);
+			await agent.safeSetControlState("forward", true, signal);
 
 			// 左右どちらかにランダムに旋回してスタック脱出を試みる
 			const yaw = bot.entity.yaw + (Math.random() > 0.5 ? 0.5 : -0.5);

@@ -1,5 +1,4 @@
 import type { Bot } from "mineflayer";
-import type { AgentOrchestrator } from "../../core/agent";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 import { ensureCraftingTable, ensureSticks } from "./util";
 
@@ -12,9 +11,7 @@ export const craftToolSkill = createSkill<void, { item: string; material: string
 	description:
 		"Checks inventory and crafts the best possible tool (pickaxe, axe, shovel, or hoe) that is missing or needs an upgrade.",
 	inputSchema: {} as any,
-	handler: async (
-		agent: AgentOrchestrator,
-	): Promise<SkillResponse<{ item: string; material: string }>> => {
+	handler: async ({agent, signal}): Promise<SkillResponse<{ item: string; material: string }>> => {
 		const { bot } = agent;
 
 		// 【ここに追加】ツールの材料を確定させる前に、まず棒を確保する
