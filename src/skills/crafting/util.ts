@@ -1,6 +1,6 @@
 import type { Bot } from "mineflayer";
 import { Vec3 } from "vec3";
-import type { AgentOrchestrator } from "../../core/agent";
+import type { MinecraftAgent } from "../../core/agent";
 
 type Block = NonNullable<ReturnType<Bot["blockAt"]>>;
 
@@ -8,7 +8,7 @@ type Block = NonNullable<ReturnType<Bot["blockAt"]>>;
  * 共通ロジック：作業台を確保する（周辺スキャン -> 作成 -> 設置）
  * @returns 確保された作業台のBlockオブジェクト、確保失敗時は null
  */
-export async function ensureCraftingTable(agent: AgentOrchestrator): Promise<Block | null> {
+export async function ensureCraftingTable(agent: MinecraftAgent): Promise<Block | null> {
 	const { bot } = agent;
 
 	// 1. 周辺スキャン
@@ -78,7 +78,7 @@ export async function ensureCraftingTable(agent: AgentOrchestrator): Promise<Blo
  * 共通ロジック：かまどを確保する（周辺スキャン -> 作成 -> 設置）
  * @returns 確保されたかまどのBlockオブジェクト、確保失敗時は null
  */
-export async function ensureFurnace(agent: AgentOrchestrator): Promise<Block | null> {
+export async function ensureFurnace(agent: MinecraftAgent): Promise<Block | null> {
 	const { bot } = agent;
 
 	// 1. 周辺スキャン
@@ -133,7 +133,7 @@ export async function ensureFurnace(agent: AgentOrchestrator): Promise<Block | n
  * 作業台は不要ですが、材料（板材/原木）がない場合は作成を試みます。
  * @returns 確保成功時は true
  */
-export async function ensureSticks(agent: AgentOrchestrator, count = 4): Promise<boolean> {
+export async function ensureSticks(agent: MinecraftAgent, count = 4): Promise<boolean> {
 	const { bot } = agent;
 
 	// 1. インベントリ確認

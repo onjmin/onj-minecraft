@@ -1,4 +1,4 @@
-import { AgentOrchestrator } from "../core/agent";
+import { MinecraftAgent } from "../core/agent";
 import { profiles } from "../profiles";
 import { farmTendCropsSkill } from "../skills/collecting/farming";
 import { fellTreesSkill } from "../skills/collecting/felling";
@@ -38,7 +38,7 @@ const allSkills = [
  */
 (async () => {
 	for (const profile of Object.values(profiles)) {
-		new AgentOrchestrator(profile, allSkills);
+		new MinecraftAgent(profile, allSkills);
 		await new Promise((resolve) => setTimeout(resolve, 5000));
 	}
 })();

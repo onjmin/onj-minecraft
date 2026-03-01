@@ -45,7 +45,7 @@ type ChatLog = {
 	timestamp: number;
 };
 
-export class AgentOrchestrator {
+export class MinecraftAgent {
 	public bot: mineflayer.Bot;
 	private profile: AgentProfile;
 	private skills: Map<string, any>;

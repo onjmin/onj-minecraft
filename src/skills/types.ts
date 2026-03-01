@@ -1,4 +1,4 @@
-import type { AgentOrchestrator } from "../core/agent";
+import type { MinecraftAgent } from "../core/agent";
 
 // スネークケース（_を含む）を禁止するためのユーティリティ型
 type NoSnakeCase<T> = {
@@ -22,7 +22,15 @@ export interface SkillDefinition<T, R = void> {
 	name: string;
 	description: string;
 	inputSchema: Record<keyof T, SkillField>;
-	handler: ({agent, signal, args}: {agent: AgentOrchestrator, signal: AbortSignal, args: T}) => Promise<SkillResponse<R>>;
+	handler: ({
+		agent,
+		signal,
+		args,
+	}: {
+		agent: MinecraftAgent;
+		signal: AbortSignal;
+		args: T;
+	}) => Promise<SkillResponse<R>>;
 }
 
 export function createSkill<T extends NoSnakeCase<T>, R = void>(
