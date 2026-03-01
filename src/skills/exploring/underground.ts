@@ -66,7 +66,7 @@ export const exploreUndergroundSkill = createSkill<void, { torchPlaced: boolean 
 			}
 
 			// 目的地が見つからない時のあがき：真下を1段掘って、少し下がる
-			console.log(`[${bot.username}] No cave found. Digging down...`);
+			agent.log(`No cave found. Digging down...`);
 			const down = bot.blockAt(bot.entity.position.offset(0, -1, 0));
 			if (down && down.name !== "air" && down.name !== "bedrock") {
 				await agent.safeDig(down, signal);

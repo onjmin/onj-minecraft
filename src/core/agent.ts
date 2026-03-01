@@ -1,11 +1,11 @@
-import mineflayer from "mineflayer";
+import mineflayer, { type ControlState } from "mineflayer";
 import { goals, Movements, pathfinder } from "mineflayer-pathfinder";
-import { BotStateMachine } from "mineflayer-statemachine";
 import { Vec3 } from "vec3";
 import type { AgentProfile } from "../profiles/types";
+import { exploreLandSkill } from "../skills/exploring/land";
+import type { SkillResponse } from "../skills/types";
 import { emitDiscordWebhook, translateWithRoleplay } from "./discord-webhook";
 import { llm } from "./llm-client";
-import { exploreLandSkill } from "../skills/exploring/land";
 
 const tryLoad = (bot: any, name: string, mod: any) => {
 	if (!mod) {
@@ -128,10 +128,7 @@ export class AgentOrchestrator {
 			timeZone: "Asia/Tokyo",
 		}).format(new Date());
 
-		console.log(
-			`[${time}] ${this.bot.profile.displayName}:`,
-			output
-		);
+		console.log(`[${time}] ${this.profile.displayName}:`, output);
 	}
 
 	/**
@@ -141,7 +138,7 @@ export class AgentOrchestrator {
 	private initEvents() {
 		// --- ログイン/スポーン関連 ---
 		this.bot.once("spawn", () => {
-			console.log(`[${this.profile.minecraftName}] First spawn - Initializing pathfinder`);
+			this.log("First spawn - Initializing pathfinder");
 			this.setupPathfinderConfig();
 
 			// ループは初回のスポーン時に一度だけ開始
@@ -150,7 +147,7 @@ export class AgentOrchestrator {
 		});
 
 		this.bot.on("spawn", () => {
-			console.log(`[${this.profile.minecraftName}] Spawned/Respawned!`);
+			this.log("Spawned/Respawned!");
 			this.applySkinOnce();
 		});
 
@@ -160,10 +157,10 @@ export class AgentOrchestrator {
 		this.bot.on("move", () => this.handleEnvironmentCheck());
 
 		// --- パスファインダー ---
-		this.bot.on("goal_reached", () => console.log(`[${this.profile.minecraftName}] Goal reached!`));
+		this.bot.on("goal_reached", () => this.log("Goal reached!"));
 		this.bot.on("path_update", (results) => {
 			if (results.status === "noPath") {
-				console.warn(`[${this.profile.minecraftName}] No path found.`);
+				this.log("No path found.");
 			}
 		});
 
@@ -252,7 +249,7 @@ export class AgentOrchestrator {
 	 */
 	private applySkinOnce() {
 		if (this.profile.skinUrl && !this.hasSetSkin) {
-			console.log(`[${this.profile.minecraftName}] Setting skin: ${this.profile.skinUrl}`);
+			this.log(`Setting skin: ${this.profile.skinUrl}`);
 			// スポーン直後の安定を待ってから一度だけ実行
 			setTimeout(() => {
 				this.bot.chat(`/skin ${this.profile.skinUrl}`);
@@ -290,8 +287,8 @@ export class AgentOrchestrator {
 	private enterCombat(target: any) {
 		if (this.isInCombat) return;
 
-		console.log(
-			`[${this.profile.minecraftName}] Combat detected! Target: ${target.name || target.type}`,
+		this.log(
+			`Combat detected! Target: ${target.name || target.type}`,
 		);
 		this.isInCombat = true;
 		this.combatTarget = target;
@@ -307,7 +304,7 @@ export class AgentOrchestrator {
 	private exitCombat() {
 		if (!this.isInCombat) return;
 
-		console.log(`[${this.profile.minecraftName}] Combat ended. Returning to skill mode.`);
+		this.log(`Combat ended. Returning to skill mode.`);
 		this.isInCombat = false;
 		this.combatTarget = null;
 
@@ -323,7 +320,7 @@ export class AgentOrchestrator {
 	}
 
 	public cancelAllTasks() {
-		console.log(`[${this.profile.minecraftName}] Cancelling all tasks...`);
+		this.log(`Cancelling all tasks...`);
 
 		this.shouldStopSkill = true;
 
@@ -333,23 +330,23 @@ export class AgentOrchestrator {
 
 		try {
 			this.bot.pathfinder.setGoal(null);
-		} catch (e) {}
+		} catch {}
 
 		try {
 			this.bot.pathfinder.stop();
-		} catch (e) {}
+		} catch {}
 
 		try {
 			this.bot.stopDigging();
-		} catch (e) {}
+		} catch {}
 
 		try {
 			(this.bot as any).collectBlock?.stop();
-		} catch (e) {}
+		} catch {}
 
 		try {
 			(this.bot as any).pvp?.stop();
-		} catch (e) {}
+		} catch {}
 
 		this.bot.clearControlStates();
 	}
@@ -391,7 +388,7 @@ export class AgentOrchestrator {
 	}
 
 	private async startReflexLoop() {
-		console.log(`[${this.profile.minecraftName}] ReflexLoop started.`);
+		this.log(`ReflexLoop started.`);
 		await new Promise((r) => setTimeout(r, Math.random() * 2000));
 
 		while (this.bot && this.bot.entity) {
@@ -417,31 +414,36 @@ export class AgentOrchestrator {
 					const controller = new AbortController();
 					this.currentAbort = controller;
 
-					let result;
+					let result: SkillResponse | undefined;
 
 					try {
-						console.log(this.profile.displayName, skill.name)
+						this.log(`${this.profile.displayName} ${skill.name}`);
 						result = await skill.handler({
 							agent: this,
 							signal: controller.signal,
 						});
 					} catch (err) {
-						console.log(this.profile.displayName, skill.name, "Aborted")
+						this.log(`${this.profile.displayName} ${skill.name} Aborted`);
 						if (err instanceof Error && err?.message !== "Aborted") {
 							throw err;
 						}
+					}
+
+					if (!result) {
+						this.log("result of handler is undefined");
+						continue;
 					}
 
 					this.pushHistory({
 						action: this.currentTaskName,
 						rationale: this.latestRationale || "Continuing task",
 						result: result.success ? "Success" : "Fail",
-						message: result.message,
+						message: result.summary,
 					});
 					if (!result.success) await new Promise((r) => setTimeout(r, 2000));
 				} catch (e) {
 					const errorMsg = e instanceof Error ? e.message : String(e);
-					console.error(`[${this.profile.minecraftName}] Reflex Error: ${errorMsg}`);
+					this.log(`Reflex Error: ${errorMsg}`);
 					if (errorMsg.includes("No path")) await new Promise((r) => setTimeout(r, 2000));
 				}
 			} else {
@@ -635,18 +637,7 @@ Skill: (exact name)`;
 						this.bot.chat(chatMessage);
 					}
 
-					console.log(
-						new Intl.DateTimeFormat("ja-JP", {
-							hour: "2-digit",
-							minute: "2-digit",
-							second: "2-digit",
-							hour12: false,
-							timeZone: "Asia/Tokyo",
-						}).format(new Date()),
-						this.profile.displayName,
-						foundSkillName,
-						rationale,
-					);
+					this.log(`${this.profile.displayName} ${foundSkillName}: ${rationale}`);
 
 					// --- ツールの実行とDiscord通知(思考) ---
 					if (foundSkillName && this.skills.has(foundSkillName)) {
@@ -672,7 +663,7 @@ Skill: (exact name)`;
 					}
 				}
 			} catch (err) {
-				console.error(`[${this.profile.minecraftName}] Thinking error:`, err);
+				this.log(`Thinking error: ${err}`);
 			}
 			await new Promise((r) => setTimeout(r, 30000));
 		}
@@ -685,15 +676,15 @@ Skill: (exact name)`;
 
 		try {
 			this.bot.pathfinder.setGoal(null);
-		} catch (e) {}
+		} catch {}
 
 		try {
 			this.bot.pathfinder.stop();
-		} catch (e) {}
+		} catch {}
 
 		try {
 			this.bot.stopDigging();
-		} catch (e) {}
+		} catch {}
 
 		for (const key of Object.keys(this.bot.controlState)) {
 			this.bot.setControlState(key as any, false);
@@ -704,14 +695,14 @@ Skill: (exact name)`;
 
 	private checkAbort(signal: AbortSignal | undefined): boolean {
 		if (signal?.aborted) {
-			console.log("Abort detected, stopping execution...");
+			this.log("Abort detected, stopping execution...");
 			return true;
 		}
 		return false;
 	}
 
 	public async safeSetControlState(
-		control: string,
+		control: ControlState,
 		value: boolean,
 		signal?: AbortSignal,
 	): Promise<void> {
@@ -745,7 +736,7 @@ Skill: (exact name)`;
 				}
 			});
 
-			this.bot.once("diggingComplete", () => {
+			this.bot.once("diggingCompleted", () => {
 				signal?.removeEventListener("abort", abortHandler);
 				resolve();
 			});
@@ -828,15 +819,18 @@ Skill: (exact name)`;
 		const g = goal as any;
 		const currentPos = this.bot.entity.position;
 
-		// x, y, z のいずれかが欠落していたら、Botの現在地で補完する
-		const safeX = (typeof g.x === 'number' && !isNaN(g.x)) ? g.x : currentPos.x;
-		const safeY = (typeof g.y === 'number' && !isNaN(g.y)) ? g.y : currentPos.y;
-		const safeZ = (typeof g.z === 'number' && !isNaN(g.z)) ? g.z : currentPos.z;
+		const isValidNumber = (v: unknown): v is number => typeof v === "number" && !Number.isNaN(v);
 
-		// もし元の Goal が不正（NaNを含むなど）だった場合、強制的に有効な GoalNear に差し替える
+		const safeX = isValidNumber(g.x) ? g.x : currentPos.x;
+		const safeY = isValidNumber(g.y) ? g.y : currentPos.y;
+		const safeZ = isValidNumber(g.z) ? g.z : currentPos.z;
+
 		let finalGoal = goal;
-		if (isNaN(g.x) || isNaN(g.y) || isNaN(g.z) || g.x === undefined || g.z === undefined) {
-			console.warn(`[Pathfinding] Invalid Goal detected! Auto-correcting to: (${safeX.toFixed(1)}, ${safeY.toFixed(1)}, ${safeZ.toFixed(1)})`);
+
+		if (!isValidNumber(g.x) || !isValidNumber(g.y) || !isValidNumber(g.z)) {
+			this.log(
+				`Pathfinding: Invalid Goal detected! Auto-correcting to: (${safeX.toFixed(1)}, ${safeY.toFixed(1)}, ${safeZ.toFixed(1)})`,
+			);
 			finalGoal = new goals.GoalNear(safeX, safeY, safeZ, 1);
 		}
 
@@ -846,7 +840,7 @@ Skill: (exact name)`;
 			throw new Error("Aborted");
 		}
 
-		if (this.currentGoal && this.currentGoal.equals?.(goal)) {
+		if ((this.currentGoal as any)?.equals?.(goal)) {
 			return;
 		}
 
@@ -861,17 +855,21 @@ Skill: (exact name)`;
 		this.isMoving = true;
 
 		let goalStr: string;
-		if (goal && typeof goal === "object") {
-			if ("x" in goal && goal.x !== undefined) {
-				goalStr = `(${goal.x}, ${goal.y}, ${goal.z})`;
-			} else {
-				goalStr = goal.constructor.name;
-			}
+		if (goal && typeof goal === "object" && "x" in goal && "y" in goal && "z" in goal) {
+			const { x, y, z } = goal as {
+				x: unknown;
+				y: unknown;
+				z: unknown;
+			};
+
+			goalStr = `(${x}, ${y}, ${z})`;
+		} else if (goal && typeof goal === "object") {
+			goalStr = goal.constructor.name;
 		} else {
 			goalStr = String(goal);
 		}
-		console.log(`[Pathfinding] Starting path to goal: ${goalStr}`);
-		console.log(`[Pathfinding] Bot position: ${this.bot.entity.position}`);
+		this.log(`Pathfinding: Starting path to goal: ${goalStr}`);
+		this.log(`Pathfinding: Bot position: ${this.bot.entity.position}`);
 
 		const startPos = this.bot.entity.position.clone();
 		let lastPos = startPos.clone();
@@ -888,7 +886,9 @@ Skill: (exact name)`;
 				stuckCount = 0;
 			}
 			if (stuckCount >= 5) {
-				console.log(`[Pathfinding Stuck] From:(${this.bot.entity.position.x.toFixed(1)}, ${this.bot.entity.position.y.toFixed(1)}, ${this.bot.entity.position.z.toFixed(1)}) To:(${ (goal as any).x?.toFixed(1) ?? '?' }, ${ (goal as any).y?.toFixed(1) ?? '?' }, ${ (goal as any).z?.toFixed(1) ?? '?' }) Dist:${ (goal as any).x ? this.bot.entity.position.distanceTo(new Vec3((goal as any).x, (goal as any).y, (goal as any).z)).toFixed(1) : '?' }m`);
+				this.log(
+					`Pathfinding Stuck: From:(${this.bot.entity.position.x.toFixed(1)}, ${this.bot.entity.position.y.toFixed(1)}, ${this.bot.entity.position.z.toFixed(1)}) To:(${(goal as any).x?.toFixed(1) ?? "?"}, ${(goal as any).y?.toFixed(1) ?? "?"}, ${(goal as any).z?.toFixed(1) ?? "?"}) Dist:${(goal as any).x ? this.bot.entity.position.distanceTo(new Vec3((goal as any).x, (goal as any).y, (goal as any).z)).toFixed(1) : "?"}m`,
+				);
 				this.bot.setControlState("jump", true);
 				setTimeout(() => this.bot.setControlState("jump", false), 200);
 			}
@@ -904,11 +904,11 @@ Skill: (exact name)`;
 				}
 				try {
 					await this.bot.pathfinder.goto(goal);
-					console.log(`[Pathfinding] Reached goal successfully!`);
+					this.log(`Pathfinding: Reached goal successfully!`);
 					break;
 				} catch (err) {
-					console.log(`[Pathfinding] Error: ${err instanceof Error ? err.message : String(err)}`);
-					console.log(`[Pathfinding] Current pos after error: ${this.bot.entity.position}`);
+					this.log(`Pathfinding Error: ${err instanceof Error ? err.message : String(err)}`);
+					this.log(`Pathfinding: Current pos after error: ${this.bot.entity.position}`);
 					await new Promise((r) => setTimeout(r, 1000 * retry));
 				}
 				retry++;
