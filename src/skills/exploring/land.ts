@@ -1,50 +1,84 @@
 import { goals } from "mineflayer-pathfinder";
+import { Vec3 } from "vec3";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
-/**
- * Exploring Domain: Surface exploration.
- * 探索ドメイン（地表）：村や動物を探して、地表を広く探索します。
- */
 export const exploreLandSkill = createSkill<void, { x: number; z: number }>({
-	name: "exploring.explore_land",
-	description:
-		"Explores the surface to find villages, animals, or structures. Best used in daylight.",
-	inputSchema: {} as any,
-	handler: async ({ agent, signal }): Promise<SkillResponse<{ x: number; z: number }>> => {
-		const { bot } = agent;
+    name: "exploring.explore_land",
+    description: "Explores the surface by sampling nearby safe ground. Avoids walls and steep cliffs.",
+    inputSchema: {} as any,
+    handler: async ({ agent, signal }): Promise<SkillResponse<{ x: number; z: number }>> => {
+        const { bot } = agent;
 
-		const angle = Math.random() * Math.PI * 2;
+        // --- 1. インテリジェント・サンプリング ---
+        const candidates: Vec3[] = [];
+        const radius = 15;
+        const currentY = Math.floor(bot.entity.position.y);
+        
+        for (let i = 0; i < 20; i++) {
+            const dx = Math.floor((Math.random() - 0.5) * radius * 2);
+            const dz = Math.floor((Math.random() - 0.5) * radius * 2);
+            const tx = Math.floor(bot.entity.position.x + dx);
+            const tz = Math.floor(bot.entity.position.z + dz);
 
-		// 5〜15ブロックの範囲でランダムに決定
-		const distance = 5 + Math.random() * 10;
-		const x = Math.round(bot.entity.position.x + Math.cos(angle) * distance);
-		const z = Math.round(bot.entity.position.z + Math.sin(angle) * distance);
+            // getHighestBlockYAt の代替ロジック：
+            // 現在の高さから上下5ブロックの範囲で地面を探す
+            let foundY: number | null = null;
+            for (let dy = 5; dy >= -5; dy--) {
+                const checkPos = new Vec3(tx, currentY + dy, tz);
+                const block = bot.blockAt(checkPos);
+                const up1 = bot.blockAt(checkPos.offset(0, 1, 0));
+                const up2 = bot.blockAt(checkPos.offset(0, 2, 0));
 
-		try {
-			// timeout を設定して、あまりに長い移動は区切る
-			// 30秒経っても着かなければ一旦戻る
-			await Promise.race([
-				agent.smartGoto(new goals.GoalXZ(x, z)),
-				new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 30000)),
-			]);
+                // 「足場が実体」かつ「その上が2マス空き」ならそこを地面とする
+                if (block && block.boundingBox === 'block' && 
+                    up1?.boundingBox === 'empty' && 
+                    up2?.boundingBox === 'empty') {
+                    foundY = currentY + dy + 1;
+                    break;
+                }
+            }
 
-			return skillResult.ok("Moving to new area...", { x, z });
-		} catch {
-			// 4. リカバリ処理の強化
-			// 詰まった時は単なるジャンプだけでなく、少し横にずれるなどの動作を加える
-			bot.clearControlStates();
-			await agent.safeSetControlState("jump", true, signal);
-			await agent.safeSetControlState("forward", true, signal);
+            if (foundY === null) continue;
 
-			// 左右どちらかにランダムに旋回してスタック脱出を試みる
-			const yaw = bot.entity.yaw + (Math.random() > 0.5 ? 0.5 : -0.5);
-			await bot.look(yaw, bot.entity.pitch, true);
+            const finalPos = new Vec3(tx, foundY, tz);
+            const groundBlock = bot.blockAt(finalPos.offset(0, -1, 0));
+            
+            // 水などは除外
+            if (groundBlock && groundBlock.name !== 'water' && groundBlock.name !== 'lava') {
+                candidates.push(finalPos);
+            }
+        }
 
-			await new Promise((r) => setTimeout(r, 800));
-			bot.clearControlStates();
+        let targetPos = candidates.length > 0 
+            ? candidates[Math.floor(Math.random() * candidates.length)]
+            : null;
 
-			// タイムアウトでも、ある程度進めていれば「一部成功」として扱うのも手
-			return skillResult.fail("Stuck or timeout, attempted recovery jump.");
-		}
-	},
+        if (!targetPos) {
+            return skillResult.fail("No safe ground found in sampling.");
+        }
+
+        const { x, y, z } = targetPos;
+
+        try {
+            // --- 2. 3次元目的地による移動 ---
+            await Promise.race([
+                agent.safeGoto(new goals.GoalNear(x, y, z, 1), signal),
+                new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 30000)),
+            ]);
+
+            return skillResult.ok("Reached destination.", { x, z });
+        } catch (err) {
+            // --- 3. リカバリ処理 ---
+            bot.clearControlStates();
+            const escapeYaw = bot.entity.yaw + (Math.random() > 0.5 ? 1 : -1);
+            await bot.look(escapeYaw, bot.entity.pitch, true);
+            bot.setControlState("forward", true);
+            bot.setControlState("jump", true);
+            
+            await new Promise((r) => setTimeout(r, 600));
+            bot.clearControlStates();
+
+            return skillResult.fail("Movement failed.");
+        }
+    },
 });

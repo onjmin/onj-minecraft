@@ -1,10 +1,11 @@
 import mineflayer from "mineflayer";
-import { type goals, Movements, pathfinder } from "mineflayer-pathfinder";
+import { goals, Movements, pathfinder } from "mineflayer-pathfinder";
 import { BotStateMachine } from "mineflayer-statemachine";
 import { Vec3 } from "vec3";
 import type { AgentProfile } from "../profiles/types";
 import { emitDiscordWebhook, translateWithRoleplay } from "./discord-webhook";
 import { llm } from "./llm-client";
+import { exploreLandSkill } from "../skills/exploring/land";
 
 const tryLoad = (bot: any, name: string, mod: any) => {
 	if (!mod) {
@@ -62,7 +63,6 @@ export class AgentOrchestrator {
 	private chatHistory: ChatLog[] = [];
 	private maxChatHistory = 10;
 
-	private taskGeneration = 0;
 	private currentGoal: goals.Goal | null = null;
 
 	private currentAbort?: AbortController;
@@ -117,6 +117,21 @@ export class AgentOrchestrator {
 
 		// イベント登録
 		this.initEvents();
+	}
+
+	public log(output: unknown) {
+		const time = new Intl.DateTimeFormat("ja-JP", {
+			hour: "2-digit",
+			minute: "2-digit",
+			second: "2-digit",
+			hour12: false,
+			timeZone: "Asia/Tokyo",
+		}).format(new Date());
+
+		console.log(
+			`[${time}] ${this.bot.profile.displayName}:`,
+			output
+		);
 	}
 
 	/**
@@ -395,7 +410,6 @@ export class AgentOrchestrator {
 			const skill = this.skills.get(this.currentTaskName);
 			if (skill) {
 				try {
-					const myGen = this.taskGeneration;
 					if (this.currentAbort) {
 						this.currentAbort.abort();
 					}
@@ -406,17 +420,17 @@ export class AgentOrchestrator {
 					let result;
 
 					try {
+						console.log(this.profile.displayName, skill.name)
 						result = await skill.handler({
 							agent: this,
 							signal: controller.signal,
 						});
 					} catch (err) {
+						console.log(this.profile.displayName, skill.name, "Aborted")
 						if (err instanceof Error && err?.message !== "Aborted") {
 							throw err;
 						}
 					}
-
-					if (myGen !== this.taskGeneration) return;
 
 					this.pushHistory({
 						action: this.currentTaskName,
@@ -431,7 +445,7 @@ export class AgentOrchestrator {
 					if (errorMsg.includes("No path")) await new Promise((r) => setTimeout(r, 2000));
 				}
 			} else {
-				this.currentTaskName = "exploring.exploreLand";
+				this.currentTaskName = exploreLandSkill.name;
 			}
 
 			await new Promise((r) => setTimeout(r, 1000 + Math.random() * 500));
@@ -470,7 +484,6 @@ export class AgentOrchestrator {
 	 * 大脳ループ：定期的に状況を評価し、方針を更新する
 	 */
 	private async startThinkingLoop() {
-		this.taskGeneration++;
 		while (this.bot && this.bot.entity) {
 			const skillsContext = Array.from(this.skills.values())
 				.map((t) => `- ${t.name}: ${t.description}`)
@@ -577,7 +590,8 @@ Skill: (exact name)`;
 
 					const rationale = rationaleMatch ? rationaleMatch[1].trim() : "No reasoning.";
 					let chatMessage = chatMatch ? chatMatch[1].trim() : "";
-					const foundSkillName = skillMatch ? skillMatch[1].trim() : null;
+					let foundSkillName = skillMatch ? skillMatch[1].trim() : null;
+					foundSkillName = exploreLandSkill.name;
 
 					// 2. Chat内容の高度なクリーンアップ
 					if (chatMessage) {
@@ -621,25 +635,25 @@ Skill: (exact name)`;
 						this.bot.chat(chatMessage);
 					}
 
+					console.log(
+						new Intl.DateTimeFormat("ja-JP", {
+							hour: "2-digit",
+							minute: "2-digit",
+							second: "2-digit",
+							hour12: false,
+							timeZone: "Asia/Tokyo",
+						}).format(new Date()),
+						this.profile.displayName,
+						foundSkillName,
+						rationale,
+					);
+
 					// --- ツールの実行とDiscord通知(思考) ---
 					if (foundSkillName && this.skills.has(foundSkillName)) {
 						this.cancelCurrentExecution();
 						if (this.currentTaskName !== foundSkillName) {
 							this.currentTaskName = foundSkillName;
 							this.latestRationale = rationale;
-
-							console.log(
-								new Intl.DateTimeFormat("ja-JP", {
-									hour: "2-digit",
-									minute: "2-digit",
-									second: "2-digit",
-									hour12: false,
-									timeZone: "Asia/Tokyo",
-								}).format(new Date()),
-								this.profile.displayName,
-								foundSkillName,
-								rationale,
-							);
 
 							// --- 送信処理の中 ---
 							const now = Date.now();
@@ -665,8 +679,6 @@ Skill: (exact name)`;
 	}
 
 	private cancelCurrentExecution() {
-		this.taskGeneration++;
-
 		if (this.currentAbort) {
 			this.currentAbort.abort();
 		}
@@ -690,12 +702,12 @@ Skill: (exact name)`;
 
 	private isMoving: boolean = false;
 
-	private checkAbort(signal: AbortSignal | undefined) {
+	private checkAbort(signal: AbortSignal | undefined): boolean {
 		if (signal?.aborted) {
-			const err = new Error("Aborted");
-			err.name = "AbortError";
-			throw err;
+			console.log("Abort detected, stopping execution...");
+			return true;
 		}
+		return false;
 	}
 
 	public async safeSetControlState(
@@ -703,12 +715,16 @@ Skill: (exact name)`;
 		value: boolean,
 		signal?: AbortSignal,
 	): Promise<void> {
-		this.checkAbort(signal);
+		if (this.checkAbort(signal)) {
+			throw new Error("Aborted");
+		}
 		this.bot.setControlState(control, value);
 	}
 
 	public async safeDig(block: any, signal?: AbortSignal): Promise<void> {
-		this.checkAbort(signal);
+		if (this.checkAbort(signal)) {
+			throw new Error("Aborted");
+		}
 		const p = new Promise<void>((resolve, reject) => {
 			const onAbort = () => {
 				this.bot.stopDigging();
@@ -724,7 +740,9 @@ Skill: (exact name)`;
 			signal?.addEventListener("abort", abortHandler);
 
 			this.bot.once("blockBreakProgressObserved", () => {
-				this.checkAbort(signal);
+				if (this.checkAbort(signal)) {
+					this.bot.stopDigging();
+				}
 			});
 
 			this.bot.once("diggingComplete", () => {
@@ -750,7 +768,9 @@ Skill: (exact name)`;
 		});
 
 		while (true) {
-			this.checkAbort(signal);
+			if (this.checkAbort(signal)) {
+				throw new Error("Aborted");
+			}
 			try {
 				await p;
 				return;
@@ -768,11 +788,15 @@ Skill: (exact name)`;
 	}
 
 	public async safeAttack(target: any, signal?: AbortSignal): Promise<void> {
-		this.checkAbort(signal);
+		if (this.checkAbort(signal)) {
+			throw new Error("Aborted");
+		}
 
 		const attackLoop = async () => {
 			while (true) {
-				this.checkAbort(signal);
+				if (this.checkAbort(signal)) {
+					throw new Error("Aborted");
+				}
 				try {
 					await this.bot.attack(target);
 				} catch (err) {
@@ -801,7 +825,26 @@ Skill: (exact name)`;
 	}
 
 	public async safeGoto(goal: goals.Goal, signal?: AbortSignal): Promise<void> {
-		this.checkAbort(signal);
+		const g = goal as any;
+		const currentPos = this.bot.entity.position;
+
+		// x, y, z のいずれかが欠落していたら、Botの現在地で補完する
+		const safeX = (typeof g.x === 'number' && !isNaN(g.x)) ? g.x : currentPos.x;
+		const safeY = (typeof g.y === 'number' && !isNaN(g.y)) ? g.y : currentPos.y;
+		const safeZ = (typeof g.z === 'number' && !isNaN(g.z)) ? g.z : currentPos.z;
+
+		// もし元の Goal が不正（NaNを含むなど）だった場合、強制的に有効な GoalNear に差し替える
+		let finalGoal = goal;
+		if (isNaN(g.x) || isNaN(g.y) || isNaN(g.z) || g.x === undefined || g.z === undefined) {
+			console.warn(`[Pathfinding] Invalid Goal detected! Auto-correcting to: (${safeX.toFixed(1)}, ${safeY.toFixed(1)}, ${safeZ.toFixed(1)})`);
+			finalGoal = new goals.GoalNear(safeX, safeY, safeZ, 1);
+		}
+
+		goal = finalGoal;
+
+		if (this.checkAbort(signal)) {
+			throw new Error("Aborted");
+		}
 
 		if (this.currentGoal && this.currentGoal.equals?.(goal)) {
 			return;
@@ -834,7 +877,10 @@ Skill: (exact name)`;
 		let lastPos = startPos.clone();
 		let stuckCount = 0;
 		const checkStuck = setInterval(() => {
-			this.checkAbort(signal);
+			if (this.checkAbort(signal)) {
+				clearInterval(checkStuck);
+				return;
+			}
 			const currentPos = this.bot.entity.position;
 			if (currentPos.distanceTo(lastPos) < 0.1) {
 				stuckCount++;
@@ -842,7 +888,7 @@ Skill: (exact name)`;
 				stuckCount = 0;
 			}
 			if (stuckCount >= 5) {
-				console.log(`[Pathfinding] Stuck detected! Position: ${currentPos}`);
+				console.log(`[Pathfinding Stuck] From:(${this.bot.entity.position.x.toFixed(1)}, ${this.bot.entity.position.y.toFixed(1)}, ${this.bot.entity.position.z.toFixed(1)}) To:(${ (goal as any).x?.toFixed(1) ?? '?' }, ${ (goal as any).y?.toFixed(1) ?? '?' }, ${ (goal as any).z?.toFixed(1) ?? '?' }) Dist:${ (goal as any).x ? this.bot.entity.position.distanceTo(new Vec3((goal as any).x, (goal as any).y, (goal as any).z)).toFixed(1) : '?' }m`);
 				this.bot.setControlState("jump", true);
 				setTimeout(() => this.bot.setControlState("jump", false), 200);
 			}
@@ -853,7 +899,9 @@ Skill: (exact name)`;
 
 		try {
 			do {
-				this.checkAbort(signal);
+				if (this.checkAbort(signal)) {
+					throw new Error("Aborted");
+				}
 				try {
 					await this.bot.pathfinder.goto(goal);
 					console.log(`[Pathfinding] Reached goal successfully!`);
@@ -876,4 +924,3 @@ Skill: (exact name)`;
 		return this.safeGoto(goal, this.currentAbort?.signal);
 	}
 }
-
