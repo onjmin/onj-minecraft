@@ -10,7 +10,10 @@ export const stealFromChestSkill = createSkill<void, { itemsCount: number; conta
 		name: "collecting.stealing",
 		description: "Finds a nearby chest or barrel, opens it, and takes all items inside.",
 		inputSchema: {} as any,
-		handler: async ({agent, signal}): Promise<SkillResponse<{ itemsCount: number; containerType: string }>> => {
+		handler: async ({
+			agent,
+			signal,
+		}): Promise<SkillResponse<{ itemsCount: number; containerType: string }>> => {
 			const { bot } = agent;
 
 			// 1. 周辺のコンテナ（チェスト、樽、トラップチェスト）をスキャン
@@ -29,7 +32,8 @@ export const stealFromChestSkill = createSkill<void, { itemsCount: number; conta
 
 			try {
 				// 2. ターゲットへ移動
-				await agent.smartGoto(
+				await agent.abortableGoto(
+					signal,
 					new goals.GoalGetToBlock(
 						containerBlock.position.x,
 						containerBlock.position.y,

@@ -56,7 +56,7 @@ export const exploreUndergroundSkill = createSkill<void, { torchPlaced: boolean 
 				if (targetBlock && targetBlock.name === "air") {
 					const goal = new goals.GoalNear(targetPos.x, targetPos.y, targetPos.z, 2);
 
-					agent.smartGoto(goal);
+					agent.abortableGoto(signal, goal);
 
 					return skillResult.ok(
 						`Moved deeper into the cave at ${targetPos.x}, ${targetPos.y}, ${targetPos.z}`,
@@ -69,7 +69,7 @@ export const exploreUndergroundSkill = createSkill<void, { torchPlaced: boolean 
 			agent.log(`No cave found. Digging down...`);
 			const down = bot.blockAt(bot.entity.position.offset(0, -1, 0));
 			if (down && down.name !== "air" && down.name !== "bedrock") {
-				await agent.safeDig(down, signal);
+				await agent.abortableDig(signal, down);
 				// 掘った後に少し待つ、または smartGoto で座標を更新
 			}
 

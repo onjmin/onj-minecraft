@@ -21,7 +21,7 @@ export const fellTreesSkill = createSkill<void, { count: number }>({
 			const toolPlugin = (bot as any).tool;
 
 			const goal = new goals.GoalNear(target.x, target.y, target.z, 2);
-			await agent.smartGoto(goal);
+			await agent.abortableGoto(signal, goal);
 
 			const columnLogs: Vec3[] = [];
 			for (let i = 0; i < 6; i++) {
@@ -37,7 +37,7 @@ export const fellTreesSkill = createSkill<void, { count: number }>({
 					if (toolPlugin) {
 						await toolPlugin.equipForBlock(block);
 					}
-					await agent.safeDig(block, signal);
+					await agent.abortableDig(signal, block);
 					felledCount++;
 				}
 			}

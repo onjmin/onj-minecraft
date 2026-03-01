@@ -11,7 +11,7 @@ export const exploreSeaSkill = createSkill<void, { usedBoat: boolean }>({
 	name: "exploring.explore_sea",
 	description: "Explores the ocean. Automatically attempts to use a boat for efficient travel.",
 	inputSchema: {} as any,
-	handler: async ({agent, signal}): Promise<SkillResponse<{ usedBoat: boolean }>> => {
+	handler: async ({ agent, signal }): Promise<SkillResponse<{ usedBoat: boolean }>> => {
 		let usedBoat = false;
 
 		const { bot } = agent;
@@ -66,7 +66,7 @@ export const exploreSeaSkill = createSkill<void, { usedBoat: boolean }>({
 
 			// Using GoalXZ works for boats too (pathfinder handles boat movement in latest versions)
 			// ボートに乗った状態でも GoalXZ で移動可能
-			await agent.smartGoto(new goals.GoalXZ(x, z));
+			await agent.abortableGoto(signal, new goals.GoalXZ(x, z));
 
 			return skillResult.ok(
 				`Navigating the ocean towards ${x}, ${z}. ${usedBoat ? "Using a boat." : "Swimming."}`,

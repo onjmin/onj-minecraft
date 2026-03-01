@@ -287,9 +287,7 @@ export class AgentOrchestrator {
 	private enterCombat(target: any) {
 		if (this.isInCombat) return;
 
-		this.log(
-			`Combat detected! Target: ${target.name || target.type}`,
-		);
+		this.log(`Combat detected! Target: ${target.name || target.type}`);
 		this.isInCombat = true;
 		this.combatTarget = target;
 		this.shouldStopSkill = true;
@@ -693,18 +691,18 @@ Skill: (exact name)`;
 
 	private isMoving: boolean = false;
 
-	private checkAbort(signal: AbortSignal | undefined): boolean {
-		if (signal?.aborted) {
+	private checkAbort(signal: AbortSignal): boolean {
+		if (signal.aborted) {
 			this.log("Abort detected, stopping execution...");
 			return true;
 		}
 		return false;
 	}
 
-	public async safeSetControlState(
+	public async abortableSetControlState(
+		signal: AbortSignal,
 		control: ControlState,
 		value: boolean,
-		signal?: AbortSignal,
 	): Promise<void> {
 		if (this.checkAbort(signal)) {
 			throw new Error("Aborted");
@@ -712,7 +710,7 @@ Skill: (exact name)`;
 		this.bot.setControlState(control, value);
 	}
 
-	public async safeDig(block: any, signal?: AbortSignal): Promise<void> {
+	public async abortableDig(signal: AbortSignal, block: any): Promise<void> {
 		if (this.checkAbort(signal)) {
 			throw new Error("Aborted");
 		}
@@ -778,7 +776,7 @@ Skill: (exact name)`;
 		}
 	}
 
-	public async safeAttack(target: any, signal?: AbortSignal): Promise<void> {
+	public async abortableAttack(signal: AbortSignal, target: any): Promise<void> {
 		if (this.checkAbort(signal)) {
 			throw new Error("Aborted");
 		}
@@ -815,7 +813,7 @@ Skill: (exact name)`;
 		return attackPromise;
 	}
 
-	public async safeGoto(goal: goals.Goal, signal?: AbortSignal): Promise<void> {
+	public async abortableGoto(signal: AbortSignal, goal: goals.Goal): Promise<void> {
 		const g = goal as any;
 		const currentPos = this.bot.entity.position;
 
@@ -886,9 +884,23 @@ Skill: (exact name)`;
 				stuckCount = 0;
 			}
 			if (stuckCount >= 5) {
-				this.log(
-					`Pathfinding Stuck: From:(${this.bot.entity.position.x.toFixed(1)}, ${this.bot.entity.position.y.toFixed(1)}, ${this.bot.entity.position.z.toFixed(1)}) To:(${(goal as any).x?.toFixed(1) ?? "?"}, ${(goal as any).y?.toFixed(1) ?? "?"}, ${(goal as any).z?.toFixed(1) ?? "?"}) Dist:${(goal as any).x ? this.bot.entity.position.distanceTo(new Vec3((goal as any).x, (goal as any).y, (goal as any).z)).toFixed(1) : "?"}m`,
-				);
+				const pos = this.bot.entity.position;
+
+				const from = `(${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)})`;
+
+				const gx = (goal as any).x;
+				const gy = (goal as any).y;
+				const gz = (goal as any).z;
+
+				const hasGoalPos =
+					typeof gx === "number" && typeof gy === "number" && typeof gz === "number";
+
+				const to = hasGoalPos ? `(${gx.toFixed(1)}, ${gy.toFixed(1)}, ${gz.toFixed(1)})` : "(?)";
+
+				const dist = hasGoalPos ? pos.distanceTo(new Vec3(gx, gy, gz)).toFixed(1) : "?";
+
+				this.log(`Pathfinding Stuck: From:${from} To:${to} Dist:${dist}m`);
+
 				this.bot.setControlState("jump", true);
 				setTimeout(() => this.bot.setControlState("jump", false), 200);
 			}
@@ -918,9 +930,5 @@ Skill: (exact name)`;
 			this.isMoving = false;
 			this.bot.clearControlStates();
 		}
-	}
-
-	public async smartGoto(goal: goals.Goal): Promise<void> {
-		return this.safeGoto(goal, this.currentAbort?.signal);
 	}
 }

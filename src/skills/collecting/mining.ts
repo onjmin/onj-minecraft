@@ -25,14 +25,14 @@ export const mineOresSkill = createSkill<void, { minedCount: number }>({
 		try {
 			for (const pos of orePositions.slice(0, 3)) {
 				const goal = new goals.GoalNear(pos.x, pos.y, pos.z, 2);
-				await agent.smartGoto(goal);
+				await agent.abortableGoto(signal, goal);
 
 				const block = bot.blockAt(pos);
 				if (block && (block.name.includes("ore") || block.name.includes("raw"))) {
 					if (toolPlugin) {
 						await toolPlugin.equipForBlock(block);
 					}
-					await agent.safeDig(block, signal);
+					await agent.abortableDig(signal, block);
 					minedCount++;
 				}
 			}

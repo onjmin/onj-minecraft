@@ -38,16 +38,16 @@ export const huntAnimalsSkill = createSkill<void, { hunted: string; success: boo
 			// 3. Approach and attack
 			// 動物に近づいて攻撃
 			const pos = target.position;
-			await agent.smartGoto(new goals.GoalFollow(target, 1));
+			await agent.abortableGoto(signal, new goals.GoalFollow(target, 1));
 
 			// Attack the entity
 			// 攻撃実行
-			await agent.safeAttack(target, signal);
+			await agent.abortableAttack(signal, target);
 
 			// 4. Wait a moment and collect drops (Reflex)
 			// ドロップアイテムを拾うために少し待機して移動（脊髄反射）
 			await new Promise((r) => setTimeout(r, 800));
-			await agent.smartGoto(new goals.GoalNear(pos.x, pos.y, pos.z, 1));
+			await agent.abortableGoto(signal, new goals.GoalNear(pos.x, pos.y, pos.z, 1));
 
 			let ate = false;
 

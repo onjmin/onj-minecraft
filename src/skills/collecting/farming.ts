@@ -28,14 +28,14 @@ export const farmTendCropsSkill = createSkill<void, { harvestedCount: number }>(
 			for (const pos of targets) {
 				// Navigate to the target crop
 				// ターゲットの作物の場所まで移動
-				await agent.smartGoto(new goals.GoalGetToBlock(pos.x, pos.y, pos.z));
+				await agent.abortableGoto(signal, new goals.GoalGetToBlock(pos.x, pos.y, pos.z));
 
 				const block = bot.blockAt(pos);
 				// Check again if it's still harvestable
 				// まだ収穫可能か再確認
 				if (block && block.metadata === 7) {
 					const cropName = block.name;
-					await agent.safeDig(block, signal);
+					await agent.abortableDig(signal, block);
 					harvestedCount++;
 
 					// 2. Attempt to replant if seeds are available
