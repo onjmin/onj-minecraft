@@ -1,5 +1,5 @@
 import mineflayer, { type ControlState } from "mineflayer";
-import { goals, Movements, pathfinder } from "mineflayer-pathfinder";
+import { type goals, Movements, pathfinder } from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
 import type { AgentProfile } from "../profiles/types";
 import { exploreLandSkill } from "../skills/exploring/land";
@@ -234,10 +234,14 @@ export class AgentOrchestrator {
 
 		// 3. movements に反映
 		movements.scafoldingBlocks = Array.from(buildableBlockIds);
+		movements.walkSpeed = 1.5;
+		movements.digCost = 1;
 
 		this.bot.pathfinder.setMovements(movements);
 		this.bot.pathfinder.thinkTimeout = 5000;
 		this.bot.pathfinder.tickTimeout = 100;
+
+		this.bot.physics.speed = 1.5;
 
 		if ((this.bot as any).collectBlock) {
 			(this.bot as any).collectBlock.movements = movements;
@@ -592,7 +596,6 @@ Skill: (exact name)`;
 					const rationale = rationaleMatch ? rationaleMatch[1].trim() : "No reasoning.";
 					let chatMessage = chatMatch ? chatMatch[1].trim() : "";
 					let foundSkillName = skillMatch ? skillMatch[1].trim() : null;
-					foundSkillName = exploreLandSkill.name;
 
 					// 2. Chat内容の高度なクリーンアップ
 					if (chatMessage) {
@@ -863,9 +866,7 @@ Skill: (exact name)`;
 				const hasGoalPos =
 					typeof gx === "number" && typeof gy === "number" && typeof gz === "number";
 
-				const dist = hasGoalPos
-					? pos.distanceTo(new Vec3(gx, gy, gz)).toFixed(1)
-					: "?";
+				const dist = hasGoalPos ? pos.distanceTo(new Vec3(gx, gy, gz)).toFixed(1) : "?";
 
 				this.log(`Pathfinding Stuck: From:${from} To:${to} Dist:${dist}m`);
 
