@@ -56,25 +56,8 @@ export const farmTendCropsSkill = createSkill<void, { harvestedCount: number }>(
 				}
 			}
 
-			let ate = false;
-
-			// --- Survival Routine: Eat after farming ---
-			if (bot.food < 20) {
-				const edibleItems = bot.inventory.items().filter((item) => {
-					return bot.registry.foodsByName[item.name] || bot.registry.foods[item.type];
-				});
-
-				if (edibleItems.length > 0) {
-					const food = edibleItems[0];
-					await bot.equip(food, "hand");
-					await bot.consume();
-					ate = true;
-				}
-			}
-
-			return skillResult.ok(`Managed ${harvestedCount} crops${ate ? " and ate" : ""}.`, {
+			return skillResult.ok(`Managed ${harvestedCount} crops.`, {
 				harvestedCount,
-				ate,
 			});
 		} catch (err) {
 			const errorMsg = err instanceof Error ? err.message : String(err);

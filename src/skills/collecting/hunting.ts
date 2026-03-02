@@ -50,26 +50,8 @@ export const huntAnimalsSkill = createSkill<void, { hunted: string; success: boo
 			await agent.abortableGoto(signal, new goals.GoalNear(pos.x, pos.y, pos.z, 1));
 			await agent.pickupNearbyItems();
 
-			let ate = false;
-
-			// 5. 【追加】食事ロジック (Survival Routine)
-			// 狩りの後、空腹なら手持ちの食料を食べる
-			if (bot.food < 20) {
-				const edibleItems = bot.inventory.items().filter((item) => {
-					return bot.registry.foodsByName[item.name] || bot.registry.foods[item.type];
-				});
-
-				if (edibleItems.length > 0) {
-					const food = edibleItems[0];
-					await bot.equip(food, "hand");
-					await bot.consume();
-					ate = true;
-				}
-			}
-
 			return skillResult.ok(`Successfully hunted a ${target.name}.`, {
 				hunted: target.name || "unknown",
-				ate: ate,
 				success: true,
 			});
 		} catch (err) {

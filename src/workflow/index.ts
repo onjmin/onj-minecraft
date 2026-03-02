@@ -1,13 +1,13 @@
 import { MinecraftAgent } from "../core/agent";
 import { profiles } from "../profiles";
 import { farmTendCropsSkill } from "../skills/collecting/farming";
-import { fellTreesSkill } from "../skills/collecting/felling";
+import { collectWoodSkill } from "../skills/collecting/wood";
 import { huntAnimalsSkill } from "../skills/collecting/hunting";
 import { mineOresSkill } from "../skills/collecting/mining";
 import { stealFromChestSkill } from "../skills/collecting/stealing";
 import { collectStoneSkill } from "../skills/collecting/stone";
 import { craftSmeltingSkill } from "../skills/crafting/smelting";
-import { craftStorageSkill } from "../skills/crafting/storage";
+import { craftChestSkill } from "../skills/crafting/chest";
 import { craftToolSkill } from "../skills/crafting/tool";
 import { craftWeaponSkill } from "../skills/crafting/weapon";
 import { exploreLandSkill } from "../skills/exploring/land";
@@ -19,7 +19,7 @@ const allSkills = [
 	farmTendCropsSkill, // 収穫 + 再植え付け + 食事
 	huntAnimalsSkill, // 狩猟 + 回収 + 食事
 	mineOresSkill, // 採掘
-	fellTreesSkill, // 伐採
+	collectWoodSkill, // 伐採
 	stealFromChestSkill, // 略奪 + 装備更新 + 食事
 	collectStoneSkill,
 
@@ -31,7 +31,7 @@ const allSkills = [
 	// --- Crafting Domain (The "One-at-a-time" Iterative skills) ---
 	craftToolSkill, // 道具作成
 	craftWeaponSkill, // 武器作成
-	craftStorageSkill, // チェスト作成
+	craftChestSkill, // チェスト作成
 	craftSmeltingSkill, // 精錬開始
 ];
 /**

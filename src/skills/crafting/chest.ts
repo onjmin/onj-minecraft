@@ -3,13 +3,13 @@ import { createSkill, type SkillResponse, skillResult } from "../types";
 import { ensureCraftingTable, ensurePlanks, findAllPlaceablePositions } from "./util";
 
 /**
- * Crafting Domain: Storage management.
+ * Crafting Domain: Chest management.
  * クラフトドメイン：収納管理。
  * 材料がある限り、反復してチェストを作成します。
  */
-export const craftStorageSkill = createSkill<void, { item: string; count: number }>({
-	name: "crafting.storage",
-	description: "Crafts 1 chest from planks. Can be repeated to build up storage.",
+export const craftChestSkill = createSkill<void, { item: string; count: number }>({
+	name: "crafting.chest",
+	description: "Crafts 1 chest from planks. Can be repeated to build up chest.",
 	inputSchema: {} as any,
 	handler: async ({ agent, signal }): Promise<SkillResponse<{ item: string; count: number }>> => {
 		const { bot } = agent;
@@ -17,7 +17,7 @@ export const craftStorageSkill = createSkill<void, { item: string; count: number
 		// すでにチェストがあるかチェック
 		const existingChest = bot.inventory.items().find((i) => i.name === "chest");
 		if (existingChest) {
-			agent.log(`[craftStorage] Found existing chest in inventory, attempting to place...`);
+			agent.log(`[craftChest] Found existing chest in inventory, attempting to place...`);
 			// チェストを設置
 			const positions = findAllPlaceablePositions(bot);
 			for (const refBlock of positions) {
@@ -34,10 +34,10 @@ export const craftStorageSkill = createSkill<void, { item: string; count: number
 						return skillResult.ok("Placed existing chest.", { item: "chest", count: 1 });
 					}
 				} catch (e) {
-					agent.log(`[craftStorage] Failed to place at ${refBlock.position}: ${e}`);
+					agent.log(`[craftChest] Failed to place at ${refBlock.position}: ${e}`);
 				}
 			}
-			agent.log(`[craftStorage] Could not place existing chest`);
+			agent.log(`[craftChest] Could not place existing chest`);
 		}
 
 		// 板材を事前に確保（チェストは8板材必要）
@@ -49,22 +49,22 @@ export const craftStorageSkill = createSkill<void, { item: string; count: number
 		// 1. 作業台の確保（共通関数を利用）
 		const table = await ensureCraftingTable(agent);
 		if (!table) {
-			return skillResult.fail("Could not secure a crafting table for storage crafting.");
+			return skillResult.fail("Could not secure a crafting table for chest crafting.");
 		}
 
 		try {
 			// 2. レシピの確認
 			const chestItemRef = bot.registry.itemsByName.chest;
-			agent.log(`[craftStorage] Searching for chest recipe, itemId=${chestItemRef.id}`);
+			agent.log(`[craftChest] Searching for chest recipe, itemId=${chestItemRef.id}`);
 
 			// recipesFor を使い、材料をチェック
 			const recipes = bot.recipesFor(chestItemRef.id, null, 1, table);
-			agent.log(`[craftStorage] Found ${recipes.length} chest recipes`);
+			agent.log(`[craftChest] Found ${recipes.length} chest recipes`);
 
 			if (!recipes || recipes.length === 0) {
 				const planks = bot.inventory.items().filter((i) => i.name.endsWith("planks"));
 				agent.log(
-					`[craftStorage] Planks in inventory: ${planks.map((p) => `${p.name}:${p.count}`).join(", ")}`,
+					`[craftChest] Planks in inventory: ${planks.map((p) => `${p.name}:${p.count}`).join(", ")}`,
 				);
 
 				return skillResult.fail("Recipe not found. Ensure you have 8 planks of the same type.");
@@ -72,17 +72,17 @@ export const craftStorageSkill = createSkill<void, { item: string; count: number
 
 			// 3. クラフト実行
 			await bot.craft(recipes[0], 1, table);
-			agent.log(`[craftStorage] Crafted chest, now placing...`);
+			agent.log(`[craftChest] Crafted chest, now placing...`);
 
 			// 4. チェストを設置
 			const chestItem = bot.inventory.items().find((i) => i.name === "chest");
-			agent.log(`[craftStorage] Chest item in inventory: found=${!!chestItem}`);
+			agent.log(`[craftChest] Chest item in inventory: found=${!!chestItem}`);
 			if (chestItem) {
 				const positions = findAllPlaceablePositions(bot);
-				agent.log(`[craftStorage] Found ${positions.length} placeable positions`);
+				agent.log(`[craftChest] Found ${positions.length} placeable positions`);
 
 				for (const refBlock of positions) {
-					agent.log(`[craftStorage] Trying at ${refBlock.position}`);
+					agent.log(`[craftChest] Trying at ${refBlock.position}`);
 					await bot.equip(chestItem, "hand");
 					try {
 						await new Promise((r) => setTimeout(r, 500));
@@ -94,26 +94,26 @@ export const craftStorageSkill = createSkill<void, { item: string; count: number
 						});
 
 						if (placed) {
-							agent.log(`[craftStorage] SUCCESS: Placed chest at ${placed.position}`);
+							agent.log(`[craftChest] SUCCESS: Placed chest at ${placed.position}`);
 							return skillResult.ok("Crafted and placed 1 chest.", {
 								item: "chest",
 								count: 1,
 							});
 						}
 					} catch (e) {
-						agent.log(`[craftStorage] Failed at ${refBlock.position}: ${e}`);
+						agent.log(`[craftChest] Failed at ${refBlock.position}: ${e}`);
 					}
 				}
 			}
 
-			agent.log(`[craftStorage] SUCCESS: Crafted chest (not placed)`);
+			agent.log(`[craftChest] SUCCESS: Crafted chest (not placed)`);
 			return skillResult.ok("Crafted 1 chest.", {
 				item: "chest",
 				count: 1,
 			});
 		} catch (err) {
 			return skillResult.fail(
-				`Storage crafting failed: ${err instanceof Error ? err.message : String(err)}`,
+				`Chest crafting failed: ${err instanceof Error ? err.message : String(err)}`,
 			);
 		}
 	},

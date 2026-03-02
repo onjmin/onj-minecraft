@@ -506,17 +506,7 @@ export class MinecraftAgent {
 				.filter((e) => e.type === "player" && e !== this.bot.entity)
 				.filter((e) => e.position.distanceTo(this.bot.entity.position) < 24); // 視界を少し広めに設定
 
-			const nearbyPlayersData = players.map((p) => {
-				const dist = Math.round(p.position.distanceTo(this.bot.entity.position));
-				// 手に持っているアイテム（メインハンド）
-				const heldItem = p.heldItem ? p.heldItem.name : "Nothing";
-				// 装備（ヘルメット等があるか）
-				const hasArmor = p.equipment?.some((item) => item && item.name.includes("helmet"))
-					? "Armored"
-					: "No Armor";
-
-				return `${p.username} (Dist: ${dist}m, Holding: ${heldItem}, ${hasArmor})`;
-			});
+			const nearbyPlayersData = players.map((p) => p.username);
 
 			const nearbyPlayersText =
 				nearbyPlayersData.length > 0 ? nearbyPlayersData.join(", ") : "None";
@@ -544,8 +534,26 @@ export class MinecraftAgent {
 			// 「なぜHPが減ったか」がわからないと、同じミスを繰り返します。
 
 			// 4. 装備の状態（Equipment）
-			// 手に何を持っているか、防具を着ているか。インベントリの中にあるだけでは使えないため、**「今、手に持っているもの」**は重要です。
+			// 手に何を持っているか，防具を着ているか。インベントリの中にあるだけでは使えないため、**「今，手に持っているもの」**は重要です。
 			const heldItem = this.bot.heldItem ? this.bot.heldItem.name : "Bare hands";
+
+			// 周囲のブロックをランダムサンプリング（10個）
+			const sampleRadius = 8;
+			const sampledBlocks: string[] = [];
+			for (let i = 0; i < 10; i++) {
+				const dx = Math.floor(Math.random() * sampleRadius * 2 - sampleRadius);
+				const dy = Math.floor(Math.random() * sampleRadius * 2 - sampleRadius);
+				const dz = Math.floor(Math.random() * sampleRadius * 2 - sampleRadius);
+				const pos = this.bot.entity.position.offset(dx, dy, dz);
+				const block = this.bot.blockAt(pos);
+				if (block && block.name !== "air") {
+					sampledBlocks.push(block.name);
+				}
+			}
+			const nearbyBlocksText = [...new Set(sampledBlocks)].slice(0, 10).join(", ") || "None";
+
+			// 明るさ感知（木材伐採や農業のため）
+			const perceivedLight = getPerceivedLight(this.bot);
 
 			// チャットログのテキスト化
 			const chatLogContext =
@@ -567,6 +575,8 @@ ${this.profile.personality}
 - Nearby Players (IMPORTANT): ${nearbyPlayersText}
 - Nearby Mobs: ${nearbyMobs}
 - Last Damage Cause: ${this.lastDamageCause}
+- Nearby Blocks (sample): ${nearbyBlocksText}
+- Perceived Light: ${perceivedLight.toFixed(2)}/1.0 (1=dark, 0.5=twilight, 0=sunlight)
 
 ## RECENT CHAT LOG
 ${chatLogContext}
@@ -590,7 +600,7 @@ Skill: (exact name)`;
 				const logDir = path.join(process.cwd(), "logs", safeName);
 
 				if (!fs.existsSync(logDir)) {
-				fs.mkdirSync(logDir, { recursive: true });
+					fs.mkdirSync(logDir, { recursive: true });
 				}
 
 				// ファイルパス
@@ -913,4 +923,32 @@ Skill: (exact name)`;
 
 		await collectBlock.collectNearby();
 	}
+}
+
+/**
+ * 人間の目に近づけた明るさ知覚
+ */
+function getPerceivedLight(bot: mineflayer.Bot, samples = 30, radius = 4) {
+	let total = 0;
+	let count = 0;
+
+	for (let i = 0; i < samples; i++) {
+		const offset = new Vec3(
+			(Math.random() - 0.5) * radius * 2,
+			1 + Math.random(), // 目線高さ付近
+			(Math.random() - 0.5) * radius * 2,
+		);
+
+		const pos = bot.entity.position.plus(offset);
+		const block = bot.blockAt(pos);
+
+		if (block) {
+			const raw = Math.max(block.light, block.skyLight);
+			const perceived = Math.log2(raw + 1) / Math.log2(16);
+			total += perceived;
+			count++;
+		}
+	}
+
+	return count > 0 ? total / count : 0;
 }

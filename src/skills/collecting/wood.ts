@@ -3,13 +3,13 @@ import { goals } from "mineflayer-pathfinder";
 import type { Vec3 } from "vec3";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
-export const fellTreesSkill = createSkill<void, { count: number }>({
-    name: "collecting.felling",
+export const collectWoodSkill = createSkill<void, { count: number }>({
+    name: "collecting.wood",
     description: "Automatically finds and fells nearby trees, including clearing leaves to move safely.",
     inputSchema: {} as any,
     handler: async ({ agent, signal }): Promise<SkillResponse<{ count: number }>> => {
         const { bot } = agent;
-        const logs = fellingScanner.findNearbyLogs(bot);
+        const logs = woodScanner.findNearbyLogs(bot);
 
         if (logs.length === 0) return skillResult.fail("No trees found nearby.");
 
@@ -61,9 +61,9 @@ export const fellTreesSkill = createSkill<void, { count: number }>({
         } catch (err) {
             const errorMsg = err instanceof Error ? err.message : String(err);
             if (errorMsg.includes("Cancelled") || errorMsg.includes("stop")) {
-                return skillResult.fail("Felling cancelled by combat");
+                return skillResult.fail("Wood cancelled by combat");
             }
-            return skillResult.fail(`Felling failed: ${errorMsg}`);
+            return skillResult.fail(`Wood failed: ${errorMsg}`);
         }
     },
 });
@@ -86,7 +86,7 @@ function isLeaves(name: string): boolean {
     );
 }
 
-export const fellingScanner = {
+export const woodScanner = {
     findNearbyLogs: (bot: Bot, radius = 24): Vec3[] => {
         return bot
             .findBlocks({
