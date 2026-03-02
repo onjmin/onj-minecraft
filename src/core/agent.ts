@@ -194,7 +194,7 @@ export class MinecraftAgent {
 		movements.allowParkour = true; // ジャンプが必要な地形に対応
 		movements.allowFreeMotion = true;
 		movements.maxDropDown = 4; // 4ブロックまでの落下を許容
-		movements.stepHeight = 1;
+		movements.stepHeight = 2;
 
 		// --- 修正ポイント：破壊不可能なリストから「土」や「葉っぱ」を除去する ---
 		const diggableNames = ["dirt", "grass_block", "sand", "gravel", "oak_leaves", "birch_leaves"];
@@ -873,17 +873,44 @@ Skill: (exact name)`;
 				return;
 			}
 			const currentPos = this.bot.entity.position;
-			if (currentPos.distanceTo(lastPos) < 0.1) {
+			if (currentPos.distanceTo(lastPos) < 0.05) {
 				stuckCount++;
 			} else {
 				stuckCount = 0;
 			}
-			if (stuckCount >= 5) {
-				this.bot.setControlState("jump", true);
-				setTimeout(() => this.bot.setControlState("jump", false), 200);
+			if (stuckCount >= 3) {
+				this.log(`Pathfinding: Stuck detected, recalculating with offset...`);
+
+				// 1. Pathfinderを停止
+				const currentGoal = this.bot.pathfinder.goal;
+				this.bot.pathfinder.setGoal(null);
+
+				// 2. 一旦「後ろ」に下がって角から離れる（跳ね返り防止）
+				this.bot.clearControlStates();
+				this.bot.setControlState("back", true);
+
+				setTimeout(() => {
+					this.bot.setControlState("back", false);
+					
+					// 3. 少し横（例えば右）を向きつつ、ジャンプして前進
+					// これにより「角」を斜めに飛び越える挙動になる
+					this.bot.setControlState("jump", true);
+					this.bot.setControlState("forward", true);
+					this.bot.setControlState("right", true);
+
+					setTimeout(() => {
+						this.bot.clearControlStates();
+						// 4. 再計算させて復帰
+						if (currentGoal) {
+							this.bot.pathfinder.setGoal(currentGoal);
+						}
+					}, 400); // ジャンプ前進の時間
+				}, 200); // 後退の時間
+
+				stuckCount = 0;
 			}
 			lastPos = currentPos.clone();
-		}, 500);
+		}, 300);
 
 		let retry = 0;
 

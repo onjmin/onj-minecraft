@@ -5,9 +5,7 @@ import { createSkill, type SkillResponse, skillResult } from "../types";
 
 export const collectStoneSkill = createSkill<void, { minedCount: number }>({
     name: "collecting.stone",
-    description:
-        "Scans for and collects common stone blocks (Stone, Cobblestone, Deepslate, etc.). " +
-        "Use this skill when you need bulk materials for building or crafting furnaces.",
+    description: "Collects stone-type blocks. Requires a pickaxe to successfully obtain stone.",
     inputSchema: {} as any,
     handler: async ({ agent, signal }): Promise<SkillResponse<{ minedCount: number }>> => {
         const { bot } = agent;
