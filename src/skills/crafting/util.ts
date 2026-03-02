@@ -5,30 +5,137 @@ import type { MinecraftAgent } from "../../core/agent";
 type Block = NonNullable<ReturnType<Bot["blockAt"]>>;
 
 /**
- * 周囲の設置可能な位置を探す
+ * 設置を試みる（複数の位置でリトライ）
  */
-function findPlaceablePosition(bot: Bot): Block | null {
-	const directions = [
-		[1, 0],
-		[-1, 0],
-		[0, 1],
-		[0, -1],
-		[1, 1],
-		[-1, 1],
-		[1, -1],
-		[-1, -1],
-	];
+async function tryPlaceBlock(
+	bot: Bot,
+	itemName: string,
+	blockId: number,
+	agent: MinecraftAgent,
+): Promise<Block | null> {
+	const positions = findAllPlaceablePositions(bot);
+	agent.log(`[tryPlaceBlock] Found ${positions.length} positions`);
 
-	for (const [dx, dz] of directions) {
-		const refBlock = bot.blockAt(bot.entity.position.offset(dx, -1, dz));
-		if (refBlock && refBlock.name !== "air") {
-			const placePos = refBlock.position.offset(0, 1, 0);
-			const blockAbove = bot.blockAt(placePos);
-			if (blockAbove && blockAbove.name === "air") {
-				return refBlock;
+	if (positions.length === 0) {
+		agent.log(`[tryPlaceBlock] No placeable positions found!`);
+		return null;
+	}
+
+	// アイテムをオブジェクトとして取得
+	const item = bot.inventory.items().find((i) => i.name === itemName);
+	if (!item) {
+		agent.log(`[tryPlaceBlock] Item not found in inventory: ${itemName}`);
+		return null;
+	}
+	agent.log(`[tryPlaceBlock] Item found: ${item.name}, count=${item.count}`);
+
+	for (const refBlock of positions) {
+		agent.log(`[tryPlaceBlock] Trying at ${refBlock.position}, ref=${refBlock.name}`);
+
+		try {
+			await bot.equip(item, "hand");
+			agent.log(`[tryPlaceBlock] Equipped ${item.name}`);
+
+			await new Promise((r) => setTimeout(r, 500));
+
+			try {
+				await bot.placeBlock(refBlock, new Vec3(0, 1, 0));
+				agent.log(`[tryPlaceBlock] placeBlock returned`);
+			} catch (placeErr) {
+				agent.log(`[tryPlaceBlock] placeBlock error: ${placeErr}`);
+				continue;
 			}
+
+			// 設置確認
+			await new Promise((r) => setTimeout(r, 500));
+			const placed = bot.findBlock({
+				matching: blockId,
+				maxDistance: 4,
+			});
+
+			if (placed) {
+				agent.log(`[tryPlaceBlock] SUCCESS at ${refBlock.position}`);
+				return placed;
+			} else {
+				agent.log(`[tryPlaceBlock] Block not found after placement`);
+			}
+		} catch (e) {
+			agent.log(`[tryPlaceBlock] Error at ${refBlock.position}: ${e}`);
 		}
 	}
+
+	agent.log(`[tryPlaceBlock] All positions failed`);
+	return null;
+}
+
+/**
+ * 設置可能な位置をすべて取得（拡張版）
+ */
+function findAllPlaceablePositions(bot: Bot): Block[] {
+	const candidates: { block: Block; dist: number }[] = [];
+
+	for (let dx = -3; dx <= 3; dx++) {
+		for (let dz = -3; dz <= 3; dz++) {
+			if (dx === 0 && dz === 0) continue;
+
+			const refBlock = bot.blockAt(bot.entity.position.offset(dx, -1, dz));
+			if (!refBlock || refBlock.name === "air") continue;
+
+			const invalidBlocks = ["water", "lava", "fire", "grass", "tall_grass", "fern", "snow"];
+			if (invalidBlocks.includes(refBlock.name)) continue;
+
+			const blockAbove = bot.blockAt(refBlock.position.offset(0, 1, 0));
+			if (!blockAbove || blockAbove.name !== "air") continue;
+
+			const dist = Math.abs(dx) + Math.abs(dz);
+			candidates.push({ block: refBlock, dist });
+		}
+	}
+
+	candidates.sort((a, b) => a.dist - b.dist);
+	return candidates.map((c) => c.block);
+}
+
+/**
+ * 周囲の設置可能な位置を探す（拡張版）
+ */
+function findPlaceablePosition(bot: Bot): Block | null {
+	// 周边3マス、全方向
+	const candidates: { block: Block; dist: number }[] = [];
+
+	for (let dx = -3; dx <= 3; dx++) {
+		for (let dz = -3; dz <= 3; dz++) {
+			if (dx === 0 && dz === 0) continue;
+
+			const refBlock = bot.blockAt(bot.entity.position.offset(dx, -1, dz));
+			if (!refBlock || refBlock.name === "air") continue;
+
+			// 足場として適さないブロックは避ける
+			const invalidBlocks = ["water", "lava", "fire", "grass", "tall_grass", "fern", "snow"];
+			if (invalidBlocks.includes(refBlock.name)) continue;
+
+			// 上が空いているか
+			const blockAbove = bot.blockAt(refBlock.position.offset(0, 1, 0));
+			if (!blockAbove || blockAbove.name !== "air") continue;
+
+			// 距離計算
+			const dist = Math.abs(dx) + Math.abs(dz);
+			candidates.push({ block: refBlock, dist });
+		}
+	}
+
+	// 近い順にソート
+	candidates.sort((a, b) => a.dist - b.dist);
+
+	console.log(`[findPlaceablePosition] Found ${candidates.length} candidates`);
+
+	if (candidates.length > 0) {
+		console.log(
+			`[findPlaceablePosition] Selected: pos=${candidates[0].block.position}, dist=${candidates[0].dist}`,
+		);
+		return candidates[0].block;
+	}
+
 	return null;
 }
 
@@ -106,17 +213,14 @@ export async function ensureCraftingTable(agent: MinecraftAgent): Promise<Block 
 
 	// 4. 設置する
 	if (tableItem) {
-		const referenceBlock = findPlaceablePosition(bot);
-		if (referenceBlock) {
-			await bot.equip(tableItem, "hand");
-			await bot.placeBlock(referenceBlock, new Vec3(0, 1, 0));
-			const placed = bot.findBlock({
-				matching: bot.registry.blocksByName.crafting_table.id,
-				maxDistance: 4,
-			});
-			agent.log(`[ensureCraftingTable] Placed: found=${!!placed}`);
-			return placed;
-		}
+		const placed = await tryPlaceBlock(
+			bot,
+			tableItem.name,
+			bot.registry.blocksByName.crafting_table.id,
+			agent,
+		);
+		agent.log(`[ensureCraftingTable] Placed: found=${!!placed}`);
+		return placed;
 	}
 
 	agent.log(`[ensureCraftingTable] FAIL: Cannot place table`);
@@ -175,18 +279,14 @@ export async function ensureFurnace(agent: MinecraftAgent): Promise<Block | null
 
 	// 4. 設置する
 	if (furnaceItem) {
-		// 作業台と重ならないよう、少しずらした位置（例: Z軸に+1）に設置
-		const referenceBlock = findPlaceablePosition(bot);
-		if (referenceBlock) {
-			await bot.equip(furnaceItem, "hand");
-			await bot.placeBlock(referenceBlock, new Vec3(0, 1, 0));
-			const placed = bot.findBlock({
-				matching: bot.registry.blocksByName.furnace.id,
-				maxDistance: 4,
-			});
-			agent.log(`[ensureFurnace] Placed: found=${!!placed}`);
-			return placed;
-		}
+		const placed = await tryPlaceBlock(
+			bot,
+			furnaceItem.name,
+			bot.registry.blocksByName.furnace.id,
+			agent,
+		);
+		agent.log(`[ensureFurnace] Placed: found=${!!placed}`);
+		return placed;
 	}
 
 	agent.log(`[ensureFurnace] FAIL: Cannot place furnace`);
@@ -286,6 +386,13 @@ export async function ensurePlanks(agent: MinecraftAgent, minCount = 4): Promise
 		agent.log(`[ensurePlanks] Already have enough planks: ${planks.count}`);
 		return true;
 	}
+
+	agent.log(
+		`[ensurePlanks] Current inventory: ${bot.inventory
+			.items()
+			.map((i) => `${i.name}:${i.count}`)
+			.join(", ")}`,
+	);
 
 	const logItem = bot.inventory
 		.items()

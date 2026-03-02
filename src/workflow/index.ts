@@ -5,6 +5,7 @@ import { fellTreesSkill } from "../skills/collecting/felling";
 import { huntAnimalsSkill } from "../skills/collecting/hunting";
 import { mineOresSkill } from "../skills/collecting/mining";
 import { stealFromChestSkill } from "../skills/collecting/stealing";
+import { collectStoneSkill } from "../skills/collecting/stone";
 import { craftSmeltingSkill } from "../skills/crafting/smelting";
 import { craftStorageSkill } from "../skills/crafting/storage";
 import { craftToolSkill } from "../skills/crafting/tool";
@@ -20,6 +21,7 @@ const allSkills = [
 	mineOresSkill, // 採掘
 	fellTreesSkill, // 伐採
 	stealFromChestSkill, // 略奪 + 装備更新 + 食事
+	collectStoneSkill,
 
 	// --- Exploring Domain ---
 	exploreLandSkill, // 陸上探索

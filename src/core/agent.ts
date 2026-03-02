@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import mineflayer, { type ControlState } from "mineflayer";
 import { type goals, Movements, pathfinder } from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
@@ -582,6 +584,22 @@ Skill: (exact name)`;
 
 			try {
 				const rawContent = await llm.complete(systemPrompt);
+
+				// ログディレクトリ
+				const safeName = path.basename(this.profile.minecraftName);
+				const logDir = path.join(process.cwd(), "logs", safeName);
+
+				if (!fs.existsSync(logDir)) {
+				fs.mkdirSync(logDir, { recursive: true });
+				}
+
+				// ファイルパス
+				const inputPath = path.join(logDir, "input.md");
+				const outputPath = path.join(logDir, "output.md");
+
+				fs.writeFileSync(inputPath, systemPrompt);
+				fs.writeFileSync(outputPath, rawContent || "");
+
 				if (rawContent) {
 					// 1. 各セクションを抽出（次のキーワードまたは終端まで）
 					const rationaleMatch = rawContent.match(
