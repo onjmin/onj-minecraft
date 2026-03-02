@@ -194,6 +194,7 @@ export class MinecraftAgent {
 		movements.allowParkour = true; // ジャンプが必要な地形に対応
 		movements.allowFreeMotion = true;
 		movements.maxDropDown = 4; // 4ブロックまでの落下を許容
+		movements.stepHeight = 1;
 
 		// --- 修正ポイント：破壊不可能なリストから「土」や「葉っぱ」を除去する ---
 		const diggableNames = ["dirt", "grass_block", "sand", "gravel", "oak_leaves", "birch_leaves"];
@@ -526,8 +527,10 @@ export class MinecraftAgent {
 					.join(", ") || "None";
 
 			// 2. 現在のバイオームと周囲の環境
-			// 「砂漠で農業しようとしている」「洞窟の中にいるのに地上探索しようとしている」といった矛盾を防げます。また、**「今何時か（夜か昼か）」**は生存戦略に直結します。
-			const biome = this.bot.blockAt(this.bot.entity.position)?.biome.name || "unknown";
+			// biome取得
+			const blockAtPos = this.bot.blockAt(this.bot.entity.position);
+			const biome = (blockAtPos as any)?.biome?.name || this.bot.game.dimension || "unknown";
+
 			const isRaining = this.bot.isRaining;
 			const timeOfDay = this.bot.time.isDay ? "Day" : "Night";
 			// 3. 直近のダメージ原因
@@ -567,8 +570,8 @@ Roleplay as this character and interact with other players naturally.
 ${this.profile.personality}
 
 ## CURRENT STATUS
-- HP: ${this.bot.health}/20 | Food: ${this.bot.food}/20
-- Position: ${this.bot.entity.position.floored()} (Biome: ${biome})
+- HP: ${this.bot.health?.toFixed(0)}/20 | Food: ${this.bot.food?.toFixed(0)}/20
+- Biome: ${biome}
 - Time: ${timeOfDay} | Weather: ${isRaining ? "Raining" : "Clear"}
 - Held Item: ${heldItem}
 - Inventory: ${inventory}
@@ -576,7 +579,7 @@ ${this.profile.personality}
 - Nearby Mobs: ${nearbyMobs}
 - Last Damage Cause: ${this.lastDamageCause}
 - Nearby Blocks (sample): ${nearbyBlocksText}
-- Perceived Light: ${perceivedLight.toFixed(2)}/1.0 (1=dark, 0.5=twilight, 0=sunlight)
+- Perceived Light: ${perceivedLight?.toFixed(2)}/1.0 (1=dark, 0.5=twilight, 0=sunlight)
 
 ## RECENT CHAT LOG
 ${chatLogContext}
@@ -908,20 +911,28 @@ Skill: (exact name)`;
 	}
 
 	public async pickupNearbyItems(): Promise<void> {
-		const collectBlock = (this.bot as any).collectBlock;
-		if (!collectBlock) {
-			const items = this.bot.nearbyEntities.filter((e) => e.objectType === "Item");
-			for (const item of items) {
-				try {
-					await this.bot.collectItem(item);
-				} catch {
-					await this.bot.entityCollect(item);
-				}
-			}
-			return;
-		}
+		const distance = 8;
+		const getNearestItem = () => {
+			return Object.values(this.bot.entities).find(
+				(e) => e.name === "item" && this.bot.entity.position.distanceTo(e.position) < distance,
+			);
+		};
 
-		await collectBlock.collectNearby();
+		let nearestItem = getNearestItem();
+		let pickedUp = 0;
+
+		while (nearestItem && pickedUp < 10) {
+			try {
+				await this.bot.pathfinder.goto(
+					new (await import("mineflayer-pathfinder")).goals.GoalFollow(nearestItem, 1),
+				);
+				await new Promise((resolve) => setTimeout(resolve, 200));
+				nearestItem = getNearestItem();
+				pickedUp++;
+			} catch {
+				break;
+			}
+		}
 	}
 }
 

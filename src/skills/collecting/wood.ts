@@ -38,8 +38,21 @@ export const collectWoodSkill = createSkill<void, { count: number }>({
                 }
             }
 
-            // 高い位置にあるブロックから順に並び替え（足元のブロックを最後に掘るため）
-            blocksToRemove.sort((a, b) => b.y - a.y);
+            // ボットの足元の高さを取得
+			const botY = bot.entity.position.y;
+
+			// ソート順の変更
+			blocksToRemove.sort((a, b) => {
+				// 1. まずは「ボットの手が届く範囲(y=0~2付近)」を優先したい
+				// 2. 次に「上」を掘っていく
+				// 3. 最後に「足元(y=-1以下)」を掘る
+				
+				// 単純な実装：ボットの目線の高さ(y + 1.6)に近いものから順にする
+				const distA = Math.abs(a.y - (botY + 1.5));
+				const distB = Math.abs(b.y - (botY + 1.5));
+				
+				return distA - distB;
+			});
 
             for (const pos of blocksToRemove) {
                 const block = bot.blockAt(pos);

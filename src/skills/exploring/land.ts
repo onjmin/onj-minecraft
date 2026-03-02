@@ -55,8 +55,9 @@ export const exploreLandSkill = createSkill<void, { x: number; z: number }>({
                 }
 
                 if (foundY !== null) {
-                    targetPos = new Vec3(tx, foundY, tz);
-                    break search; // 見つかったら即座に決定
+                    // 修正ポイント1: ブロックの真ん中 (+0.5) を狙うことでスタックを激減させる
+                    targetPos = new Vec3(tx + 0.5, foundY, tz + 0.5);
+                    break search;
                 }
             }
         }
@@ -65,17 +66,19 @@ export const exploreLandSkill = createSkill<void, { x: number; z: number }>({
             return skillResult.fail("No safe ground found in sampling.");
         }
 
-        const { x, y, z } = targetPos;
-
         try {
-            // --- 2. XZ平面による移動 (Yはパスファインダーに任せる) ---
-            // これにより、段差の上を指定して「登れない！」となる事故を防げます
+            // 修正ポイント2: Goalの精度を調整
+            // GoalNearXZ(x, z, 1) は「半径1ブロック以内」で満足してしまうため、
+            // 階段の途中で「着いた」と判定して止まり、次の動作で詰まることがあります。
+            // 探索なら 0.5 くらいまで詰め寄るのが安全です。
+            const goal = new goals.GoalNearXZ(targetPos.x, targetPos.z, 0.5);
+            
             await Promise.race([
-                agent.abortableGoto(signal, new goals.GoalNearXZ(x, z, 1)),
-                new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 20000)),
+                agent.abortableGoto(signal, goal),
+                new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 15000)),
             ]);
 
-            return skillResult.ok("Reached destination.", { x, z });
+            return skillResult.ok("Reached destination.", { x: targetPos.x, z: targetPos.z });
         } catch (err) {
             // --- 3. リカバリ (スタック解除) ---
             bot.clearControlStates();
