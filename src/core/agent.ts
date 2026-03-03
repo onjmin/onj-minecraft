@@ -550,7 +550,7 @@ export class MinecraftAgent {
 								.map(([k, v]) => `${k}: ${(v as any).description}`)
 								.join(", ")}`
 						: "";
-					return `- ${t.name}: ${t.description}${argsInfo}`;
+					return `- ${t.name}${hasArgs ? `(${Object.keys(t.inputSchema).join(',')})` : ''}: ${t.description}${argsInfo}`;
 				})
 				.join("\n");
 
