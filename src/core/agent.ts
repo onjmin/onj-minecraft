@@ -786,7 +786,17 @@ Skill: (exact name)`;
 		safe: boolean;
 		functional: boolean;
 		hasStorage: boolean;
-	}) {
+	}): boolean {
+		const MIN_DISTANCE = 50;
+		for (const existing of this.bases) {
+			const dist =
+				Math.abs(existing.position.x - base.position.x) +
+				Math.abs(existing.position.z - base.position.z);
+			if (dist < MIN_DISTANCE) {
+				this.log(`Base too close to existing base (${dist} < ${MIN_DISTANCE}), not adding.`);
+				return false;
+			}
+		}
 		if (this.bases.length >= 3) {
 			this.bases.shift();
 		}
@@ -794,6 +804,7 @@ Skill: (exact name)`;
 		this.log(
 			`Added base: ${base.id} at (${base.position.x}, ${base.position.y}, ${base.position.z})`,
 		);
+		return true;
 	}
 
 	public getBases() {

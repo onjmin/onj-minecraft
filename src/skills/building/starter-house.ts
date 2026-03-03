@@ -5,7 +5,7 @@ import { createSkill, type SkillResponse, skillResult } from "../types";
 export const buildingHouseSkill = createSkill<void, { baseId: string; items: string[] }>({
 	name: "building.starter-house",
 	description:
-		"Builds a wooden box structure on the ground as a starter house. Places light, crafting table, furnace, chest, and door. Requires wood/planks.",
+		"Builds a wooden box structure on the ground, then adds light, crafting table, furnace, chest, and door in order. Only registers base when structure is complete.",
 	inputSchema: {} as any,
 	handler: async ({
 		agent,
@@ -54,35 +54,32 @@ export const buildingHouseSkill = createSkill<void, { baseId: string; items: str
 			(t) => t.x === -2 || t.x === 2 || t.z === -2 || t.z === 2,
 		);
 
+		let builtCount = 0;
 		for (const offset of wallTargets) {
 			if (agent.checkAbort(signal)) break;
-
 			const targetPos = pos.offset(offset.x, 0, offset.z);
 			const block = bot.blockAt(targetPos);
 
 			if (block && block.name === "air") {
 				const wood = bot.inventory.items().find((i) => woodBlocks.includes(i.name));
 				const plank = bot.inventory.items().find((i) => plankBlocks.includes(i.name));
-
 				const itemToPlace = plank || wood;
+
 				if (itemToPlace) {
-					const blockId =
-						bot.registry.blocksByName[
-							itemToPlace.name === "oak_log"
-								? "oak_planks"
-								: itemToPlace.name.replace("_log", "_planks")
-						];
-					if (blockId) {
-						await bot.equip(itemToPlace, "hand");
-						try {
-							await bot.placeBlock(targetPos, new (require("vec3"))(0, 1, 0));
-						} catch (e) {}
-					}
+					await bot.equip(itemToPlace, "hand");
+					try {
+						await bot.placeBlock(targetPos, new (require("vec3"))(0, 1, 0));
+						builtCount++;
+					} catch (e) {}
 				}
 			}
 		}
 
-		const installedItems: string[] = [];
+		if (builtCount < 8) {
+			return skillResult.fail(`Not enough walls built. Need at least 8, got ${builtCount}.`);
+		}
+
+		const installedItems: string[] = ["structure"];
 
 		const torchItem = bot.inventory.items().find((i) => i.name === "torch");
 		if (torchItem) {
@@ -96,12 +93,21 @@ export const buildingHouseSkill = createSkill<void, { baseId: string; items: str
 				} catch (e) {}
 			}
 		}
+		if (!installedItems.includes("torch")) {
+			return skillResult.fail("Failed to place torch. Cannot proceed without light.");
+		}
 
 		const table = await ensureCraftingTable(agent);
-		if (table) installedItems.push("crafting_table");
+		if (!table) {
+			return skillResult.fail("Failed to place crafting table.");
+		}
+		installedItems.push("crafting_table");
 
 		const furnace = await ensureFurnace(agent);
-		if (furnace) installedItems.push("furnace");
+		if (!furnace) {
+			return skillResult.fail("Failed to place furnace.");
+		}
+		installedItems.push("furnace");
 
 		const chestItem = bot.inventory.items().find((i) => i.name === "chest");
 		if (chestItem) {
@@ -121,15 +127,20 @@ export const buildingHouseSkill = createSkill<void, { baseId: string; items: str
 		}
 
 		const baseId = `house_${Date.now()}`;
-		agent.addBase({
+		const registered = agent.addBase({
 			id: baseId,
 			type: "starter-house",
 			position: { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) },
 			safe: true,
-			functional: installedItems.includes("crafting_table") && installedItems.includes("furnace"),
+			functional: true,
 			hasStorage: installedItems.includes("chest"),
 		});
-		agent.log(`[building.house] Base ${baseId}: ${installedItems.join(", ")}`);
+
+		if (!registered) {
+			return skillResult.fail("Base too close to existing base. Choose a different location.");
+		}
+
+		agent.log(`[building.house] Base ${baseId} registered: ${installedItems.join(", ")}`);
 
 		return skillResult.ok(`Built starter house. Items: ${installedItems.join(", ")}`, {
 			baseId,

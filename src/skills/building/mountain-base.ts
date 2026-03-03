@@ -5,7 +5,7 @@ import { createSkill, type SkillResponse, skillResult } from "../types";
 export const buildingMountainSkill = createSkill<void, { baseId: string; items: string[] }>({
 	name: "building.mountain-base",
 	description:
-		"Digs a horizontal cave into the side of a mountain and builds a base with light, crafting table, furnace, chest, and door. Creates mountain base.",
+		"Digs a horizontal cave into the side of a mountain, then adds light, crafting table, furnace, chest, and door in order. Only registers base when all items are placed.",
 	inputSchema: {} as any,
 	handler: async ({
 		agent,
@@ -36,10 +36,8 @@ export const buildingMountainSkill = createSkill<void, { baseId: string; items: 
 		let dugCount = 0;
 		for (const offset of digTargets) {
 			if (agent.checkAbort(signal)) break;
-
 			const targetPos = pos.offset(offset.x, offset.y, offset.z);
 			const block = bot.blockAt(targetPos);
-
 			if (!block || block.name === "air") continue;
 			if (["water", "lava", "bedrock"].includes(block.name)) continue;
 			if (!bot.canDigBlock(block)) continue;
@@ -48,7 +46,6 @@ export const buildingMountainSkill = createSkill<void, { baseId: string; items: 
 				signal,
 				new goals.GoalNear(targetPos.x, targetPos.y, targetPos.z, 1),
 			);
-
 			const currentBlock = bot.blockAt(targetPos);
 			if (currentBlock && currentBlock.name !== "air" && bot.canDigBlock(currentBlock)) {
 				if (toolPlugin) await toolPlugin.equipForBlock(currentBlock);
@@ -58,11 +55,11 @@ export const buildingMountainSkill = createSkill<void, { baseId: string; items: 
 			}
 		}
 
-		if (dugCount < 5) {
-			return skillResult.fail(`Not enough space dug: ${dugCount} blocks.`);
+		if (dugCount < 6) {
+			return skillResult.fail(`Not enough space dug. Need at least 6 blocks, got ${dugCount}.`);
 		}
 
-		const installedItems: string[] = [];
+		const installedItems: string[] = ["space"];
 
 		const torchItem = bot.inventory.items().find((i) => i.name === "torch");
 		if (torchItem) {
@@ -76,12 +73,21 @@ export const buildingMountainSkill = createSkill<void, { baseId: string; items: 
 				} catch (e) {}
 			}
 		}
+		if (!installedItems.includes("torch")) {
+			return skillResult.fail("Failed to place torch. Cannot proceed without light.");
+		}
 
 		const table = await ensureCraftingTable(agent);
-		if (table) installedItems.push("crafting_table");
+		if (!table) {
+			return skillResult.fail("Failed to place crafting table.");
+		}
+		installedItems.push("crafting_table");
 
 		const furnace = await ensureFurnace(agent);
-		if (furnace) installedItems.push("furnace");
+		if (!furnace) {
+			return skillResult.fail("Failed to place furnace.");
+		}
+		installedItems.push("furnace");
 
 		const chestItem = bot.inventory.items().find((i) => i.name === "chest");
 		if (chestItem) {
@@ -101,15 +107,20 @@ export const buildingMountainSkill = createSkill<void, { baseId: string; items: 
 		}
 
 		const baseId = `mountain_${Date.now()}`;
-		agent.addBase({
+		const registered = agent.addBase({
 			id: baseId,
 			type: "mountain",
 			position: { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) },
 			safe: true,
-			functional: installedItems.includes("crafting_table") && installedItems.includes("furnace"),
+			functional: true,
 			hasStorage: installedItems.includes("chest"),
 		});
-		agent.log(`[building.mountain] Base ${baseId}: ${installedItems.join(", ")}`);
+
+		if (!registered) {
+			return skillResult.fail("Base too close to existing base. Choose a different location.");
+		}
+
+		agent.log(`[building.mountain] Base ${baseId} registered: ${installedItems.join(", ")}`);
 
 		return skillResult.ok(`Built mountain base. Items: ${installedItems.join(", ")}`, {
 			baseId,
