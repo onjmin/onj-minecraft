@@ -987,7 +987,7 @@ Chat: (optional, message to send)`;
 			} else {
 				stuckCount = 0;
 			}
-			if (stuckCount >= 3) {
+			if (stuckCount >= 2) {
 				this.log(`Pathfinding: Stuck detected, recalculating with offset...`);
 
 				// 1. Pathfinderを停止
