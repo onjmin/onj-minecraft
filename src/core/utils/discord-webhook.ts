@@ -1,5 +1,5 @@
-import type { AgentProfile } from "../profiles/types";
-import { llm } from "./llm-client";
+import type { AgentProfile } from "../../profiles/types";
+import { llm } from "../llm-client";
 
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL ?? "";
 

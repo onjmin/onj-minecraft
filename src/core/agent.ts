@@ -6,9 +6,10 @@ import { Vec3 } from "vec3";
 import type { AgentProfile } from "../profiles/types";
 import { exploreLandSkill } from "../skills/exploring/land";
 import type { SkillResponse } from "../skills/types";
-import { emitDiscordWebhook, translateWithRoleplay } from "./discord-webhook";
 import { llm } from "./llm-client";
 import { cleanChatField, parseSections, parseSkillField } from "./llm-output-parser";
+import { emitDiscordWebhook, translateWithRoleplay } from "./utils/discord-webhook";
+import { isSameSimhash } from "./utils/simhash";
 
 const tryLoad = (bot: any, name: string, mod: any) => {
 	if (!mod) {
@@ -716,7 +717,9 @@ Chat: (optional, message to send)`;
 
 					// Chat のクリーンアップ共通化
 					const chatMessage = cleanChatField(sections.chat || "");
-					const isNotSpam = this.updateFIFO(this.strategicState.chats, chatMessage);
+					const isNotSpam =
+						isSameSimhash(chatMessage, this.profile.minecraftName) &&
+						this.updateFIFO(this.strategicState.chats, chatMessage);
 					if (isNotSpam) {
 						this.bot.chat(chatMessage);
 					}
