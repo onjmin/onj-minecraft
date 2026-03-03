@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import mineflayer, { type ControlState } from "mineflayer";
-import { type goals, Movements, pathfinder } from "mineflayer-pathfinder";
+import { goals, Movements, pathfinder } from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
 import type { AgentProfile } from "../profiles/types";
 import { exploreLandSkill } from "../skills/exploring/land";
@@ -68,6 +68,16 @@ export class MinecraftAgent {
 	private currentGoal: goals.Goal | null = null;
 
 	private currentAbort?: AbortController;
+	private currentSkillArgs: Record<string, any> = {};
+
+	private bases: {
+		id: string;
+		type: string;
+		position: { x: number; y: number; z: number };
+		safe: boolean;
+		functional: boolean;
+		hasStorage: boolean;
+	}[] = [];
 
 	constructor(profile: AgentProfile, skillList: any[]) {
 		this.profile = profile;
@@ -420,11 +430,16 @@ export class MinecraftAgent {
 
 					let result: SkillResponse | undefined;
 
+					const args = this.currentSkillArgs[skill.name] || {};
+
 					try {
-						this.log(`${skill.name} start`);
+						this.log(
+							`${skill.name} start${Object.keys(args).length > 0 ? ` with args: ${JSON.stringify(args)}` : ""}`,
+						);
 						result = await skill.handler({
 							agent: this,
 							signal: controller.signal,
+							args: args,
 						});
 					} catch (err) {
 						this.log(`${skill.name} aborted`);
@@ -493,7 +508,15 @@ export class MinecraftAgent {
 	private async startThinkingLoop() {
 		while (this.bot && this.bot.entity) {
 			const skillsContext = Array.from(this.skills.values())
-				.map((t) => `- ${t.name}: ${t.description}`)
+				.map((t) => {
+					const hasArgs = t.inputSchema && Object.keys(t.inputSchema).length > 0;
+					const argsInfo = hasArgs
+						? `\n  Args: ${Object.entries(t.inputSchema)
+								.map(([k, v]) => `${k}: ${(v as any).description}`)
+								.join(", ")}`
+						: "";
+					return `- ${t.name}: ${t.description}${argsInfo}`;
+				})
 				.join("\n");
 
 			const historyText = this.getHistoryContext();
@@ -572,6 +595,7 @@ Roleplay as this character and interact with other players naturally.
 ${this.profile.personality}
 
 ## CURRENT STATUS
+- Position: (${Math.floor(this.bot.entity.position.x)}, ${Math.floor(this.bot.entity.position.y)}, ${Math.floor(this.bot.entity.position.z)})
 - HP: ${this.bot.health?.toFixed(0)}/20 | Food: ${this.bot.food?.toFixed(0)}/20
 - Biome: ${biome}
 - Time: ${timeOfDay} | Weather: ${isRaining ? "Raining" : "Clear"}
@@ -588,6 +612,9 @@ ${chatLogContext}
 
 ## PAST OBSERVATIONS
 ${historyText}
+
+## KNOWN BASES (Max 3)
+${this.bases.length > 0 ? this.bases.map((b) => `- ${b.id} (${b.type}) at (${b.position.x}, ${b.position.y}, ${b.position.z}) | safe: ${b.safe}, functional: ${b.functional}, storage: ${b.hasStorage}`).join("\n") : "No bases registered yet."}
 
 ## AVAILABLE SKILLS
 ${skillsContext}
@@ -626,6 +653,25 @@ Skill: (exact name)`;
 					const rationale = rationaleMatch ? rationaleMatch[1].trim() : "No reasoning.";
 					let chatMessage = chatMatch ? chatMatch[1].trim() : "";
 					const foundSkillName = skillMatch ? skillMatch[1].trim() : null;
+
+					if (foundSkillName) {
+						const skillLine = rawContent.match(/Skill:\s*([^\n]+)/i);
+						if (skillLine && skillLine[1].includes(",")) {
+							const argStr = skillLine[1].split(",").slice(1).join(",");
+							const parsedArgs: Record<string, any> = {};
+							const argMatches = argStr.matchAll(/(\w+):\s*([^\s,]+)/g);
+							for (const match of argMatches) {
+								const key = match[1];
+								const value = match[2];
+								parsedArgs[key] = isNaN(Number(value)) ? value : Number(value);
+							}
+							if (Object.keys(parsedArgs).length > 0) {
+								this.currentSkillArgs[foundSkillName] = parsedArgs;
+							}
+						} else {
+							this.currentSkillArgs[foundSkillName] = {};
+						}
+					}
 
 					this.log(`${foundSkillName} ${rationale}`);
 
@@ -725,12 +771,55 @@ Skill: (exact name)`;
 
 	private isMoving: boolean = false;
 
-	private checkAbort(signal: AbortSignal): boolean {
+	public checkAbort(signal: AbortSignal): boolean {
 		if (signal.aborted) {
 			this.log("Abort detected, stopping execution...");
 			return true;
 		}
 		return false;
+	}
+
+	public addBase(base: {
+		id: string;
+		type: string;
+		position: { x: number; y: number; z: number };
+		safe: boolean;
+		functional: boolean;
+		hasStorage: boolean;
+	}) {
+		if (this.bases.length >= 3) {
+			this.bases.shift();
+		}
+		this.bases.push(base);
+		this.log(
+			`Added base: ${base.id} at (${base.position.x}, ${base.position.y}, ${base.position.z})`,
+		);
+	}
+
+	public getBases() {
+		return this.bases;
+	}
+
+	public getNearestBase(): {
+		id: string;
+		type: string;
+		position: { x: number; y: number; z: number };
+		safe: boolean;
+		functional: boolean;
+		hasStorage: boolean;
+	} | null {
+		if (this.bases.length === 0) return null;
+		const pos = this.bot.entity.position;
+		let nearest = this.bases[0];
+		let minDist = Infinity;
+		for (const base of this.bases) {
+			const dist = Math.abs(base.position.x - pos.x) + Math.abs(base.position.z - pos.z);
+			if (dist < minDist) {
+				minDist = dist;
+				nearest = base;
+			}
+		}
+		return nearest;
 	}
 
 	public async abortableSetControlState(
@@ -952,9 +1041,7 @@ Skill: (exact name)`;
 
 		while (nearestItem && pickedUp < 10) {
 			try {
-				await this.bot.pathfinder.goto(
-					new (await import("mineflayer-pathfinder")).goals.GoalFollow(nearestItem, 1),
-				);
+				await this.bot.pathfinder.goto(new goals.GoalFollow(nearestItem, 1));
 				await new Promise((resolve) => setTimeout(resolve, 200));
 				nearestItem = getNearestItem();
 				pickedUp++;
@@ -999,7 +1086,6 @@ Skill: (exact name)`;
 						) {
 							this.log(`Found land at ${checkPos}, moving...`);
 							try {
-								const { goals } = await import("mineflayer-pathfinder");
 								const goal = new goals.GoalNear(checkPos.x, checkPos.y, checkPos.z, 1);
 								await this.bot.pathfinder.goto(goal);
 								this.log("Moved to land successfully");

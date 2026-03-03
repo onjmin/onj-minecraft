@@ -1,12 +1,14 @@
 import { MinecraftAgent } from "../core/agent";
 import { profiles } from "../profiles";
+import { buildingMountainSkill } from "../skills/building/mountain-base";
+import { buildingHouseSkill } from "../skills/building/starter-house";
+import { buildingUndergroundSkill } from "../skills/building/underground-base";
 import { farmTendCropsSkill } from "../skills/collecting/farming";
 import { huntAnimalsSkill } from "../skills/collecting/hunting";
 import { mineOresSkill } from "../skills/collecting/mining";
 import { stealFromChestSkill } from "../skills/collecting/stealing";
 import { collectStoneSkill } from "../skills/collecting/stone";
 import { collectWoodSkill } from "../skills/collecting/wood";
-import { craftChestSkill } from "../skills/crafting/chest";
 import { craftSmeltingSkill } from "../skills/crafting/smelting";
 import { craftToolSkill } from "../skills/crafting/tool";
 import { craftTorchSkill } from "../skills/crafting/torch";
@@ -14,6 +16,9 @@ import { craftWeaponSkill } from "../skills/crafting/weapon";
 import { exploreLandSkill } from "../skills/exploring/land";
 import { exploreSeaSkill } from "../skills/exploring/sea";
 import { exploreUndergroundSkill } from "../skills/exploring/underground";
+import { gotoBaseSkill } from "../skills/goto/base";
+import { gotoCoordsSkill } from "../skills/goto/coords";
+import { gotoPlayerSkill } from "../skills/goto/player";
 
 const allSkills = [
 	// --- Collecting Domain (With integrated Eat/Equip routine) ---
@@ -32,9 +37,18 @@ const allSkills = [
 	// --- Crafting Domain (The "One-at-a-time" Iterative skills) ---
 	craftToolSkill, // 道具作成
 	craftWeaponSkill, // 武器作成
-	craftChestSkill, // チェスト作成
 	craftSmeltingSkill, // 精錬開始
 	craftTorchSkill, // トーチ作成
+
+	// --- Building Domain ---
+	buildingUndergroundSkill, // 地下拠点
+	buildingMountainSkill, // 山岳拠点
+	buildingHouseSkill, // 地上拠点(starter-house)
+
+	// --- Goto Domain ---
+	gotoCoordsSkill, // 座標へ移動
+	gotoBaseSkill, // 拠点帰還
+	gotoPlayerSkill, // プレイヤーへ移動
 ];
 /**
  * Initialize and start all agents
