@@ -71,7 +71,7 @@ async function tryPlaceBlock(
 /**
  * 設置可能な位置をすべて取得（拡張版）
  */
-function findAllPlaceablePositions(bot: Bot): Block[] {
+export function findAllPlaceablePositions(bot: Bot): Block[] {
 	const candidates: { block: Block; dist: number }[] = [];
 
 	for (let dx = -3; dx <= 3; dx++) {
@@ -387,6 +387,10 @@ export async function ensurePlanks(agent: MinecraftAgent, minCount = 4): Promise
 		return true;
 	}
 
+	if (planks) {
+		agent.log(`[ensurePlanks] Already have some planks: ${planks.count}, need ${minCount}`);
+	}
+
 	agent.log(
 		`[ensurePlanks] Current inventory: ${bot.inventory
 			.items()
@@ -399,7 +403,9 @@ export async function ensurePlanks(agent: MinecraftAgent, minCount = 4): Promise
 		.find((i) => i.name.endsWith("_log") || i.name.endsWith("_stem") || i.name.endsWith("_wood"));
 
 	if (!logItem) {
-		agent.log(`[ensurePlanks] FAIL: No logs in inventory`);
+		agent.log(
+			`[ensurePlanks] FAIL: No logs in inventory, and not enough planks (have ${planks?.count || 0}, need ${minCount})`,
+		);
 		return false;
 	}
 

@@ -10,7 +10,7 @@ export interface AgentProfile {
 	roleplayPrompt: string;
 	/** スキンのテクスチャURL */
 	skinUrl: string;
-	/** iscordの通知アイコン用 (正方形の顔画像など) **/
+	/** Discordの通知アイコン用 (正方形の顔画像など) **/
 	avatarUrl: string;
 	/** オプション: 初期装備やスポーン地点などの追加設定 */
 	metadata?: Record<string, any>;
