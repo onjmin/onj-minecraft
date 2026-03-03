@@ -9,7 +9,7 @@ import { ensureFurnace } from "./util";
 export const craftSmeltingSkill = createSkill<void, { item: string; amount: number }>({
 	name: "crafting.smelting",
 	description:
-		"Automatically identifies smeltable items and fuels using recipe data, and starts the smelting process.",
+		"Automatically identifies smeltable items and fuels using recipe data, and starts the smelting process. Also supports creating charcoal (from wood/logs) for crafting torches.",
 	inputSchema: {} as any,
 	handler: async ({ agent, signal }): Promise<SkillResponse<{ item: string; amount: number }>> => {
 		const { bot } = agent;

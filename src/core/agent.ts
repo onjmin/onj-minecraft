@@ -413,6 +413,8 @@ export class MinecraftAgent {
 						this.currentAbort.abort();
 					}
 
+					await this.ensureOnLand();
+
 					const controller = new AbortController();
 					this.currentAbort = controller;
 
@@ -891,7 +893,7 @@ Skill: (exact name)`;
 
 				setTimeout(() => {
 					this.bot.setControlState("back", false);
-					
+
 					// 3. 少し横（例えば右）を向きつつ、ジャンプして前進
 					// これにより「角」を斜めに飛び越える挙動になる
 					this.bot.setControlState("jump", true);
@@ -961,11 +963,59 @@ Skill: (exact name)`;
 			}
 		}
 	}
-}
 
 /**
  * 人間の目に近づけた明るさ知覚
  */
+private async ensureOnLand(): Promise<void>
+{
+	const { bot } = this;
+	const pos = bot.entity.position;
+	const blockAtFeet = bot.blockAt(pos);
+	const blockAtHead = bot.blockAt(pos.offset(0, 1, 0));
+
+	const isInWater = (b: any) => b && b.name === "water";
+	if (!isInWater(blockAtFeet) && !isInWater(blockAtHead)) {
+		return;
+	}
+
+	this.log("Agent is in water, finding nearest land...");
+
+	const searchRadius = 16;
+	for (let r = 1; r <= searchRadius; r++) {
+		for (let dx = -r; dx <= r; dx++) {
+			for (let dz = -r; dz <= r; dz++) {
+				for (let dy = -2; dy <= 4; dy++) {
+					const checkPos = pos.offset(dx, dy, dz);
+					const feet = bot.blockAt(checkPos);
+					const head = bot.blockAt(checkPos.offset(0, 1, 0));
+
+					if (
+						feet &&
+						!isInWater(feet) &&
+						feet.name !== "air" &&
+						head &&
+						!isInWater(head) &&
+						head.name === "air"
+					) {
+						this.log(`Found land at ${checkPos}, moving...`);
+						try {
+							const { goals } = await import("mineflayer-pathfinder");
+							const goal = new goals.GoalNear(checkPos.x, checkPos.y, checkPos.z, 1);
+							await this.bot.pathfinder.goto(goal);
+							this.log("Moved to land successfully");
+							return;
+						} catch (e) {}
+					}
+				}
+			}
+		}
+	}
+	this.log("Could not find nearby land");
+}
+
+}
+
 function getPerceivedLight(bot: mineflayer.Bot, samples = 30, radius = 4) {
 	let total = 0;
 	let count = 0;

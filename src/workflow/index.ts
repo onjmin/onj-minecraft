@@ -1,14 +1,15 @@
 import { MinecraftAgent } from "../core/agent";
 import { profiles } from "../profiles";
 import { farmTendCropsSkill } from "../skills/collecting/farming";
-import { collectWoodSkill } from "../skills/collecting/wood";
 import { huntAnimalsSkill } from "../skills/collecting/hunting";
 import { mineOresSkill } from "../skills/collecting/mining";
 import { stealFromChestSkill } from "../skills/collecting/stealing";
 import { collectStoneSkill } from "../skills/collecting/stone";
-import { craftSmeltingSkill } from "../skills/crafting/smelting";
+import { collectWoodSkill } from "../skills/collecting/wood";
 import { craftChestSkill } from "../skills/crafting/chest";
+import { craftSmeltingSkill } from "../skills/crafting/smelting";
 import { craftToolSkill } from "../skills/crafting/tool";
+import { craftTorchSkill } from "../skills/crafting/torch";
 import { craftWeaponSkill } from "../skills/crafting/weapon";
 import { exploreLandSkill } from "../skills/exploring/land";
 import { exploreSeaSkill } from "../skills/exploring/sea";
@@ -33,6 +34,7 @@ const allSkills = [
 	craftWeaponSkill, // 武器作成
 	craftChestSkill, // チェスト作成
 	craftSmeltingSkill, // 精錬開始
+	craftTorchSkill, // トーチ作成
 ];
 /**
  * Initialize and start all agents
