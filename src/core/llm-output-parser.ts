@@ -1,10 +1,13 @@
 export function parseSections(rawContent: string) {
 	// 見出しのリスト（必要ならここに新しいセクション名を追加）
 	const headers = ["Rationale", "Chat", "Skill", "Strategy", "Achievement"];
+
+	const headerPattern = headers.join("|");
+
 	// ^...: で行頭からキャプチャ、次の見出し行または文末までを非貪欲に取得
 	const pattern = new RegExp(
-		`^(${headers.join("|")}):\\s*([\\s\\S]*?)(?=^(?:${headers.join("|")}):|\\z)`,
-		"gim", // g=全マッチ, i=大文字小文字無視, m=^が行頭にマッチ
+		`^(${headerPattern}):\\s*([\\s\\S]*?)(?=^(?:${headerPattern}):|$)`,
+		"gim",
 	);
 
 	const map: Record<string, string[]> = {};
