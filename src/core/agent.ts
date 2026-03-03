@@ -558,7 +558,7 @@ export class MinecraftAgent {
 			const nearbyBlocksText = [...new Set(sampledBlocks)].slice(0, 10).join(", ") || "None";
 
 			// 明るさ感知（木材伐採や農業のため）
-			const perceivedLight = getPerceivedLight(this.bot);
+			const perceivedLight = this.getPerceivedLight();
 
 			// チャットログのテキスト化
 			const chatLogContext =
@@ -964,79 +964,77 @@ Skill: (exact name)`;
 		}
 	}
 
-/**
- * 人間の目に近づけた明るさ知覚
- */
-private async ensureOnLand(): Promise<void>
-{
-	const { bot } = this;
-	const pos = bot.entity.position;
-	const blockAtFeet = bot.blockAt(pos);
-	const blockAtHead = bot.blockAt(pos.offset(0, 1, 0));
+	/**
+	 * 人間の目に近づけた明るさ知覚
+	 */
+	private async ensureOnLand(): Promise<void> {
+		const { bot } = this;
+		const pos = bot.entity.position;
+		const blockAtFeet = bot.blockAt(pos);
+		const blockAtHead = bot.blockAt(pos.offset(0, 1, 0));
 
-	const isInWater = (b: any) => b && b.name === "water";
-	if (!isInWater(blockAtFeet) && !isInWater(blockAtHead)) {
-		return;
-	}
+		const isInWater = (b: any) => b && b.name === "water";
+		if (!isInWater(blockAtFeet) && !isInWater(blockAtHead)) {
+			return;
+		}
 
-	this.log("Agent is in water, finding nearest land...");
+		this.log("Agent is in water, finding nearest land...");
 
-	const searchRadius = 16;
-	for (let r = 1; r <= searchRadius; r++) {
-		for (let dx = -r; dx <= r; dx++) {
-			for (let dz = -r; dz <= r; dz++) {
-				for (let dy = -2; dy <= 4; dy++) {
-					const checkPos = pos.offset(dx, dy, dz);
-					const feet = bot.blockAt(checkPos);
-					const head = bot.blockAt(checkPos.offset(0, 1, 0));
+		const searchRadius = 16;
+		for (let r = 1; r <= searchRadius; r++) {
+			for (let dx = -r; dx <= r; dx++) {
+				for (let dz = -r; dz <= r; dz++) {
+					for (let dy = -2; dy <= 4; dy++) {
+						const checkPos = pos.offset(dx, dy, dz);
+						const feet = bot.blockAt(checkPos);
+						const head = bot.blockAt(checkPos.offset(0, 1, 0));
 
-					if (
-						feet &&
-						!isInWater(feet) &&
-						feet.name !== "air" &&
-						head &&
-						!isInWater(head) &&
-						head.name === "air"
-					) {
-						this.log(`Found land at ${checkPos}, moving...`);
-						try {
-							const { goals } = await import("mineflayer-pathfinder");
-							const goal = new goals.GoalNear(checkPos.x, checkPos.y, checkPos.z, 1);
-							await this.bot.pathfinder.goto(goal);
-							this.log("Moved to land successfully");
-							return;
-						} catch (e) {}
+						if (
+							feet &&
+							!isInWater(feet) &&
+							feet.name !== "air" &&
+							head &&
+							!isInWater(head) &&
+							head.name === "air"
+						) {
+							this.log(`Found land at ${checkPos}, moving...`);
+							try {
+								const { goals } = await import("mineflayer-pathfinder");
+								const goal = new goals.GoalNear(checkPos.x, checkPos.y, checkPos.z, 1);
+								await this.bot.pathfinder.goto(goal);
+								this.log("Moved to land successfully");
+								return;
+							} catch (e) {}
+						}
 					}
 				}
 			}
 		}
+		this.log("Could not find nearby land");
 	}
-	this.log("Could not find nearby land");
-}
 
-}
+	private getPerceivedLight(samples = 30, radius = 4) {
+		let total = 0;
+		let count = 0;
 
-function getPerceivedLight(bot: mineflayer.Bot, samples = 30, radius = 4) {
-	let total = 0;
-	let count = 0;
+		for (let i = 0; i < samples; i++) {
+			const offset = new Vec3(
+				(Math.random() - 0.5) * radius * 2,
+				1 + Math.random(), // 目線高さ付近
+				(Math.random() - 0.5) * radius * 2,
+			);
 
-	for (let i = 0; i < samples; i++) {
-		const offset = new Vec3(
-			(Math.random() - 0.5) * radius * 2,
-			1 + Math.random(), // 目線高さ付近
-			(Math.random() - 0.5) * radius * 2,
-		);
+			const pos = this.bot.entity.position.plus(offset);
+			const block = this.bot.blockAt(pos);
 
-		const pos = bot.entity.position.plus(offset);
-		const block = bot.blockAt(pos);
-
-		if (block) {
-			const raw = Math.max(block.light, block.skyLight);
-			const perceived = Math.log2(raw + 1) / Math.log2(16);
-			total += perceived;
-			count++;
+			if (block) {
+				const raw = Math.max(block.light, block.skyLight);
+				const perceived = Math.log2(raw + 1) / Math.log2(16);
+				total += perceived;
+				count++;
+			}
 		}
-	}
 
-	return count > 0 ? total / count : 0;
+		return count > 0 ? total / count : 0;
+	}
 }
