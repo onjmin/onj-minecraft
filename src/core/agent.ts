@@ -1039,7 +1039,7 @@ Chat: (optional, message to send)`;
 				}
 				retry++;
 			} while (retry < 3);
-		} finally {
+		} catch {} finally {
 			clearInterval(checkStuck);
 			this.isMoving = false;
 			this.bot.clearControlStates();
