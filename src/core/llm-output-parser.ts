@@ -130,3 +130,55 @@ function parseKeyValueArgs(argStr: string) {
 	}
 	return parsed;
 }
+
+export interface ParsedThought {
+	speak?: string;
+	action?: {
+		name: string;
+		args?: Record<string, any>;
+	};
+	memory?: string;
+}
+
+export function parseLlmOutput(rawContent: string): ParsedThought {
+	if (!rawContent || rawContent.trim() === "") {
+		throw new Error("Empty LLM output");
+	}
+
+	// ① セクション分解
+	const sections = parseSections(rawContent);
+
+	const result: ParsedThought = {};
+
+	// ② Chat → speak
+	const cleanedChat = cleanChatField(sections.chat);
+	if (cleanedChat) {
+		result.speak = cleanedChat;
+	}
+
+	// ③ Skill → action
+	const { name, args } = parseSkillField(sections.skill);
+	if (name) {
+		result.action = {
+			name,
+			args,
+		};
+	}
+
+	// ④ Strategy や Achievement を memory として保存
+	const memoryChunks: string[] = [];
+
+	if (sections.strategy) {
+		memoryChunks.push(`Strategy: ${sections.strategy}`);
+	}
+
+	if (sections.achievement) {
+		memoryChunks.push(`Achievement: ${sections.achievement}`);
+	}
+
+	if (memoryChunks.length > 0) {
+		result.memory = memoryChunks.join(" | ");
+	}
+
+	return result;
+}

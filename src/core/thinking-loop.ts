@@ -1,4 +1,4 @@
-import { callLlm } from "./llm-client";
+import { llm } from "./llm-client";
 import { parseLlmOutput } from "./llm-output-parser";
 import { buildThinkingPrompt } from "./prompt-builder";
 
@@ -35,7 +35,7 @@ export function startThinkingLoop(deps: ThinkingLoopDeps) {
 				log?.("🧠 Thinking...");
 
 				// 2️⃣ LLM呼び出し
-				const rawOutput = await callLlm(prompt);
+				const rawOutput = await llm.complete(prompt);
 
 				// 3️⃣ パース
 				const parsed = parseLlmOutput(rawOutput);

@@ -1,125 +1,125 @@
 import type { Bot } from "mineflayer";
+import type { Vec3 } from "vec3";
 
 export interface EnvironmentSnapshot {
-	biome?: string;
-	timeOfDay?: string;
-	lightLevel?: number;
-	health?: number;
-	hunger?: number;
-	position?: { x: number; y: number; z: number };
+	biome: string;
+	timeOfDay: "sunrise" | "day" | "sunset" | "night";
+	weather: "clear" | "rain";
+	lightLevel: number; // 0–15 averaged
 	nearbyPlayers: string[];
-	nearbyMobs: string[];
+	nearbyMobs: {
+		name: string;
+		distance: number;
+	}[];
+}
+
+export interface InventorySummary {
+	items: string[];
+	heldItem: string;
+}
+
+export interface DamageInfo {
+	type: "attack" | "fire" | "lava" | "fall" | "drowning" | "suffocation";
+	attacker?: string;
 }
 
 export interface PerceptionSnapshot {
+	position: Vec3;
+	health: number;
+	food: number;
 	environment: EnvironmentSnapshot;
-	inventorySummary: string;
-	lastDamageCause?: string;
+	inventory: InventorySummary;
+	lastDamageCause?: DamageInfo;
 }
 
-export function createPerceptionSnapshot(bot: Bot): PerceptionSnapshot {
+export function createPerceptionSnapshot(
+	bot: Bot,
+	lastDamageCause?: DamageInfo,
+): PerceptionSnapshot {
+	const position = bot.entity.position.clone();
+	const health = bot.health;
+	const food = bot.food;
+
+	const blockAtPos = bot.blockAt(position);
+	const biome = (blockAtPos as any)?.biome?.name ?? bot.game?.dimension ?? "unknown";
+
+	const timeOfDay = detectTimeOfDay(bot.time.timeOfDay);
+	const weather = bot.isRaining ? "rain" : "clear";
+	const lightLevel = getPerceivedLight(bot);
+
+	const nearbyPlayers = getNearbyPlayers(bot, 16);
+	const nearbyMobs = getNearbyMobs(bot, 16);
+
+	const inventoryItems = bot.inventory.items().map((i) => `${i.name} x${i.count}`) ?? [];
+
+	const heldItem = bot.heldItem?.name ?? "bare_hands";
+
 	return {
-		environment: createEnvironmentSnapshot(bot),
-		inventorySummary: summarizeInventory(bot),
-		lastDamageCause: detectEnvironmentDamageCause(bot),
+		position,
+		health,
+		food,
+		environment: {
+			biome,
+			timeOfDay,
+			weather,
+			lightLevel,
+			nearbyPlayers,
+			nearbyMobs,
+		},
+		inventory: {
+			items: inventoryItems,
+			heldItem,
+		},
+		lastDamageCause,
 	};
 }
 
-function createEnvironmentSnapshot(bot: Bot): EnvironmentSnapshot {
-	return {
-		biome: bot.game?.dimension ?? "unknown",
-		timeOfDay: detectTimeOfDay(bot),
-		lightLevel: getPerceivedLight(bot),
-		health: bot.health,
-		hunger: bot.food,
-		position: bot.entity?.position
-			? {
-					x: bot.entity.position.x,
-					y: bot.entity.position.y,
-					z: bot.entity.position.z,
-				}
-			: undefined,
-		nearbyPlayers: getNearbyPlayers(bot, 16),
-		nearbyMobs: getNearbyMobs(bot, 16),
-	};
-}
+function detectTimeOfDay(tick: number): "sunrise" | "day" | "sunset" | "night" {
+	const t = tick % 24000;
 
-export function getPerceivedLight(bot: Bot, samples = 20, radius = 3): number {
-	if (!bot.entity?.position) return 0;
-
-	const base = bot.entity.position;
-	let total = 0;
-	let count = 0;
-
-	for (let i = 0; i < samples; i++) {
-		const dx = randInt(-radius, radius);
-		const dz = randInt(-radius, radius);
-
-		const pos = base.offset(dx, 0, dz);
-		const block = bot.blockAt(pos);
-
-		if (block) {
-			total += block.light;
-			count++;
-		}
-	}
-
-	return count === 0 ? 0 : Math.round(total / count);
-}
-
-function detectTimeOfDay(bot: Bot): string {
-	const time = bot.time?.timeOfDay;
-	if (time == null) return "unknown";
-
-	if (time < 1000) return "sunrise";
-	if (time < 6000) return "day";
-	if (time < 12000) return "sunset";
+	if (t < 1000) return "sunrise";
+	if (t < 6000) return "day";
+	if (t < 12000) return "sunset";
 	return "night";
 }
 
 function getNearbyPlayers(bot: Bot, radius: number): string[] {
-	const players = Object.values(bot.players);
+	if (!bot.entity?.position) return [];
 
-	return players
-		.filter((p) => p.entity)
-		.filter((p) => p.username !== bot.username)
-		.filter((p) => {
-			return p.entity!.position.distanceTo(bot.entity.position) <= radius;
-		})
+	return Object.values(bot.players)
+		.filter((p) => p.entity && p.entity.position.distanceTo(bot.entity.position) < radius)
 		.map((p) => p.username);
 }
 
-function getNearbyMobs(bot: Bot, radius: number): string[] {
+function getNearbyMobs(bot: Bot, radius: number): { name: string; distance: number }[] {
+	if (!bot.entity?.position) return [];
+
 	return Object.values(bot.entities)
-		.filter((e) => e.type === "mob")
-		.filter((e) => {
-			return e.position.distanceTo(bot.entity.position) <= radius;
-		})
-		.map((e) => e.name);
+		.filter((e) => e.type === "mob" && e.position.distanceTo(bot.entity.position) < radius)
+		.map((e) => ({
+			name: e.name ?? e.displayName ?? e.type,
+			distance: Math.round(e.position.distanceTo(bot.entity.position)),
+		}));
 }
 
-function summarizeInventory(bot: Bot): string {
-	const items = bot.inventory.items();
-	if (items.length === 0) return "Empty";
+function getPerceivedLight(bot: Bot): number {
+	const pos = bot.entity.position.floored();
+	const samples: number[] = [];
 
-	const grouped: Record<string, number> = {};
+	for (let dx = -1; dx <= 1; dx++) {
+		for (let dz = -1; dz <= 1; dz++) {
+			const block = bot.blockAt(pos.offset(dx, 0, dz));
+			if (!block) continue;
 
-	for (const item of items) {
-		grouped[item.name] = (grouped[item.name] ?? 0) + item.count;
+			const raw = Math.max(block.light ?? 0, (block as any).skyLight ?? 0);
+
+			samples.push(raw);
+		}
 	}
 
-	return Object.entries(grouped)
-		.map(([name, count]) => `${name} x${count}`)
-		.join(", ");
-}
+	if (samples.length === 0) return 0;
 
-export function detectEnvironmentDamageCause(bot: Bot): string | undefined {
-	if (bot.entity?.isInWater) return "drowning";
-	if (bot.entity?.isInLava) return "lava";
-	if (bot.entity?.velocity.y < -0.6) return "fall";
-	return undefined;
-}
+	const avg = samples.reduce((a, b) => a + b, 0) / samples.length;
 
-function randInt(min: number, max: number) {
-	return Math.floor(Math.random() * (max - min + 1)) + min;
+	return Math.round(avg);
 }
