@@ -589,8 +589,30 @@ export class MinecraftAgent {
 			// 2. 現在のバイオームと周囲の環境
 			// biome取得
 			const blockAtPos = this.bot.blockAt(this.bot.entity.position);
-			const biome = (blockAtPos as any)?.biome?.name || this.bot.game.dimension || "unknown";
 
+			// 1. 位置を確定（自分自身の足元の座標 Vec3 を取得）
+			const pos = blockAtPos?.position || this.bot.entity.position;
+
+			let biomeName = "unknown";
+
+			if (pos) {
+				try {
+					// 2. 標準API: world.getBiome を使用して ID を取得
+					const biomeId = this.bot.world.getBiome(pos);
+
+					// 3. レジストリからバイオーム情報を取得
+					const biomeInfo = this.bot.registry.biomes[biomeId];
+					
+					// 4. 名前を取得（例: "plains"）
+					biomeName = biomeInfo?.name || this.bot.game.dimension || "unknown";
+				} catch (err) {
+					// まだチャンクが読み込まれていない場合はここに来る
+					biomeName = this.bot.game.dimension || "unknown";
+				}
+			} else {
+				biomeName = this.bot.game.dimension || "unknown";
+			}
+			
 			const isRaining = this.bot.isRaining;
 			const timeOfDay = this.bot.time.isDay ? "Day" : "Night";
 			// 3. 直近のダメージ原因
@@ -646,7 +668,7 @@ ${
 ## CURRENT STATUS
 - Position: (${Math.floor(this.bot.entity.position.x)}, ${Math.floor(this.bot.entity.position.y)}, ${Math.floor(this.bot.entity.position.z)})
 - HP: ${this.bot.health?.toFixed(0)}/20 | Food: ${this.bot.food?.toFixed(0)}/20
-- Biome: ${biome}
+- Biome: ${biomeName}
 - Time: ${timeOfDay} | Weather: ${isRaining ? "Raining" : "Clear"}
 - Held Item: ${heldItem}
 - Inventory: ${inventory}

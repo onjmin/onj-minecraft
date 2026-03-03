@@ -40,8 +40,31 @@ export function createPerceptionSnapshot(
 	const health = bot.health;
 	const food = bot.food;
 
-	const blockAtPos = bot.blockAt(position);
-	const biome = (blockAtPos as any)?.biome?.name ?? bot.game?.dimension ?? "unknown";
+	// biome取得
+	const blockAtPos = bot.blockAt(bot.entity.position);
+
+	// 1. 位置を確定（自分自身の足元の座標 Vec3 を取得）
+	const pos = blockAtPos?.position || bot.entity.position;
+
+	let biomeName = "unknown";
+
+	if (pos) {
+		try {
+			// 2. 標準API: world.getBiome を使用して ID を取得
+			const biomeId = bot.world.getBiome(pos);
+
+			// 3. レジストリからバイオーム情報を取得
+			const biomeInfo = bot.registry.biomes[biomeId];
+			
+			// 4. 名前を取得（例: "plains"）
+			biomeName = biomeInfo?.name || bot.game.dimension || "unknown";
+		} catch (err) {
+			// まだチャンクが読み込まれていない場合はここに来る
+			biomeName = bot.game.dimension || "unknown";
+		}
+	} else {
+		biomeName = bot.game.dimension || "unknown";
+	}
 
 	const timeOfDay = detectTimeOfDay(bot.time.timeOfDay);
 	const weather = bot.isRaining ? "rain" : "clear";
@@ -59,7 +82,7 @@ export function createPerceptionSnapshot(
 		health,
 		food,
 		environment: {
-			biome,
+			biome: biomeName,
 			timeOfDay,
 			weather,
 			lightLevel,
