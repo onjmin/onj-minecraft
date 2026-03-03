@@ -8,6 +8,7 @@ import { exploreLandSkill } from "../skills/exploring/land";
 import type { SkillResponse } from "../skills/types";
 import { emitDiscordWebhook, translateWithRoleplay } from "./discord-webhook";
 import { llm } from "./llm-client";
+import { cleanChatField, parseSections, parseSkillField } from "./llm-output-parser";
 
 const tryLoad = (bot: any, name: string, mod: any) => {
 	if (!mod) {
@@ -47,6 +48,11 @@ type ChatLog = {
 	timestamp: number;
 };
 
+type StrategicState = {
+	strategies: string[]; // FIFO 3
+	achievements: string[]; // FIFO 3
+};
+
 export class MinecraftAgent {
 	public bot: mineflayer.Bot;
 	private profile: AgentProfile;
@@ -78,6 +84,17 @@ export class MinecraftAgent {
 		functional: boolean;
 		hasStorage: boolean;
 	}[] = [];
+
+	private strategicState: StrategicState = {
+		strategies: [],
+		achievements: [],
+	};
+
+	private updateFIFO(list: string[], value?: string, max = 3) {
+		if (!value || value.trim() === "") return; // 省略された場合は反映しない
+		list.push(value.trim());
+		if (list.length > max) list.shift();
+	}
 
 	constructor(profile: AgentProfile, skillList: any[]) {
 		this.profile = profile;
@@ -594,6 +611,20 @@ Roleplay as this character and interact with other players naturally.
 ## PERSONALITY
 ${this.profile.personality}
 
+## CURRENT STRATEGY (Max 3)
+${
+	this.strategicState.strategies.length > 0
+		? this.strategicState.strategies.map((s) => `- ${s}`).join("\n")
+		: "None"
+}
+
+## RECENT ACHIEVEMENTS (Max 3)
+${
+	this.strategicState.achievements.length > 0
+		? this.strategicState.achievements.map((a) => `- ${a}`).join("\n")
+		: "None"
+}
+
 ## CURRENT STATUS
 - Position: (${Math.floor(this.bot.entity.position.x)}, ${Math.floor(this.bot.entity.position.y)}, ${Math.floor(this.bot.entity.position.z)})
 - HP: ${this.bot.health?.toFixed(0)}/20 | Food: ${this.bot.food?.toFixed(0)}/20
@@ -620,9 +651,11 @@ ${this.bases.length > 0 ? this.bases.map((b) => `- ${b.id} (${b.type}) at (${b.p
 ${skillsContext}
 
 ## OUTPUT FORMAT
-Rationale: (logic)
-Chat: (message to send in Minecraft, if any. empty if silent)
-Skill: (exact name)`;
+Rationale: (optional, internal reasoning)
+Strategy: (optional, update or keep current)
+Achievement: (optional, if something was completed)
+Skill: (exact name)
+Chat: (optional, message to send)`;
 
 			try {
 				const rawContent = await llm.complete(systemPrompt);
@@ -643,77 +676,44 @@ Skill: (exact name)`;
 				fs.writeFileSync(outputPath, rawContent || "");
 
 				if (rawContent) {
-					// 1. 各セクションを抽出（次のキーワードまたは終端まで）
-					const rationaleMatch = rawContent.match(
-						/Rationale:\s*([\s\S]*?)(?=\n(?:Chat|Skill):|$)/i,
-					);
-					const chatMatch = rawContent.match(/Chat:\s*([\s\S]*?)(?=\n(?:Rationale|Skill):|$)/i);
-					const skillMatch = rawContent.match(/Skill:\s*([a-zA-Z0-9._-]+)/i);
+					// 共通パーサーで全セクションを抽出（順序や改行に頑強）
+					const sections = parseSections(rawContent);
 
-					const rationale = rationaleMatch ? rationaleMatch[1].trim() : "No reasoning.";
-					let chatMessage = chatMatch ? chatMatch[1].trim() : "";
-					const foundSkillName = skillMatch ? skillMatch[1].trim() : null;
+					// 戦略・実績は改行ごとに分解して FIFO 更新
+					const pushLinesToFIFO = (text: string, destList: string[]) => {
+						if (!text) return;
+						for (const line of text.split("\n").map((s) => s.trim())) {
+							if (!line) continue;
+							const low = line
+								.toLowerCase()
+								.replace(/[()."']/g, "")
+								.split(/[\s—-]/)[0];
+							if (["none", "empty", "n/a", "nothing", "silent", "ignored"].includes(low)) continue;
+							this.updateFIFO(destList, line);
+						}
+					};
 
+					pushLinesToFIFO(sections.strategy, this.strategicState.strategies);
+					pushLinesToFIFO(sections.achievement, this.strategicState.achievements);
+
+					// Rationale
+					const rationale = sections.rationale ? sections.rationale.trim() : "No reasoning.";
+
+					// Skill parse (名前 + args)
+					const { name: foundSkillName, args: parsedArgs } = parseSkillField(sections.skill || "");
 					if (foundSkillName) {
-						const skillLine = rawContent.match(/Skill:\s*([^\n]+)/i);
-						if (skillLine && skillLine[1].includes(",")) {
-							const argStr = skillLine[1].split(",").slice(1).join(",");
-							const parsedArgs: Record<string, any> = {};
-							const argMatches = argStr.matchAll(/(\w+):\s*([^\s,]+)/g);
-							for (const match of argMatches) {
-								const key = match[1];
-								const value = match[2];
-								parsedArgs[key] = isNaN(Number(value)) ? value : Number(value);
-							}
-							if (Object.keys(parsedArgs).length > 0) {
-								this.currentSkillArgs[foundSkillName] = parsedArgs;
-							}
+						if (Object.keys(parsedArgs).length > 0) {
+							this.currentSkillArgs[foundSkillName] = parsedArgs;
 						} else {
 							this.currentSkillArgs[foundSkillName] = {};
 						}
 					}
 
-					this.log(`${foundSkillName} ${rationale}`);
+					this.log(`${foundSkillName ?? "no-skill"} ${rationale}`);
 
-					// 2. Chat内容の高度なクリーンアップ
+					// Chat のクリーンアップ共通化
+					const chatMessage = cleanChatField(sections.chat || "");
 					if (chatMessage) {
-						// 1. キーワード混入対策: "Skill:" や "Rationale:" 以降をカット
-						chatMessage = chatMessage.split(/(?:Skill|Rationale):/i)[0].trim();
-
-						// 2. 複数行対策: 最初の1行目のみ取得
-						chatMessage = chatMessage.split("\n")[0].trim();
-
-						// 3. 【追加】括弧（全角含む）で始まっていたら「心の声」とみなして無視
-						if (chatMessage.startsWith("(") || chatMessage.startsWith("（")) {
-							chatMessage = "";
-						}
-
-						if (chatMessage) {
-							// 4. 引用符の除去（"Hello" -> Hello）
-							chatMessage = chatMessage.replace(/^["'「“](.*)["'」”]$/, "$1").trim();
-
-							// 5. 特定キーワード（none, empty等）の最終判定
-							const normalizedChat = chatMessage
-								.toLowerCase()
-								.replace(/[()."']/g, "")
-								.split(/[\s—-]/)[0];
-
-							const isNone = ["", "none", "empty", "n/a", "nothing", "silent", "ignored"].includes(
-								normalizedChat,
-							);
-
-							if (isNone) {
-								chatMessage = "";
-							}
-						}
-					}
-
-					// 最終チェック: 前後を trim した際に残った引用符をもう一度掃除
-					chatMessage = chatMessage.replace(/^["'“]|["'”]$/g, "").trim();
-
-					// 3. チャットの実行
-					if (chatMessage !== "") {
-						// ゲーム内チャットに送信
 						this.bot.chat(chatMessage);
 					}
 
