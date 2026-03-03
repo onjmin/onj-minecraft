@@ -51,6 +51,7 @@ type ChatLog = {
 type StrategicState = {
 	strategies: string[]; // FIFO 3
 	achievements: string[]; // FIFO 3
+	chats: string[]; // FIFO 3 (自分自身の過去発言)
 };
 
 export class MinecraftAgent {
@@ -59,7 +60,7 @@ export class MinecraftAgent {
 	private skills: Map<string, any>;
 	private currentTaskName: string = "idle";
 	private observationHistory: ObservationRecord[] = [];
-	private maxHistory = 5;
+	private maxHistory = 3;
 	private lastDamageCause: string = "None";
 	private hasSetSkin: boolean = false;
 	private latestRationale: string = "";
@@ -88,12 +89,28 @@ export class MinecraftAgent {
 	private strategicState: StrategicState = {
 		strategies: [],
 		achievements: [],
+		chats: [],
 	};
 
+	/**
+	 * FIFO 更新（重複チェック込み）
+	 */
 	private updateFIFO(list: string[], value?: string, max = 3) {
-		if (!value || value.trim() === "") return; // 省略された場合は反映しない
-		list.push(value.trim());
-		if (list.length > max) list.shift();
+		if (!value || value.trim() === "") return false;
+
+		const trimmedValue = value.trim();
+
+		// すでにリストに含まれている場合は追加しない
+		if (list.includes(trimmedValue)) return false;
+
+		list.push(trimmedValue);
+
+		// 指定サイズを超えたら古いものを削除
+		if (list.length > max) {
+			list.shift();
+		}
+
+		return true;
 	}
 
 	constructor(profile: AgentProfile, skillList: any[]) {
@@ -679,22 +696,8 @@ Chat: (optional, message to send)`;
 					// 共通パーサーで全セクションを抽出（順序や改行に頑強）
 					const sections = parseSections(rawContent);
 
-					// 戦略・実績は改行ごとに分解して FIFO 更新
-					const pushLinesToFIFO = (text: string, destList: string[]) => {
-						if (!text) return;
-						for (const line of text.split("\n").map((s) => s.trim())) {
-							if (!line) continue;
-							const low = line
-								.toLowerCase()
-								.replace(/[()."']/g, "")
-								.split(/[\s—-]/)[0];
-							if (["none", "empty", "n/a", "nothing", "silent", "ignored"].includes(low)) continue;
-							this.updateFIFO(destList, line);
-						}
-					};
-
-					pushLinesToFIFO(sections.strategy, this.strategicState.strategies);
-					pushLinesToFIFO(sections.achievement, this.strategicState.achievements);
+					this.updateFIFO(this.strategicState.strategies, sections.strategy);
+					this.updateFIFO(this.strategicState.achievements, sections.achievement);
 
 					// Rationale
 					const rationale = sections.rationale ? sections.rationale.trim() : "No reasoning.";
@@ -713,7 +716,8 @@ Chat: (optional, message to send)`;
 
 					// Chat のクリーンアップ共通化
 					const chatMessage = cleanChatField(sections.chat || "");
-					if (chatMessage) {
+					const isNotSpam = this.updateFIFO(this.strategicState.chats, chatMessage);
+					if (isNotSpam) {
 						this.bot.chat(chatMessage);
 					}
 
