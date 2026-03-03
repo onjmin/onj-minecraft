@@ -4,16 +4,22 @@ import type { MinecraftAgent } from "../../core/agent";
 
 type Block = NonNullable<ReturnType<Bot["blockAt"]>>;
 
+interface PlaceableBlock extends Block {
+	_needsDig?: boolean;
+	_digTarget?: Block;
+}
+
 /**
  * 設置を試みる（複数の位置でリトライ）
+ * 候補が埋まっている場合は、掘ってでも設置を試みる
  */
-async function tryPlaceBlock(
+export async function tryPlaceBlock(
 	bot: Bot,
 	itemName: string,
 	blockId: number,
 	agent: MinecraftAgent,
 ): Promise<Block | null> {
-	const positions = findAllPlaceablePositions(bot);
+	const positions = findAllPlaceablePositions(bot) as PlaceableBlock[];
 	agent.log(`[tryPlaceBlock] Found ${positions.length} positions`);
 
 	if (positions.length === 0) {
@@ -21,7 +27,6 @@ async function tryPlaceBlock(
 		return null;
 	}
 
-	// アイテムをオブジェクトとして取得
 	const item = bot.inventory.items().find((i) => i.name === itemName);
 	if (!item) {
 		agent.log(`[tryPlaceBlock] Item not found in inventory: ${itemName}`);
@@ -30,13 +35,25 @@ async function tryPlaceBlock(
 	agent.log(`[tryPlaceBlock] Item found: ${item.name}, count=${item.count}`);
 
 	for (const refBlock of positions) {
-		agent.log(`[tryPlaceBlock] Trying at ${refBlock.position}, ref=${refBlock.name}`);
+		agent.log(
+			`[tryPlaceBlock] Trying at ${refBlock.position}, ref=${refBlock.name}, needsDig=${refBlock._needsDig}`,
+		);
 
 		try {
 			await bot.equip(item, "hand");
 			agent.log(`[tryPlaceBlock] Equipped ${item.name}`);
 
 			await new Promise((r) => setTimeout(r, 500));
+
+			if (refBlock._needsDig && refBlock._digTarget) {
+				agent.log(`[tryPlaceBlock] Digging blocking block: ${refBlock._digTarget.name}`);
+				const toolPlugin = (bot as any).tool;
+				if (toolPlugin) {
+					await toolPlugin.equipForBlock(refBlock._digTarget);
+				}
+				await bot.dig(refBlock._digTarget);
+				await new Promise((r) => setTimeout(r, 500));
+			}
 
 			try {
 				await bot.placeBlock(refBlock, new Vec3(0, 1, 0));
@@ -46,7 +63,6 @@ async function tryPlaceBlock(
 				continue;
 			}
 
-			// 設置確認
 			await new Promise((r) => setTimeout(r, 500));
 			const placed = bot.findBlock({
 				matching: blockId,
@@ -68,40 +84,40 @@ async function tryPlaceBlock(
 	return null;
 }
 
-/**
- * 設置可能な位置をすべて取得（拡張版）
- */
-export function findAllPlaceablePositions(bot: Bot): Block[] {
-	const candidates: { block: Block; dist: number }[] = [];
+const DIGGABLE_BLOCKS = [
+	"dirt",
+	"grass_block",
+	"sand",
+	"gravel",
+	"cobblestone",
+	"stone",
+	"andesite",
+	"granite",
+	"diorite",
+	"deepslate",
+	"tuff",
+	"netherrack",
+	"bedrock",
+	"oak_leaves",
+	"birch_leaves",
+	"jungle_leaves",
+	"spruce_leaves",
+	"dark_oak_leaves",
+	"acacia_leaves",
+	"moss_block",
+];
 
-	for (let dx = -3; dx <= 3; dx++) {
-		for (let dz = -3; dz <= 3; dz++) {
-			if (dx === 0 && dz === 0) continue;
-
-			const refBlock = bot.blockAt(bot.entity.position.offset(dx, -1, dz));
-			if (!refBlock || refBlock.name === "air") continue;
-
-			const invalidBlocks = ["water", "lava", "fire", "grass", "tall_grass", "fern", "snow"];
-			if (invalidBlocks.includes(refBlock.name)) continue;
-
-			const blockAbove = bot.blockAt(refBlock.position.offset(0, 1, 0));
-			if (!blockAbove || blockAbove.name !== "air") continue;
-
-			const dist = Math.abs(dx) + Math.abs(dz);
-			candidates.push({ block: refBlock, dist });
-		}
-	}
-
-	candidates.sort((a, b) => a.dist - b.dist);
-	return candidates.map((c) => c.block);
+function isDiggable(name: string): boolean {
+	return DIGGABLE_BLOCKS.includes(name) || name.endsWith("_leaves");
 }
 
 /**
- * 周囲の設置可能な位置を探す（拡張版）
+ * 設置可能な位置をすべて取得（拡張版）
+ * 設置可能な場所がない場合は、掘ってでも場所を作る候補を含める
  */
-function findPlaceablePosition(bot: Bot): Block | null {
-	// 周边3マス、全方向
-	const candidates: { block: Block; dist: number }[] = [];
+export function findAllPlaceablePositions(bot: Bot): Block[] {
+	const candidates: { block: Block; dist: number; needsDig: boolean; digTarget?: Block }[] = [];
+	const agentY = Math.floor(bot.entity.position.y);
 
 	for (let dx = -3; dx <= 3; dx++) {
 		for (let dz = -3; dz <= 3; dz++) {
@@ -110,33 +126,30 @@ function findPlaceablePosition(bot: Bot): Block | null {
 			const refBlock = bot.blockAt(bot.entity.position.offset(dx, -1, dz));
 			if (!refBlock || refBlock.name === "air") continue;
 
-			// 足場として適さないブロックは避ける
+			// エージェントより下の座標は除外
+			if (refBlock.position.y < agentY - 1) continue;
+
 			const invalidBlocks = ["water", "lava", "fire", "grass", "tall_grass", "fern", "snow"];
 			if (invalidBlocks.includes(refBlock.name)) continue;
 
-			// 上が空いているか
 			const blockAbove = bot.blockAt(refBlock.position.offset(0, 1, 0));
-			if (!blockAbove || blockAbove.name !== "air") continue;
 
-			// 距離計算
-			const dist = Math.abs(dx) + Math.abs(dz);
-			candidates.push({ block: refBlock, dist });
+			if (blockAbove && blockAbove.name === "air") {
+				const dist = Math.abs(dx) + Math.abs(dz);
+				candidates.push({ block: refBlock, dist, needsDig: false });
+			} else if (blockAbove && isDiggable(blockAbove.name) && bot.canDigBlock(blockAbove)) {
+				const dist = Math.abs(dx) + Math.abs(dz);
+				candidates.push({ block: refBlock, dist, needsDig: true, digTarget: blockAbove });
+			}
 		}
 	}
 
-	// 近い順にソート
 	candidates.sort((a, b) => a.dist - b.dist);
-
-	console.log(`[findPlaceablePosition] Found ${candidates.length} candidates`);
-
-	if (candidates.length > 0) {
-		console.log(
-			`[findPlaceablePosition] Selected: pos=${candidates[0].block.position}, dist=${candidates[0].dist}`,
-		);
-		return candidates[0].block;
-	}
-
-	return null;
+	return candidates.map((c) => ({
+		...c.block,
+		_needsDig: c.needsDig,
+		_digTarget: c.digTarget,
+	})) as unknown as Block[];
 }
 
 /**

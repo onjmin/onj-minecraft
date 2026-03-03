@@ -1,6 +1,5 @@
-import { Vec3 } from "vec3";
 import { createSkill, type SkillResponse, skillResult } from "../types";
-import { ensureCraftingTable, ensurePlanks, findAllPlaceablePositions } from "./util";
+import { ensureCraftingTable, ensurePlanks, tryPlaceBlock } from "./util";
 
 /**
  * Crafting Domain: Chest management.
@@ -18,24 +17,9 @@ export const craftChestSkill = createSkill<void, { item: string; count: number }
 		const existingChest = bot.inventory.items().find((i) => i.name === "chest");
 		if (existingChest) {
 			agent.log(`[craftChest] Found existing chest in inventory, attempting to place...`);
-			// チェストを設置
-			const positions = findAllPlaceablePositions(bot);
-			for (const refBlock of positions) {
-				try {
-					await bot.equip(existingChest, "hand");
-					await new Promise((r) => setTimeout(r, 500));
-					await bot.placeBlock(refBlock, new Vec3(0, 1, 0));
-					await new Promise((r) => setTimeout(r, 500));
-					const placed = bot.findBlock({
-						matching: bot.registry.blocksByName.chest.id,
-						maxDistance: 4,
-					});
-					if (placed) {
-						return skillResult.ok("Placed existing chest.", { item: "chest", count: 1 });
-					}
-				} catch (e) {
-					agent.log(`[craftChest] Failed to place at ${refBlock.position}: ${e}`);
-				}
+			const placed = await tryPlaceBlock(bot, "chest", bot.registry.blocksByName.chest.id, agent);
+			if (placed) {
+				return skillResult.ok("Placed existing chest.", { item: "chest", count: 1 });
 			}
 			agent.log(`[craftChest] Could not place existing chest`);
 		}
@@ -78,31 +62,13 @@ export const craftChestSkill = createSkill<void, { item: string; count: number }
 			const chestItem = bot.inventory.items().find((i) => i.name === "chest");
 			agent.log(`[craftChest] Chest item in inventory: found=${!!chestItem}`);
 			if (chestItem) {
-				const positions = findAllPlaceablePositions(bot);
-				agent.log(`[craftChest] Found ${positions.length} placeable positions`);
-
-				for (const refBlock of positions) {
-					agent.log(`[craftChest] Trying at ${refBlock.position}`);
-					await bot.equip(chestItem, "hand");
-					try {
-						await new Promise((r) => setTimeout(r, 500));
-						await bot.placeBlock(refBlock, new Vec3(0, 1, 0));
-
-						const placed = bot.findBlock({
-							matching: bot.registry.blocksByName.chest.id,
-							maxDistance: 4,
-						});
-
-						if (placed) {
-							agent.log(`[craftChest] SUCCESS: Placed chest at ${placed.position}`);
-							return skillResult.ok("Crafted and placed 1 chest.", {
-								item: "chest",
-								count: 1,
-							});
-						}
-					} catch (e) {
-						agent.log(`[craftChest] Failed at ${refBlock.position}: ${e}`);
-					}
+				const placed = await tryPlaceBlock(bot, "chest", bot.registry.blocksByName.chest.id, agent);
+				if (placed) {
+					agent.log(`[craftChest] SUCCESS: Placed chest at ${placed.position}`);
+					return skillResult.ok("Crafted and placed 1 chest.", {
+						item: "chest",
+						count: 1,
+					});
 				}
 			}
 

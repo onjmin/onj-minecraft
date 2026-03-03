@@ -35,6 +35,10 @@ export const farmTendCropsSkill = createSkill<void, { harvestedCount: number }>(
 				// まだ収穫可能か再確認
 				if (block && block.metadata === 7) {
 					const cropName = block.name;
+					const toolPlugin = (bot as any).tool;
+					if (toolPlugin) {
+						await toolPlugin.equipForBlock(block);
+					}
 					await agent.abortableDig(signal, block);
 					harvestedCount++;
 
