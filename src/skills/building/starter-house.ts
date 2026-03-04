@@ -13,7 +13,7 @@ export const buildingHouseSkill = createSkill<void, { baseId: string; items: str
 		signal,
 	}): Promise<SkillResponse<{ baseId: string; items: string[] }>> => {
 		const { bot } = agent;
-		const pos = bot.entity.position;
+		const pos = new Vec3(bot.entity.position.x, bot.entity.position.y, bot.entity.position.z);
 
 		agent.log(
 			"[building.house] Started at position:",
@@ -69,9 +69,11 @@ export const buildingHouseSkill = createSkill<void, { baseId: string; items: str
 		for (const offset of wallTargets) {
 			if (agent.checkAbort(signal)) break;
 			const targetPos = pos.offset(offset.x, 0, offset.z);
+			const groundPos = targetPos.offset(0, -1, 0);
 			const block = bot.blockAt(targetPos);
+			const groundBlock = bot.blockAt(groundPos);
 
-			if (block && block.name === "air") {
+			if (block && block.name === "air" && groundBlock && groundBlock.name !== "air") {
 				const wood = bot.inventory.items().find((i) => woodBlocks.includes(i.name));
 				const plank = bot.inventory.items().find((i) => plankBlocks.includes(i.name));
 				const itemToPlace = plank || wood;
@@ -79,7 +81,7 @@ export const buildingHouseSkill = createSkill<void, { baseId: string; items: str
 				if (itemToPlace) {
 					await bot.equip(itemToPlace, "hand");
 					try {
-						await bot.placeBlock(targetPos, new Vec3(0, 1, 0));
+						await bot.placeBlock(groundBlock, new Vec3(0, 1, 0));
 						builtCount++;
 					} catch (e) {
 						agent.log(`[building.house] Failed to place at ${offset.x},${offset.z}: ${e}`);
@@ -99,11 +101,18 @@ export const buildingHouseSkill = createSkill<void, { baseId: string; items: str
 		const torchItem = bot.inventory.items().find((i) => i.name === "torch");
 		if (torchItem) {
 			await bot.equip(torchItem, "hand");
-			const centerPos = pos.offset(0, 2, 0);
+			const centerPos = pos.offset(0, 1, 0);
+			const groundPos = centerPos.offset(0, -1, 0);
 			const blockAtCenter = bot.blockAt(centerPos);
-			if (blockAtCenter && blockAtCenter.name === "air") {
+			const groundBlock = bot.blockAt(groundPos);
+			if (
+				blockAtCenter &&
+				blockAtCenter.name === "air" &&
+				groundBlock &&
+				groundBlock.name !== "air"
+			) {
 				try {
-					await bot.placeBlock(blockAtCenter, new (require("vec3"))(0, -1, 0));
+					await bot.placeBlock(groundBlock, new Vec3(0, 1, 0));
 					installedItems.push("torch");
 					agent.log("[building.house] Torch placed");
 				} catch (e) {
