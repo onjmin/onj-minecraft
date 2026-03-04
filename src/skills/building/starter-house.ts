@@ -1,4 +1,5 @@
 import { goals } from "mineflayer-pathfinder";
+import { Vec3 } from "vec3";
 import { ensureCraftingTable, ensureFurnace, tryPlaceBlock } from "../crafting/util";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
@@ -13,6 +14,15 @@ export const buildingHouseSkill = createSkill<void, { baseId: string; items: str
 	}): Promise<SkillResponse<{ baseId: string; items: string[] }>> => {
 		const { bot } = agent;
 		const pos = bot.entity.position;
+
+		agent.log(
+			"[building.house] Started at position:",
+			Math.floor(pos.x),
+			Math.floor(pos.y),
+			Math.floor(pos.z),
+		);
+
+		const installedItems: string[] = [];
 
 		const woodBlocks = [
 			"oak_log",
@@ -54,6 +64,7 @@ export const buildingHouseSkill = createSkill<void, { baseId: string; items: str
 			(t) => t.x === -2 || t.x === 2 || t.z === -2 || t.z === 2,
 		);
 
+		agent.log("[building.house] Phase 1: Building walls...");
 		let builtCount = 0;
 		for (const offset of wallTargets) {
 			if (agent.checkAbort(signal)) break;
@@ -68,19 +79,23 @@ export const buildingHouseSkill = createSkill<void, { baseId: string; items: str
 				if (itemToPlace) {
 					await bot.equip(itemToPlace, "hand");
 					try {
-						await bot.placeBlock(targetPos, new (require("vec3"))(0, 1, 0));
+						await bot.placeBlock(targetPos, new Vec3(0, 1, 0));
 						builtCount++;
-					} catch (e) {}
+					} catch (e) {
+						agent.log(`[building.house] Failed to place at ${offset.x},${offset.z}: ${e}`);
+					}
 				}
 			}
 		}
 
 		if (builtCount < 8) {
+			agent.log(`[building.house] Failed: Only built ${builtCount} walls`);
 			return skillResult.fail(`Not enough walls built. Need at least 8, got ${builtCount}.`);
 		}
+		agent.log(`[building.house] Phase 1 complete: Built ${builtCount} walls`);
+		installedItems.push("structure");
 
-		const installedItems: string[] = ["structure"];
-
+		agent.log("[building.house] Phase 2: Placing torch...");
 		const torchItem = bot.inventory.items().find((i) => i.name === "torch");
 		if (torchItem) {
 			await bot.equip(torchItem, "hand");
@@ -90,31 +105,48 @@ export const buildingHouseSkill = createSkill<void, { baseId: string; items: str
 				try {
 					await bot.placeBlock(blockAtCenter, new (require("vec3"))(0, -1, 0));
 					installedItems.push("torch");
-				} catch (e) {}
+					agent.log("[building.house] Torch placed");
+				} catch (e) {
+					agent.log(`[building.house] Torch placement failed: ${e}`);
+				}
 			}
 		}
 		if (!installedItems.includes("torch")) {
+			agent.log("[building.house] Failed: No torch");
 			return skillResult.fail("Failed to place torch. Cannot proceed without light.");
 		}
 
+		agent.log("[building.house] Phase 3: Placing crafting table...");
 		const table = await ensureCraftingTable(agent);
 		if (!table) {
+			agent.log("[building.house] Failed: Crafting table");
 			return skillResult.fail("Failed to place crafting table.");
 		}
 		installedItems.push("crafting_table");
+		agent.log("[building.house] Crafting table placed");
 
+		agent.log("[building.house] Phase 4: Placing furnace...");
 		const furnace = await ensureFurnace(agent);
 		if (!furnace) {
+			agent.log("[building.house] Failed: Furnace");
 			return skillResult.fail("Failed to place furnace.");
 		}
 		installedItems.push("furnace");
+		agent.log("[building.house] Furnace placed");
 
+		agent.log("[building.house] Phase 5: Placing chest...");
 		const chestItem = bot.inventory.items().find((i) => i.name === "chest");
 		if (chestItem) {
 			const placed = await tryPlaceBlock(bot, "chest", bot.registry.blocksByName.chest.id, agent);
-			if (placed) installedItems.push("chest");
+			if (placed) {
+				installedItems.push("chest");
+				agent.log("[building.house] Chest placed");
+			}
+		} else {
+			agent.log("[building.house] No chest in inventory");
 		}
 
+		agent.log("[building.house] Phase 6: Placing door...");
 		const doorItem = bot.inventory.items().find((i) => i.name.endsWith("_door"));
 		if (doorItem) {
 			const placed = await tryPlaceBlock(
@@ -123,9 +155,15 @@ export const buildingHouseSkill = createSkill<void, { baseId: string; items: str
 				bot.registry.blocksByName[doorItem.name].id,
 				agent,
 			);
-			if (placed) installedItems.push("door");
+			if (placed) {
+				installedItems.push("door");
+				agent.log("[building.house] Door placed");
+			}
+		} else {
+			agent.log("[building.house] No door in inventory");
 		}
 
+		agent.log("[building.house] Phase 7: Registering base...");
 		const baseId = `house_${Date.now()}`;
 		const registered = agent.addBase({
 			id: baseId,
@@ -137,6 +175,7 @@ export const buildingHouseSkill = createSkill<void, { baseId: string; items: str
 		});
 
 		if (!registered) {
+			agent.log("[building.house] Failed: Base too close to existing");
 			return skillResult.fail("Base too close to existing base. Choose a different location.");
 		}
 

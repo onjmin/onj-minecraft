@@ -15,6 +15,13 @@ export const buildingMountainSkill = createSkill<void, { baseId: string; items: 
 		const pos = bot.entity.position;
 		const toolPlugin = (bot as any).tool;
 
+		agent.log(
+			"[building.mountain] Started at position:",
+			Math.floor(pos.x),
+			Math.floor(pos.y),
+			Math.floor(pos.z),
+		);
+
 		const digTargets = [
 			{ x: 1, y: 0, z: 0 },
 			{ x: 2, y: 0, z: 0 },

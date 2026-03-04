@@ -3,6 +3,7 @@ import { profiles } from "../profiles";
 import { buildingMountainSkill } from "../skills/building/mountain-base";
 import { buildingHouseSkill } from "../skills/building/starter-house";
 import { buildingUndergroundSkill } from "../skills/building/underground-base";
+import { collectDirtSkill } from "../skills/collecting/dirt";
 import { farmTendCropsSkill } from "../skills/collecting/farming";
 import { huntAnimalsSkill } from "../skills/collecting/hunting";
 import { mineOresSkill } from "../skills/collecting/mining";
@@ -28,6 +29,7 @@ const allSkills = [
 	collectWoodSkill, // 伐採
 	stealFromChestSkill, // 略奪 + 装備更新 + 食事
 	collectStoneSkill,
+	collectDirtSkill, // 土収集
 
 	// --- Exploring Domain ---
 	exploreLandSkill, // 陸上探索

@@ -166,7 +166,7 @@ export class MinecraftAgent {
 		this.initEvents();
 	}
 
-	public log(output: unknown) {
+	public log(...outputs: unknown[]) {
 		const time = new Intl.DateTimeFormat("ja-JP", {
 			hour: "2-digit",
 			minute: "2-digit",
@@ -175,7 +175,7 @@ export class MinecraftAgent {
 			timeZone: "Asia/Tokyo",
 		}).format(new Date());
 
-		console.log(`[${time}] ${this.profile.displayName}:`, output);
+		console.log(`[${time}] ${this.profile.displayName}:`, outputs.join(' '));
 	}
 
 	/**
