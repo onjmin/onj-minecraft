@@ -2,21 +2,20 @@
  * SimHashを用いた類似投稿判定モジュール
  */
 
-// メモリリーク防止のため、定期的にキャッシュをクリアするか、TTL付きのライブラリ（node-cache等）への置き換えを推奨
-const simhashCache: Map<string, number[]> = new Map();
 const allowedSameCount = 3;
-
-// 定期的にキャッシュを掃除する（例: 1時間ごと）
-setInterval(() => simhashCache.clear(), 60 * 60 * 1000);
 
 /**
  * 類似投稿を判定する
  * @param text 判定対象の文字列
  * @param userId 投稿者のユーザーID
+ * @param simhashCache 外部から渡されるキャッシュMap
  * @returns 類似と判定された場合はtrue
  */
-export const isSameSimhash = (text: string, userId: string): boolean => {
-	// 短すぎるテキストや特定のコマンドは判定から除外
+export const isSameSimhash = (
+	text: string,
+	userId: string,
+	simhashCache: Map<string, number[]>,
+): boolean => {
 	if (text.length < 4) return false;
 
 	const simhash = calcSimhash(text);
@@ -24,14 +23,12 @@ export const isSameSimhash = (text: string, userId: string): boolean => {
 
 	const simhashLog = simhashCache.get(userId) || [];
 
-	// some(): 直近数件のうち、1つでも「ハミング距離が8未満（25%未満の差異）」があれば弾く
 	const isSame = simhashLog.some((v) => hammingDistance32(v, simhash) < 8);
 
 	if (isSame) {
 		return true;
 	}
 
-	// 履歴を更新（最新を先頭に追加し、規定数に絞る）
 	const newLog = [simhash, ...simhashLog].slice(0, allowedSameCount);
 	simhashCache.set(userId, newLog);
 

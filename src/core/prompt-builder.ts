@@ -7,17 +7,21 @@ export interface ThinkingState {
 	environment: {
 		biome?: string;
 		timeOfDay?: string;
+		weather?: string;
 		lightLevel?: number;
 		health?: number;
 		hunger?: number;
 		position?: { x: number; y: number; z: number };
 		nearbyPlayers?: string[];
 		nearbyMobs?: string[];
+		nearbyBlocks?: string;
+		heldItem?: string;
 	};
 
 	inventorySummary?: string;
 
-	strategicState?: string;
+	strategies?: string[];
+	achievements?: string[];
 
 	bases?: string[];
 
@@ -65,13 +69,16 @@ function buildEnvironmentSection(state: ThinkingState): string {
 === ENVIRONMENT ===
 Biome: ${e.biome ?? "unknown"}
 Time: ${e.timeOfDay ?? "unknown"}
+Weather: ${e.weather ?? "clear"}
 Light Level: ${e.lightLevel ?? "unknown"}
 Health: ${e.health ?? "unknown"}
 Hunger: ${e.hunger ?? "unknown"}
 Position: ${formatPosition(e.position)}
+Held Item: ${e.heldItem ?? "bare_hands"}
 
 Nearby Players: ${formatList(e.nearbyPlayers)}
 Nearby Mobs: ${formatList(e.nearbyMobs)}
+Nearby Blocks (sample): ${e.nearbyBlocks ?? "None"}
 
 Last Damage Cause: ${state.lastDamageCause ?? "none"}
 `.trim();
@@ -85,9 +92,22 @@ ${state.inventorySummary ?? "Empty or unknown"}
 }
 
 function buildStrategicSection(state: ThinkingState): string {
+	const strategies = state.strategies ?? [];
+	const achievements = state.achievements ?? [];
+
+	const strategyText = strategies.length > 0 ? strategies.map((s) => `- ${s}`).join("\n") : "None";
+
+	const achievementText =
+		achievements.length > 0
+			? achievements.map((a) => `- ${a}`).join("\n")
+			: "None (still in progress)";
+
 	return `
-=== STRATEGIC STATE ===
-${state.strategicState ?? "No active long-term plan."}
+=== CURRENT STRATEGY (Max 3) ===
+${strategyText}
+
+=== RECENT ACHIEVEMENTS (Max 3) ===
+${achievementText}
 
 Known Bases:
 ${formatList(state.bases)}
@@ -131,18 +151,11 @@ function buildOutputFormatSection(): string {
 	return `
 === OUTPUT FORMAT ===
 
-Respond ONLY in JSON:
-
-{
-  "speak": string | null,
-  "action": {
-    "name": string,
-    "args": object
-  } | null,
-  "memory": string | null
-}
-
-Do not include explanations outside JSON.
+Rationale: (optional, internal reasoning)
+Strategy: (optional, update or keep current)
+Achievement: (optional, if something was completed)
+Skill: (exact name)
+Chat: (optional, message to send)
 `.trim();
 }
 

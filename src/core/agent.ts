@@ -7,7 +7,9 @@ import type { AgentProfile } from "../profiles/types";
 import { exploreLandSkill } from "../skills/exploring/land";
 import type { SkillResponse } from "../skills/types";
 import { llm } from "./llm-client";
-import { cleanChatField, parseSections, parseSkillField } from "./llm-output-parser";
+import { parseLlmOutput } from "./llm-output-parser";
+import { createPerceptionSnapshot } from "./perception";
+import { buildThinkingPrompt } from "./prompt-builder";
 import { emitDiscordWebhook, translateWithRoleplay } from "./utils/discord-webhook";
 import { isSameSimhash } from "./utils/simhash";
 
@@ -72,6 +74,9 @@ export class MinecraftAgent {
 
 	private chatHistory: ChatLog[] = [];
 	private maxChatHistory = 10;
+
+	private chatSimhashCache: Map<string, number[]> = new Map();
+	private rationaleSimhashCache: Map<string, number[]> = new Map();
 
 	private currentGoal: goals.Goal | null = null;
 
@@ -175,7 +180,7 @@ export class MinecraftAgent {
 			timeZone: "Asia/Tokyo",
 		}).format(new Date());
 
-		console.log(`[${time}] ${this.profile.displayName}:`, outputs.join(' '));
+		console.log(`[${time}] ${this.profile.displayName}:`, outputs.join(" "));
 	}
 
 	/**
@@ -536,243 +541,175 @@ export class MinecraftAgent {
 		}
 	}
 
-	/**
-	 * Cerebral Loop (Thinking): Periodically re-evaluates the situation
-	 * 大脳ループ：定期的に状況を評価し、方針を更新する
-	 */
 	private async startThinkingLoop() {
 		while (this.bot && this.bot.entity) {
-			const skillsContext = Array.from(this.skills.values())
-				.map((t) => {
-					const hasArgs = t.inputSchema && Object.keys(t.inputSchema).length > 0;
-					const argsInfo = hasArgs
-						? `\n  Args: ${Object.entries(t.inputSchema)
-								.map(([k, v]) => `${k}: ${(v as any).description}`)
-								.join(", ")}`
-						: "";
-					return `- ${t.name}${hasArgs ? `(${Object.keys(t.inputSchema).join(',')})` : ''}: ${t.description}${argsInfo}`;
-				})
-				.join("\n");
-
-			const historyText = this.getHistoryContext();
-			// --- インベントリ情報の取得 ---
-			const inventory =
-				this.bot.inventory
-					.items()
-					.map((i) => `${i.name} x${i.count}`)
-					.join(", ") || "Empty";
-
-			// 1. 周囲のプレイヤー情報を詳細に取得
-			const players = Object.values(this.bot.entities)
-				.filter((e) => e.type === "player" && e !== this.bot.entity)
-				.filter((e) => e.position.distanceTo(this.bot.entity.position) < 24); // 視界を少し広めに設定
-
-			const nearbyPlayersData = players.map((p) => p.username);
-
-			const nearbyPlayersText =
-				nearbyPlayersData.length > 0 ? nearbyPlayersData.join(", ") : "None";
-
-			// 2. その他のエンティティ（中立・敵対モブ）
-			const nearbyMobs =
-				Object.values(this.bot.entities)
-					.filter(
-						(e) =>
-							(e.type === "mob" || e.type === "hostile") &&
-							e.position.distanceTo(this.bot.entity.position) < 16,
-					)
-					.map(
-						(e) =>
-							`${e.name || e.type}(${Math.round(e.position.distanceTo(this.bot.entity.position))}m)`,
-					)
-					.join(", ") || "None";
-
-			// 2. 現在のバイオームと周囲の環境
-			// biome取得
-			const blockAtPos = this.bot.blockAt(this.bot.entity.position);
-
-			// 1. 位置を確定（自分自身の足元の座標 Vec3 を取得）
-			const pos = blockAtPos?.position || this.bot.entity.position;
-
-			let biomeName = "unknown";
-
-			if (pos) {
-				try {
-					// 2. 標準API: world.getBiome を使用して ID を取得
-					const biomeId = this.bot.world.getBiome(pos);
-
-					// 3. レジストリからバイオーム情報を取得
-					const biomeInfo = this.bot.registry.biomes[biomeId];
-					
-					// 4. 名前を取得（例: "plains"）
-					biomeName = biomeInfo?.name || this.bot.game.dimension || "unknown";
-				} catch (err) {
-					// まだチャンクが読み込まれていない場合はここに来る
-					biomeName = this.bot.game.dimension || "unknown";
-				}
-			} else {
-				biomeName = this.bot.game.dimension || "unknown";
-			}
-			
-			const isRaining = this.bot.isRaining;
-			const timeOfDay = this.bot.time.isDay ? "Day" : "Night";
-			// 3. 直近のダメージ原因
-			// 「なぜHPが減ったか」がわからないと、同じミスを繰り返します。
-
-			// 4. 装備の状態（Equipment）
-			// 手に何を持っているか，防具を着ているか。インベントリの中にあるだけでは使えないため、**「今，手に持っているもの」**は重要です。
-			const heldItem = this.bot.heldItem ? this.bot.heldItem.name : "Bare hands";
-
-			// 周囲のブロックをランダムサンプリング（10個）
-			const sampleRadius = 8;
-			const sampledBlocks: string[] = [];
-			for (let i = 0; i < 10; i++) {
-				const dx = Math.floor(Math.random() * sampleRadius * 2 - sampleRadius);
-				const dy = Math.floor(Math.random() * sampleRadius * 2 - sampleRadius);
-				const dz = Math.floor(Math.random() * sampleRadius * 2 - sampleRadius);
-				const pos = this.bot.entity.position.offset(dx, dy, dz);
-				const block = this.bot.blockAt(pos);
-				if (block && block.name !== "air") {
-					sampledBlocks.push(block.name);
-				}
-			}
-			const nearbyBlocksText = [...new Set(sampledBlocks)].slice(0, 10).join(", ") || "None";
-
-			// 明るさ感知（木材伐採や農業のため）
-			const perceivedLight = this.getPerceivedLight();
-
-			// チャットログのテキスト化
-			const chatLogContext =
-				this.chatHistory.map((c) => `<${c.username}> ${c.message}`).join("\n") ||
-				"No recent conversations.";
-
-			const systemPrompt = `Your name is ${this.profile.minecraftName}.
-Roleplay as this character and interact with other players naturally.
-
-## PERSONALITY
-${this.profile.personality}
-
-## CURRENT STRATEGY (Max 3)
-${
-	this.strategicState.strategies.length > 0
-		? this.strategicState.strategies.map((s) => `- ${s}`).join("\n")
-		: "None"
-}
-
-## RECENT ACHIEVEMENTS (Max 3)
-${
-	this.strategicState.achievements.length > 0
-		? this.strategicState.achievements.map((a) => `- ${a}`).join("\n")
-		: "None"
-}
-
-## CURRENT STATUS
-- Position: (${Math.floor(this.bot.entity.position.x)}, ${Math.floor(this.bot.entity.position.y)}, ${Math.floor(this.bot.entity.position.z)})
-- HP: ${this.bot.health?.toFixed(0)}/20 | Food: ${this.bot.food?.toFixed(0)}/20
-- Biome: ${biomeName}
-- Time: ${timeOfDay} | Weather: ${isRaining ? "Raining" : "Clear"}
-- Held Item: ${heldItem}
-- Inventory: ${inventory}
-- Nearby Players (IMPORTANT): ${nearbyPlayersText}
-- Nearby Mobs: ${nearbyMobs}
-- Last Damage Cause: ${this.lastDamageCause}
-- Nearby Blocks (sample): ${nearbyBlocksText}
-- Perceived Light: ${perceivedLight?.toFixed(2)}/1.0 (1=dark, 0.5=twilight, 0=sunlight)
-
-## RECENT CHAT LOG
-${chatLogContext}
-
-## PAST OBSERVATIONS
-${historyText}
-
-## KNOWN BASES (Max 3)
-${this.bases.length > 0 ? this.bases.map((b) => `- ${b.id} (${b.type}) at (${b.position.x}, ${b.position.y}, ${b.position.z}) | safe: ${b.safe}, functional: ${b.functional}, storage: ${b.hasStorage}`).join("\n") : "No bases registered yet."}
-
-## AVAILABLE SKILLS
-${skillsContext}
-
-## OUTPUT FORMAT
-Rationale: (optional, internal reasoning)
-Strategy: (optional, update or keep current)
-Achievement: (optional, if something was completed)
-Skill: (exact name)
-Chat: (optional, message to send)`;
-
 			try {
-				const rawContent = await llm.complete(systemPrompt);
+				const state = this.getAgentStateForThinking();
+				const prompt = buildThinkingPrompt(state);
 
-				// ログディレクトリ
+				this.log("🧠 Thinking...");
+
+				const rawOutput = await llm.complete(prompt);
+
+				// Log saving
 				const safeName = path.basename(this.profile.minecraftName);
 				const logDir = path.join(process.cwd(), "logs", safeName);
-
 				if (!fs.existsSync(logDir)) {
 					fs.mkdirSync(logDir, { recursive: true });
 				}
-
-				// ファイルパス
 				const inputPath = path.join(logDir, "input.md");
 				const outputPath = path.join(logDir, "output.md");
+				fs.writeFileSync(inputPath, prompt);
+				fs.writeFileSync(outputPath, rawOutput || "");
 
-				fs.writeFileSync(inputPath, systemPrompt);
-				fs.writeFileSync(outputPath, rawContent || "");
-
-				if (rawContent) {
-					// 共通パーサーで全セクションを抽出（順序や改行に頑強）
-					const sections = parseSections(rawContent);
-
-					this.updateFIFO(this.strategicState.strategies, sections.strategy);
-					this.updateFIFO(this.strategicState.achievements, sections.achievement);
-
-					// Rationale
-					const rationale = sections.rationale ? sections.rationale.trim() : "No reasoning.";
-
-					// Skill parse (名前 + args)
-					const { name: foundSkillName, args: parsedArgs } = parseSkillField(sections.skill || "");
-					if (foundSkillName) {
-						if (Object.keys(parsedArgs).length > 0) {
-							this.currentSkillArgs[foundSkillName] = parsedArgs;
-						} else {
-							this.currentSkillArgs[foundSkillName] = {};
-						}
-					}
-
-					this.log(`${foundSkillName ?? "no-skill"} ${rationale}`);
-
-					// Chat のクリーンアップ共通化
-					const chatMessage = cleanChatField(sections.chat || "");
-					const isNotSpam =
-						isSameSimhash(chatMessage, this.profile.minecraftName) &&
-						this.updateFIFO(this.strategicState.chats, chatMessage);
-					if (isNotSpam) {
-						this.bot.chat(chatMessage);
-					}
-
-					// --- ツールの実行とDiscord通知(思考) ---
-					if (foundSkillName && this.skills.has(foundSkillName)) {
-						this.cancelCurrentExecution();
-						if (this.currentTaskName !== foundSkillName) {
-							this.currentTaskName = foundSkillName;
-							this.latestRationale = rationale;
-
-							// --- 送信処理の中 ---
-							const now = Date.now();
-							if (now - lastDiscordEmitAt >= 10_000) {
-								// 最後に送信した時刻を更新
-								lastDiscordEmitAt = now;
-								translateWithRoleplay(rationale, this.profile).then((translatedText) =>
-									emitDiscordWebhook({
-										username: this.profile.displayName,
-										content: `**Action:** \`${foundSkillName}\`\n**Thought:** ${translatedText}${chatMessage === "" ? "" : `\n**Chat:** ${chatMessage}`}`,
-										avatar_url: this.profile.avatarUrl,
-									}),
-								);
-							}
-						}
-					}
-				}
+				const parsed = parseLlmOutput(rawOutput);
+				await this.applyThoughtResult(parsed);
 			} catch (err) {
 				this.log(`Thinking error: ${err}`);
 			}
+
 			await new Promise((r) => setTimeout(r, 30000));
+		}
+	}
+
+	private getAgentStateForThinking() {
+		const skillsContext = Array.from(this.skills.values()).map((t) => {
+			const hasArgs = t.inputSchema && Object.keys(t.inputSchema).length > 0;
+			const argsInfo = hasArgs
+				? Object.entries(t.inputSchema)
+						.map(([k, v]) => `${k}: ${(v as any).description}`)
+						.join(", ")
+				: "";
+			return {
+				name: t.name,
+				description: t.description,
+				usage: argsInfo,
+			};
+		});
+
+		const historyText = this.getHistoryContext();
+		const inventory =
+			this.bot.inventory
+				.items()
+				.map((i) => `${i.name} x${i.count}`)
+				.join(", ") || "Empty";
+
+		const heldItem = this.bot.heldItem ? this.bot.heldItem.name : "bare_hands";
+
+		const chatLogContext =
+			this.chatHistory.map((c) => `<${c.username}> ${c.message}`).join("\n") ||
+			"No recent conversations.";
+
+		// Use perception module
+		const perception = createPerceptionSnapshot(this.bot, this.lastDamageCause);
+
+		// Nearby blocks sampling (radius 8, random 10 points)
+		const sampleRadius = 8;
+		const sampledBlocks: string[] = [];
+		for (let i = 0; i < 10; i++) {
+			const dx = Math.floor(Math.random() * sampleRadius * 2 - sampleRadius);
+			const dy = Math.floor(Math.random() * sampleRadius * 2 - sampleRadius);
+			const dz = Math.floor(Math.random() * sampleRadius * 2 - sampleRadius);
+			const pos = this.bot.entity.position.offset(dx, dy, dz);
+			const block = this.bot.blockAt(pos);
+			if (block && block.name !== "air") {
+				sampledBlocks.push(block.name);
+			}
+		}
+		const nearbyBlocksText = [...new Set(sampledBlocks)].slice(0, 10).join(", ") || "None";
+
+		return {
+			profile: {
+				name: this.profile.minecraftName,
+				personality: this.profile.personality,
+			},
+			environment: {
+				biome: perception.environment.biome,
+				timeOfDay: perception.environment.timeOfDay,
+				weather: perception.environment.weather,
+				lightLevel: perception.environment.lightLevel,
+				health: perception.health,
+				hunger: perception.food,
+				position: {
+					x: Math.floor(perception.position.x),
+					y: Math.floor(perception.position.y),
+					z: Math.floor(perception.position.z),
+				},
+				nearbyPlayers: perception.environment.nearbyPlayers,
+				nearbyMobs: perception.environment.nearbyMobs.map((m) => `${m.name}(${m.distance}m)`),
+				nearbyBlocks: nearbyBlocksText,
+				heldItem: heldItem,
+			},
+			inventorySummary: inventory,
+			strategies: this.strategicState.strategies,
+			achievements: this.strategicState.achievements,
+			bases: this.bases.map(
+				(b) =>
+					`${b.id} (${b.type}) at (${b.position.x}, ${b.position.y}, ${b.position.z}) | safe: ${b.safe}, functional: ${b.functional}, storage: ${b.hasStorage}`,
+			),
+			skills: skillsContext,
+			chatHistory: [chatLogContext],
+			lastDamageCause: this.lastDamageCause,
+			memorySummary: historyText,
+		};
+	}
+
+	private async applyThoughtResult(result: any) {
+		// Extract strategy and achievement from memory
+		const memoryText = result.memory || "";
+		const strategyMatch = memoryText.match(/Strategy:\s*(.+?)(?:\||$)/);
+		const achievementMatch = memoryText.match(/Achievement:\s*(.+?)(?:\||$)/);
+
+		if (strategyMatch) {
+			this.updateFIFO(this.strategicState.strategies, strategyMatch[1].trim());
+		}
+		if (achievementMatch) {
+			this.updateFIFO(this.strategicState.achievements, achievementMatch[1].trim());
+		}
+
+		const rationale = result.memory || "No reasoning.";
+		const foundSkillName = result.action?.name;
+		const parsedArgs = result.action?.args || {};
+
+		if (foundSkillName) {
+			this.currentSkillArgs[foundSkillName] = parsedArgs;
+		}
+
+		this.log(`${foundSkillName ?? "no-skill"} ${rationale}`);
+
+		const chatMessage = result.speak || "";
+		const isNewChat = !isSameSimhash(
+			chatMessage,
+			this.profile.minecraftName,
+			this.chatSimhashCache,
+		);
+		if (isNewChat && chatMessage && this.updateFIFO(this.strategicState.chats, chatMessage)) {
+			this.bot.chat(chatMessage);
+		}
+
+		if (foundSkillName && this.skills.has(foundSkillName)) {
+			this.cancelCurrentExecution();
+			if (this.currentTaskName !== foundSkillName) {
+				this.currentTaskName = foundSkillName;
+				this.latestRationale = rationale;
+
+				const now = Date.now();
+				const isNewRationale = !isSameSimhash(
+					rationale,
+					`rationale:${this.profile.minecraftName}`,
+					this.rationaleSimhashCache,
+				);
+				if (now - lastDiscordEmitAt >= 10_000 && isNewRationale) {
+					lastDiscordEmitAt = now;
+					translateWithRoleplay(rationale, this.profile).then((translatedText) =>
+						emitDiscordWebhook({
+							username: this.profile.displayName,
+							content: `**Action:** \`${foundSkillName}\`\n**Thought:** ${translatedText}${chatMessage === "" ? "" : `\n**Chat:** ${chatMessage}`}`,
+							avatar_url: this.profile.avatarUrl,
+						}),
+					);
+				}
+			}
 		}
 	}
 
@@ -1061,7 +998,8 @@ Chat: (optional, message to send)`;
 				}
 				retry++;
 			} while (retry < 3);
-		} catch {} finally {
+		} catch {
+		} finally {
 			clearInterval(checkStuck);
 			this.isMoving = false;
 			this.bot.clearControlStates();

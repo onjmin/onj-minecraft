@@ -29,7 +29,7 @@ export const craftToolSkill = createSkill<void, { item: string; material: string
 				"Insufficient materials: Need sticks (or wood to make them) to craft tools.",
 			);
 		}
-		
+
 		// 板材を事前に確保（木ツールの場合は3枚必要）
 		await ensurePlanks(agent, 3);
 
@@ -46,6 +46,7 @@ export const craftToolSkill = createSkill<void, { item: string; material: string
 		}
 
 		const itemName = `${target.material}_${target.skillType}`;
+		const maxCraft = 3;
 
 		try {
 			// 2. 作業台の確保
@@ -67,8 +68,9 @@ export const craftToolSkill = createSkill<void, { item: string; material: string
 				return skillResult.fail(`Insufficient materials or no recipe for ${itemName}.`);
 			}
 
-			await bot.craft(recipes[0], 1, craftingTable);
-			agent.log(`[craftTool] SUCCESS: Crafted ${itemName}`);
+			// 最大3個までクラフト
+			await bot.craft(recipes[0], maxCraft, craftingTable);
+			agent.log(`[craftTool] SUCCESS: Crafted up to ${maxCraft} ${itemName}`);
 
 			return skillResult.ok(`Upgraded equipment: Crafted 1 ${itemName}.`, {
 				item: target.skillType,
@@ -96,14 +98,23 @@ export const craftingManager = {
 		const items = bot.inventory.items();
 
 		for (const type of craftingManager.types) {
-			// 現在そのカテゴリで持っている最高の素材を特定
+			// 現在そのカテゴリで持っている最高の素材と数を特定
 			let currentBestIdx = 999;
+			let currentCount = 0;
 			for (const item of items) {
 				if (item.name.endsWith(`_${type}`)) {
 					const mat = item.name.split("_")[0];
 					const idx = craftingManager.materials.indexOf(mat);
-					if (idx !== -1 && idx < currentBestIdx) currentBestIdx = idx;
+					if (idx !== -1 && idx < currentBestIdx) {
+						currentBestIdx = idx;
+						currentCount = item.count;
+					}
 				}
+			}
+
+			// 既に3個以上持っていればスキップ
+			if (currentCount >= 3) {
+				continue;
 			}
 
 			// 作成可能な最高の素材をチェック

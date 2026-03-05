@@ -24,6 +24,7 @@ export const buildingHouseSkill = createSkill<void, { baseId: string; items: str
 
 		const installedItems: string[] = [];
 
+		const dirtBlocks = ["dirt", "grass_block", "podzol", "mycelium"];
 		const woodBlocks = [
 			"oak_log",
 			"birch_log",
@@ -64,6 +65,69 @@ export const buildingHouseSkill = createSkill<void, { baseId: string; items: str
 			(t) => t.x === -2 || t.x === 2 || t.z === -2 || t.z === 2,
 		);
 
+		const unbreakableBlocks = [
+			"bedrock",
+			"obsidian",
+			"end_portal",
+			"end_gateway",
+			"portal",
+			"command_block",
+			"repeating_command_block",
+			"chain_command_block",
+			"structure_block",
+			"jigsaw",
+		];
+
+		agent.log("[building.house] Phase 0: Checking floor stability...");
+		const unstableBlocks = ["water", "lava", "air", "void_air", "cave_air"];
+		const interiorTargets = [
+			{ x: -1, y: 0, z: -1 },
+			{ x: 0, y: 0, z: -1 },
+			{ x: 1, y: 0, z: -1 },
+			{ x: -1, y: 0, z: 0 },
+			{ x: 0, y: 0, z: 0 },
+			{ x: 1, y: 0, z: 0 },
+			{ x: -1, y: 0, z: 1 },
+			{ x: 0, y: 0, z: 1 },
+			{ x: 1, y: 0, z: 1 },
+		];
+		for (const offset of interiorTargets) {
+			const targetPos = pos.offset(offset.x, 0, offset.z);
+			const groundPos = targetPos.offset(0, -1, 0);
+			const groundBlock = bot.blockAt(groundPos);
+			if (!groundBlock || unstableBlocks.includes(groundBlock.name)) {
+				agent.log(
+					`[building.house] Failed: Unstable floor at ${offset.x},${offset.z}: ${groundBlock?.name || "none"}`,
+				);
+				return skillResult.fail(
+					`Cannot build here: floor is unstable (${groundBlock?.name || "air"}).`,
+				);
+			}
+		}
+
+		agent.log("[building.house] Phase 0b: Checking for unbreakable blocks...");
+		for (const offset of interiorTargets) {
+			const targetPos = pos.offset(offset.x, 0, offset.z);
+			const block = bot.blockAt(targetPos);
+			if (block && block.name !== "air" && unbreakableBlocks.includes(block.name)) {
+				agent.log(`[building.house] Failed: Unbreakable block ${block.name} at interior`);
+				return skillResult.fail(
+					`Cannot build here: ${block.name} is in the way and cannot be broken.`,
+				);
+			}
+		}
+		for (const offset of wallTargets) {
+			const targetPos = pos.offset(offset.x, 0, offset.z);
+			const block = bot.blockAt(targetPos);
+			if (block && block.name !== "air" && unbreakableBlocks.includes(block.name)) {
+				agent.log(`[building.house] Failed: Unbreakable block ${block.name} at wall`);
+				return skillResult.fail(
+					`Cannot build here: ${block.name} is in the way and cannot be broken.`,
+				);
+			}
+		}
+		agent.log("[building.house] Phase 0: Location check passed");
+
 		agent.log("[building.house] Phase 1: Building walls...");
 		let builtCount = 0;
 		for (const offset of wallTargets) {
@@ -74,9 +138,10 @@ export const buildingHouseSkill = createSkill<void, { baseId: string; items: str
 			const groundBlock = bot.blockAt(groundPos);
 
 			if (block && block.name === "air" && groundBlock && groundBlock.name !== "air") {
-				const wood = bot.inventory.items().find((i) => woodBlocks.includes(i.name));
+				const dirt = bot.inventory.items().find((i) => dirtBlocks.includes(i.name));
 				const plank = bot.inventory.items().find((i) => plankBlocks.includes(i.name));
-				const itemToPlace = plank || wood;
+				const wood = bot.inventory.items().find((i) => woodBlocks.includes(i.name));
+				const itemToPlace = dirt || plank || wood;
 
 				if (itemToPlace) {
 					await bot.equip(itemToPlace, "hand");
@@ -190,9 +255,70 @@ export const buildingHouseSkill = createSkill<void, { baseId: string; items: str
 
 		agent.log(`[building.house] Base ${baseId} registered: ${installedItems.join(", ")}`);
 
-		return skillResult.ok(`Built starter house. Items: ${installedItems.join(", ")}`, {
+		agent.log("[building.house] Phase 8: Initial maintenance...");
+		const maintenanceActions: string[] = [];
+
+		const centerPos = pos.offset(0, 1, 0);
+		const blockAtCenter = bot.blockAt(centerPos);
+		if (!blockAtCenter || blockAtCenter.name !== "torch") {
+			const torchItem = bot.inventory.items().find((i) => i.name === "torch");
+			if (torchItem) {
+				await bot.equip(torchItem, "hand");
+				const groundPos = centerPos.offset(0, -1, 0);
+				const groundBlock = bot.blockAt(groundPos);
+				if (groundBlock && groundBlock.name !== "air") {
+					try {
+						await bot.placeBlock(groundBlock, new Vec3(0, 1, 0));
+						maintenanceActions.push("torch_placed");
+					} catch (e) {}
+				}
+			}
+		}
+
+		const validWallBlocks = [
+			"dirt",
+			"grass_block",
+			"oak_planks",
+			"birch_planks",
+			"spruce_planks",
+			"jungle_planks",
+			"acacia_planks",
+			"dark_oak_planks",
+			"oak_log",
+			"cobblestone",
+			"stone",
+		];
+		let repairedCount = 0;
+		for (const offset of wallTargets) {
+			const targetPos = pos.offset(offset.x, 0, offset.z);
+			const block = bot.blockAt(targetPos);
+			const groundPos = targetPos.offset(0, -1, 0);
+			const groundBlock = bot.blockAt(groundPos);
+			if (!block || block.name === "air") {
+				if (groundBlock && groundBlock.name !== "air") {
+					const dirt = bot.inventory.items().find((i) => dirtBlocks.includes(i.name));
+					const plank = bot.inventory.items().find((i) => i.name.endsWith("_planks"));
+					const itemToPlace = dirt || plank;
+					if (itemToPlace) {
+						await bot.equip(itemToPlace, "hand");
+						try {
+							await bot.placeBlock(groundBlock, new Vec3(0, 1, 0));
+							repairedCount++;
+						} catch (e) {}
+					}
+				}
+			}
+		}
+		if (repairedCount > 0) {
+			maintenanceActions.push(`walls_repaired:${repairedCount}`);
+		}
+
+		const finalItems = [...installedItems, ...maintenanceActions];
+		agent.log(`[building.house] Maintenance: ${maintenanceActions.join(", ")}`);
+
+		return skillResult.ok(`Built starter house. Items: ${finalItems.join(", ")}`, {
 			baseId,
-			items: installedItems,
+			items: finalItems,
 		});
 	},
 });
