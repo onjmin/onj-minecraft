@@ -3,6 +3,21 @@ import { goals } from "mineflayer-pathfinder";
 import type { Vec3 } from "vec3";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
+const SINGLE_SAPLING_TREES = ["oak", "birch", "acacia", "cherry"];
+const QUAD_SAPLING_TREES = ["dark_oak", "spruce", "jungle"];
+
+function getSaplingTypeFromLog(logName: string): string | null {
+	const base = logName.replace(/_log|_wood|_stem|_hyphae$/, "");
+	if (SINGLE_SAPLING_TREES.includes(base)) return base + "_sapling";
+	if (QUAD_SAPLING_TREES.includes(base)) return base + "_sapling";
+	return null;
+}
+
+function isQuadTree(saplingName: string): boolean {
+	const base = saplingName.replace("_sapling", "");
+	return QUAD_SAPLING_TREES.includes(base);
+}
+
 export const collectWoodSkill = createSkill<void, { felledCount: number; plantedCount: number }>({
 	name: "collecting.wood",
 	description:
@@ -18,10 +33,16 @@ export const collectWoodSkill = createSkill<void, { felledCount: number; planted
 		let felledCount = 0;
 		let plantedCount = 0;
 
+		let treeTypeToPlant: string | null = null;
 		if (logs.length > 0) {
 			try {
 				const target = logs[0];
 				const toolPlugin = (bot as any).tool;
+
+				const logBlock = bot.blockAt(target);
+				if (logBlock) {
+					treeTypeToPlant = getSaplingTypeFromLog(logBlock.name);
+				}
 
 				const goal = new goals.GoalNear(target.x, target.y, target.z, 2);
 				await agent.abortableGoto(signal, goal);
@@ -66,30 +87,63 @@ export const collectWoodSkill = createSkill<void, { felledCount: number; planted
 			}
 		}
 
-		const placeable = findPlaceableForSaplings(bot);
-		if (placeable.length > 0) {
-			const target = placeable[0];
-			await agent.abortableGoto(signal, new goals.GoalNear(target.x, target.y, target.z, 1));
+		if (!treeTypeToPlant) {
+			const saplings = bot.inventory.items().filter((i) => i.name.endsWith("_sapling"));
+			if (saplings.length > 0) {
+				treeTypeToPlant = saplings[0].name;
+			}
+		}
 
-			const sapling = bot.inventory.items().find((i) => i.name.endsWith("_sapling"));
-			if (sapling) {
-				const block = bot.blockAt(target);
-				if (block && (block.name === "dirt" || block.name === "grass_block")) {
-					await bot.equip(sapling, "hand");
-					const Vec3 = require("vec3");
-					await bot.placeBlock(block, new Vec3(0, 1, 0));
-					plantedCount++;
+		if (treeTypeToPlant) {
+			const isQuad = isQuadTree(treeTypeToPlant);
+			const placeable = findPlaceableForSaplings(bot, isQuad ? 12 : 8, isQuad);
 
-					const boneMeal = bot.inventory.items().find((i) => i.name === "bone_meal");
-					if (boneMeal) {
-						await bot.equip(boneMeal, "hand");
-						const saplingBlock = bot.blockAt(target.offset(0, 1, 0));
-						if (saplingBlock) {
-							try {
-								await bot.activateBlock(saplingBlock);
-								await new Promise((r) => setTimeout(r, 200));
-							} catch (e) {
-								agent.log(`[collecting.wood] Bone meal failed: ${e}`);
+			if (placeable.length > 0) {
+				const target = placeable[0];
+				await agent.abortableGoto(signal, new goals.GoalNear(target.x, target.y, target.z, 1));
+
+				const sapling = bot.inventory.items().find((i) => i.name === treeTypeToPlant);
+				if (sapling) {
+					const block = bot.blockAt(target);
+					if (block && (block.name === "dirt" || block.name === "grass_block")) {
+						const Vec3 = require("vec3");
+
+						if (isQuad) {
+							const positions = [
+								target,
+								target.offset(1, 0, 0),
+								target.offset(0, 0, 1),
+								target.offset(1, 0, 1),
+							];
+							for (const pos of positions) {
+								const soil = bot.blockAt(pos);
+								if (soil && (soil.name === "dirt" || soil.name === "grass_block")) {
+									const above = bot.blockAt(pos.offset(0, 1, 0));
+									if (above && above.name === "air") {
+										await bot.equip(sapling, "hand");
+										await bot.placeBlock(soil, new Vec3(0, 1, 0));
+										plantedCount++;
+										await new Promise((r) => setTimeout(r, 100));
+									}
+								}
+							}
+						} else {
+							await bot.equip(sapling, "hand");
+							await bot.placeBlock(block, new Vec3(0, 1, 0));
+							plantedCount++;
+						}
+
+						const boneMeal = bot.inventory.items().find((i) => i.name === "bone_meal");
+						if (boneMeal) {
+							await bot.equip(boneMeal, "hand");
+							const saplingBlock = bot.blockAt(target.offset(0, 1, 0));
+							if (saplingBlock) {
+								try {
+									await bot.activateBlock(saplingBlock);
+									await new Promise((r) => setTimeout(r, 200));
+								} catch (e) {
+									agent.log(`[collecting.wood] Bone meal failed: ${e}`);
+								}
 							}
 						}
 					}
@@ -121,26 +175,79 @@ function isLeaves(name: string): boolean {
 	return name.endsWith("_leaves") || name.endsWith("_wart_block") || name === "shroomlight";
 }
 
-function findPlaceableForSaplings(bot: Bot, radius = 8): Vec3[] {
-	const candidates: { pos: Vec3; dist: number }[] = [];
+function findPlaceableForSaplings(bot: Bot, radius: number, isQuad: boolean): Vec3[] {
+	const candidates: { pos: Vec3; dist: number; gridScore: number }[] = [];
 	const agentPos = bot.entity.position;
+
+	const gridInterval = 3;
+	const gridX = Math.floor(agentPos.x / gridInterval) * gridInterval;
+	const gridZ = Math.floor(agentPos.z / gridInterval) * gridInterval;
 
 	for (let dx = -radius; dx <= radius; dx++) {
 		for (let dz = -radius; dz <= radius; dz++) {
-			const checkPos = agentPos.offset(dx, 0, dz);
-			const block = bot.blockAt(checkPos);
-			if (!block || (block.name !== "dirt" && block.name !== "grass_block")) continue;
+			if (isQuad) {
+				if (dx < 0 || dz < 0) continue;
+				const checkPos = agentPos.offset(dx, 0, dz);
+				const soil1 = bot.blockAt(checkPos);
+				const soil2 = bot.blockAt(checkPos.offset(1, 0, 0));
+				const soil3 = bot.blockAt(checkPos.offset(0, 0, 1));
+				const soil4 = bot.blockAt(checkPos.offset(1, 0, 1));
+				if (!soil1 || !soil2 || !soil3 || !soil4) continue;
+				if (
+					!isPlantable(soil1) ||
+					!isPlantable(soil2) ||
+					!isPlantable(soil3) ||
+					!isPlantable(soil4)
+				)
+					continue;
 
-			const above = bot.blockAt(checkPos.offset(0, 1, 0));
-			if (above && above.name !== "air") continue;
+				const above1 = bot.blockAt(checkPos.offset(0, 1, 0));
+				const above2 = bot.blockAt(checkPos.offset(1, 1, 0));
+				const above3 = bot.blockAt(checkPos.offset(0, 1, 1));
+				const above4 = bot.blockAt(checkPos.offset(1, 1, 1));
+				if (
+					(above1 && above1.name !== "air") ||
+					(above2 && above2.name !== "air") ||
+					(above3 && above3.name !== "air") ||
+					(above4 && above4.name !== "air")
+				)
+					continue;
 
-			const dist = Math.abs(dx) + Math.abs(dz);
-			candidates.push({ pos: checkPos, dist });
+				const dist = Math.abs(dx) + Math.abs(dz);
+				if (dist >= 3) {
+					const targetX = gridX + (dx > 0 ? gridInterval : 0);
+					const targetZ = gridZ + (dz > 0 ? gridInterval : 0);
+					const gridScore = Math.abs(targetX - checkPos.x) + Math.abs(targetZ - checkPos.z);
+					candidates.push({ pos: checkPos, dist, gridScore });
+				}
+			} else {
+				const checkPos = agentPos.offset(dx, 0, dz);
+				const block = bot.blockAt(checkPos);
+				if (!isPlantable(block)) continue;
+
+				const above = bot.blockAt(checkPos.offset(0, 1, 0));
+				if (above && above.name !== "air") continue;
+
+				const dist = Math.abs(dx) + Math.abs(dz);
+				if (dist >= 2) {
+					const targetX = Math.floor(checkPos.x / gridInterval) * gridInterval;
+					const targetZ = Math.floor(checkPos.z / gridInterval) * gridInterval;
+					const gridScore = Math.abs(targetX - checkPos.x) + Math.abs(targetZ - checkPos.z);
+					candidates.push({ pos: checkPos, dist, gridScore });
+				}
+			}
 		}
 	}
 
-	candidates.sort((a, b) => a.dist - b.dist);
+	candidates.sort((a, b) => {
+		if (Math.abs(a.gridScore - b.gridScore) > 1) return a.gridScore - b.gridScore;
+		return a.dist - b.dist;
+	});
 	return candidates.map((c) => c.pos);
+}
+
+function isPlantable(block: any): boolean {
+	return block && (block.name === "dirt" || block.name === "grass_block");
 }
 
 export const woodScanner = {
