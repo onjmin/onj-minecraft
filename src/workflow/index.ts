@@ -4,7 +4,7 @@ import { buildingMountainSkill } from "../skills/building/mountain-base";
 import { buildingHouseSkill } from "../skills/building/starter-house";
 import { buildingUndergroundSkill } from "../skills/building/underground-base";
 import { collectDirtSkill } from "../skills/collecting/dirt";
-import { farmTendCropsSkill } from "../skills/collecting/farming";
+import { farmTendCropsSkill } from "../skills/farming/harvesting";
 import { huntAnimalsSkill } from "../skills/collecting/hunting";
 import { mineOresSkill } from "../skills/collecting/mining";
 import { stealFromChestSkill } from "../skills/collecting/stealing";

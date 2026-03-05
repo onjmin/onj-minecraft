@@ -3,112 +3,156 @@ import { goals } from "mineflayer-pathfinder";
 import type { Vec3 } from "vec3";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
-export const collectWoodSkill = createSkill<void, { count: number }>({
-    name: "collecting.wood",
-    description: "Automatically finds and fells nearby trees, including clearing leaves to move safely.",
-    inputSchema: {} as any,
-    handler: async ({ agent, signal }): Promise<SkillResponse<{ count: number }>> => {
-        const { bot } = agent;
-        const logs = woodScanner.findNearbyLogs(bot);
+export const collectWoodSkill = createSkill<void, { felledCount: number; plantedCount: number }>({
+	name: "collecting.wood",
+	description:
+		"Automatically finds and fells nearby trees, including clearing leaves to move safely. Also plants saplings on dirt/grass and uses bone meal to grow them.",
+	inputSchema: {} as any,
+	handler: async ({
+		agent,
+		signal,
+	}): Promise<SkillResponse<{ felledCount: number; plantedCount: number }>> => {
+		const { bot } = agent;
+		const logs = woodScanner.findNearbyLogs(bot);
 
-        if (logs.length === 0) return skillResult.fail("No trees found nearby.");
+		let felledCount = 0;
+		let plantedCount = 0;
 
-        let felledCount = 0;
+		if (logs.length > 0) {
+			try {
+				const target = logs[0];
+				const toolPlugin = (bot as any).tool;
 
-        try {
-            const target = logs[0];
-            const toolPlugin = (bot as any).tool;
+				const goal = new goals.GoalNear(target.x, target.y, target.z, 2);
+				await agent.abortableGoto(signal, goal);
 
-            // 木の上にいる場合を考慮し、目標地点の少し横まで移動を試みる
-            const goal = new goals.GoalNear(target.x, target.y, target.z, 2);
-            await agent.abortableGoto(signal, goal);
+				const blocksToRemove: Vec3[] = [];
+				for (let x = -1; x <= 1; x++) {
+					for (let z = -1; z <= 1; z++) {
+						for (let y = 0; y <= 6; y++) {
+							const pos = target.offset(x, y, z);
+							const b = bot.blockAt(pos);
+							if (b && (isLog(b.name) || isLeaves(b.name))) {
+								blocksToRemove.push(pos);
+							}
+						}
+					}
+				}
 
-            // 周辺のブロック（原木と葉っぱ）をスキャン
-            const blocksToRemove: Vec3[] = [];
-            // ターゲットの周囲（x,z: ±1, y: 0〜6）をチェックして、木に関連するブロックを収集
-            for (let x = -1; x <= 1; x++) {
-                for (let z = -1; z <= 1; z++) {
-                    for (let y = 0; y <= 6; y++) {
-                        const pos = target.offset(x, y, z);
-                        const b = bot.blockAt(pos);
-                        if (b && (isLog(b.name) || isLeaves(b.name))) {
-                            blocksToRemove.push(pos);
-                        }
-                    }
-                }
-            }
+				const botY = bot.entity.position.y;
+				blocksToRemove.sort((a, b) => {
+					const distA = Math.abs(a.y - (botY + 1.5));
+					const distB = Math.abs(b.y - (botY + 1.5));
+					return distA - distB;
+				});
 
-            // ボットの足元の高さを取得
-			const botY = bot.entity.position.y;
+				for (const pos of blocksToRemove) {
+					const block = bot.blockAt(pos);
+					if (block && block.name !== "air" && bot.canDigBlock(block)) {
+						if (toolPlugin) {
+							await toolPlugin.equipForBlock(block);
+						}
+						await agent.abortableDig(signal, block);
+						felledCount++;
+						await agent.pickupNearbyItems();
+					}
+				}
+			} catch (err) {
+				const errorMsg = err instanceof Error ? err.message : String(err);
+				if (errorMsg.includes("Cancelled") || errorMsg.includes("stop")) {
+					return skillResult.fail("Wood cancelled by combat");
+				}
+				return skillResult.fail(`Wood failed: ${errorMsg}`);
+			}
+		}
 
-			// ソート順の変更
-			blocksToRemove.sort((a, b) => {
-				// 1. まずは「ボットの手が届く範囲(y=0~2付近)」を優先したい
-				// 2. 次に「上」を掘っていく
-				// 3. 最後に「足元(y=-1以下)」を掘る
-				
-				// 単純な実装：ボットの目線の高さ(y + 1.6)に近いものから順にする
-				const distA = Math.abs(a.y - (botY + 1.5));
-				const distB = Math.abs(b.y - (botY + 1.5));
-				
-				return distA - distB;
-			});
+		const placeable = findPlaceableForSaplings(bot);
+		if (placeable.length > 0) {
+			const target = placeable[0];
+			await agent.abortableGoto(signal, new goals.GoalNear(target.x, target.y, target.z, 1));
 
-            for (const pos of blocksToRemove) {
-                const block = bot.blockAt(pos);
-                if (block && block.name !== 'air' && bot.canDigBlock(block)) {
-                    if (toolPlugin) {
-                        await toolPlugin.equipForBlock(block);
-                    }
-                    await agent.abortableDig(signal, block);
-                    felledCount++;
-                    // 落下やアイテムドロップを考慮
-                    await agent.pickupNearbyItems();
-                }
-            }
+			const sapling = bot.inventory.items().find((i) => i.name.endsWith("_sapling"));
+			if (sapling) {
+				const block = bot.blockAt(target);
+				if (block && (block.name === "dirt" || block.name === "grass_block")) {
+					await bot.equip(sapling, "hand");
+					const Vec3 = require("vec3");
+					await bot.placeBlock(block, new Vec3(0, 1, 0));
+					plantedCount++;
 
-            return skillResult.ok(
-                `Successfully cleared ${felledCount} blocks around ${target.x}, ${target.z}.`,
-                { count: felledCount },
-            );
-        } catch (err) {
-            const errorMsg = err instanceof Error ? err.message : String(err);
-            if (errorMsg.includes("Cancelled") || errorMsg.includes("stop")) {
-                return skillResult.fail("Wood cancelled by combat");
-            }
-            return skillResult.fail(`Wood failed: ${errorMsg}`);
-        }
-    },
+					const boneMeal = bot.inventory.items().find((i) => i.name === "bone_meal");
+					if (boneMeal) {
+						await bot.equip(boneMeal, "hand");
+						const saplingBlock = bot.blockAt(target.offset(0, 1, 0));
+						if (saplingBlock) {
+							try {
+								await bot.activateBlock(saplingBlock);
+								await new Promise((r) => setTimeout(r, 200));
+							} catch (e) {
+								agent.log(`[collecting.wood] Bone meal failed: ${e}`);
+							}
+						}
+					}
+				}
+			}
+		}
+
+		if (felledCount === 0 && plantedCount === 0) {
+			return skillResult.fail("No trees to fell and no suitable dirt/grass for planting.");
+		}
+
+		return skillResult.ok(`Felled ${felledCount} blocks, planted ${plantedCount} sapling(s).`, {
+			felledCount,
+			plantedCount,
+		});
+	},
 });
 
 function isLog(name: string): boolean {
-    return (
-        name.endsWith("_log") ||
-        name.endsWith("_wood") ||
-        name.endsWith("_stem") ||
-        name.endsWith("_hyphae")
-    );
+	return (
+		name.endsWith("_log") ||
+		name.endsWith("_wood") ||
+		name.endsWith("_stem") ||
+		name.endsWith("_hyphae")
+	);
 }
 
-// 葉っぱ判定の追加
 function isLeaves(name: string): boolean {
-    return (
-        name.endsWith("_leaves") ||
-        name.endsWith("_wart_block") ||
-        name === "shroomlight"
-    );
+	return name.endsWith("_leaves") || name.endsWith("_wart_block") || name === "shroomlight";
+}
+
+function findPlaceableForSaplings(bot: Bot, radius = 8): Vec3[] {
+	const candidates: { pos: Vec3; dist: number }[] = [];
+	const agentPos = bot.entity.position;
+
+	for (let dx = -radius; dx <= radius; dx++) {
+		for (let dz = -radius; dz <= radius; dz++) {
+			const checkPos = agentPos.offset(dx, 0, dz);
+			const block = bot.blockAt(checkPos);
+			if (!block || (block.name !== "dirt" && block.name !== "grass_block")) continue;
+
+			const above = bot.blockAt(checkPos.offset(0, 1, 0));
+			if (above && above.name !== "air") continue;
+
+			const dist = Math.abs(dx) + Math.abs(dz);
+			candidates.push({ pos: checkPos, dist });
+		}
+	}
+
+	candidates.sort((a, b) => a.dist - b.dist);
+	return candidates.map((c) => c.pos);
 }
 
 export const woodScanner = {
-    findNearbyLogs: (bot: Bot, radius = 24): Vec3[] => {
-        return bot
-            .findBlocks({
-                matching: (block: any) => isLog(block.name),
-                maxDistance: radius,
-                count: 10,
-            })
-            .sort((a, b) => {
-                return bot.entity.position.distanceTo(a) - bot.entity.position.distanceTo(b);
-            });
-    },
+	findNearbyLogs: (bot: Bot, radius = 24): Vec3[] => {
+		return bot
+			.findBlocks({
+				matching: (block: any) => isLog(block.name),
+				maxDistance: radius,
+				count: 10,
+			})
+			.sort((a, b) => {
+				return bot.entity.position.distanceTo(a) - bot.entity.position.distanceTo(b);
+			});
+	},
 };

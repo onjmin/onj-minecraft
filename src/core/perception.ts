@@ -55,7 +55,7 @@ export function createPerceptionSnapshot(
 
 			// 3. レジストリからバイオーム情報を取得
 			const biomeInfo = bot.registry.biomes[biomeId];
-			
+
 			// 4. 名前を取得（例: "plains"）
 			biomeName = biomeInfo?.name || bot.game.dimension || "unknown";
 		} catch (err) {

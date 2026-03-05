@@ -8,7 +8,7 @@ import { createSkill, type SkillResponse, skillResult } from "../types";
  * 農業ドメイン：作物の自動管理（収穫と再植え付け）を行います。
  */
 export const farmTendCropsSkill = createSkill<void, { harvestedCount: number }>({
-	name: "collecting.farming",
+	name: "farming.harvesting",
 	description:
 		"Automatically harvests fully grown crops and replants seeds in the vicinity. If you have dirt and there's water nearby but no available farmland, this will create new farmland. Decisions are made autonomously.",
 	inputSchema: {} as any,
