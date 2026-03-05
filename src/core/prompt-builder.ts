@@ -28,7 +28,7 @@ export interface ThinkingState {
 	skills?: {
 		name: string;
 		description: string;
-		usage: string;
+		args: string;
 	}[];
 
 	chatHistory?: string[];
@@ -120,7 +120,7 @@ function buildSkillSection(state: ThinkingState): string {
 	}
 
 	const skillText = state.skills
-		.map((s) => `- ${s.name}\n  Description: ${s.description}\n  Usage: ${s.usage}`)
+		.map((s) => `- ${s.name}(${s.args})\n  Description: ${s.description}`)
 		.join("\n");
 
 	return `

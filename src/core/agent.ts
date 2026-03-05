@@ -583,7 +583,7 @@ export class MinecraftAgent {
 			return {
 				name: t.name,
 				description: t.description,
-				usage: argsInfo,
+				args: argsInfo,
 			};
 		});
 
