@@ -322,17 +322,14 @@ export class MinecraftAgent {
 		if (entity === this.bot.entity) {
 			const attacker = this.bot.nearestEntity(
 				(e) =>
-					(e.type === "mob" || e.type === "hostile" || e.type === "player") &&
+					(e.type === "mob" || e.type === "hostile") &&
 					e.position.distanceTo(this.bot.entity.position) < 16,
 			);
 			this.lastDamageCause = attacker
 				? `Attacked by ${attacker.name || attacker.type}`
 				: "Taken damage from unknown source";
 
-			if (
-				attacker &&
-				(attacker.type === "mob" || attacker.type === "hostile" || attacker.type === "player")
-			) {
+			if (attacker && (attacker.type === "mob" || attacker.type === "hostile")) {
 				this.enterCombat(attacker);
 			}
 		}
