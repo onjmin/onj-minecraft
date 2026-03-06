@@ -73,7 +73,7 @@ export class MinecraftAgent {
 	private combatTarget: any = null;
 
 	private chatHistory: ChatLog[] = [];
-	private maxChatHistory = 10;
+	private maxChatHistory = 3;
 
 	private chatSimhashCache: Map<string, number[]> = new Map();
 	private rationaleSimhashCache: Map<string, number[]> = new Map();
