@@ -27,7 +27,7 @@ export const craftSmeltingSkill = createSkill<void, { item: string; amount: numb
 		// 2. 精錬対象（Input）の厳密な判定
 		// かまどのレシピデータにそのアイテムが材料として含まれているかを確認
 		const smeltable = items.find((item) => {
-			const recipes = bot.recipesAll(item.type, -1, 1, furnaceBlock);
+			const recipes = bot.recipesAll(item.type, 1, false);
 			return recipes.length > 0;
 		});
 
@@ -40,7 +40,9 @@ export const craftSmeltingSkill = createSkill<void, { item: string; amount: numb
 		const fuel = items.find((item) => {
 			const name = item.name;
 			return (
-				["coal", "charcoal", "coal_block", "lava_bucket", "blaze_rod"].includes(name) ||
+				["coal", "charcoal", "coal_block", "lava_bucket", "blaze_rod", "dead_bush"].includes(
+					name,
+				) ||
 				name.endsWith("_planks") ||
 				name.endsWith("_log") ||
 				name.endsWith("_wood") ||

@@ -172,7 +172,7 @@ function isLog(name: string): boolean {
 }
 
 function isLeaves(name: string): boolean {
-	return name.endsWith("_leaves") || name.endsWith("_wart_block") || name === "shroomlight";
+	return name.endsWith("_leaves") || name.endsWith("_wart_block") || name === "shroomlight" || name === "dead_bush";
 }
 
 function findPlaceableForSaplings(bot: Bot, radius: number, isQuad: boolean): Vec3[] {
