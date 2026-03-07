@@ -940,34 +940,42 @@ export class MinecraftAgent {
 				stuckCount = 0;
 			}
 			if (stuckCount >= 2) {
-				this.log(`Pathfinding: Stuck detected, recalculating with offset...`);
+				this.log(`Pathfinding: Stuck detected...`);
+
+				const pos = this.bot.entity.position;
+				const block = this.bot.blockAt(pos);
+				const inWater = block?.name === "water" || (this.bot.entity as any).isInWater;
 
 				// 1. Pathfinderを停止
 				const currentGoal = this.bot.pathfinder.goal;
 				this.bot.pathfinder.setGoal(null);
-
-				// 2. 一旦「後ろ」に下がって角から離れる（跳ね返り防止）
 				this.bot.clearControlStates();
-				this.bot.setControlState("back", true);
 
-				setTimeout(() => {
-					this.bot.setControlState("back", false);
-
-					// 3. 少し横（例えば右）を向きつつ、ジャンプして前進
-					// これにより「角」を斜めに飛び越える挙動になる
+				if (inWater) {
+					// 【水中リカバリ】とにかく上を目指して前進
 					this.bot.setControlState("jump", true);
 					this.bot.setControlState("forward", true);
-					this.bot.setControlState("right", true);
 
 					setTimeout(() => {
+						this.bot.setControlState("jump", false);
 						this.bot.clearControlStates();
-						// 4. 再計算させて復帰
-						if (currentGoal) {
-							this.bot.pathfinder.setGoal(currentGoal);
-						}
-					}, 400); // ジャンプ前進の時間
-				}, 200); // 後退の時間
+						if (currentGoal) this.bot.pathfinder.setGoal(currentGoal);
+					}, 1000); // 水中なら少し長めに（1秒程度）浮上を試みる
+				} else {
+					// 【陸上リカバリ】既存の「後ろに下がって斜めジャンプ」
+					this.bot.setControlState("back", true);
+					setTimeout(() => {
+						this.bot.setControlState("back", false);
+						this.bot.setControlState("jump", true);
+						this.bot.setControlState("forward", true);
+						this.bot.setControlState("right", true);
 
+						setTimeout(() => {
+							this.bot.clearControlStates();
+							if (currentGoal) this.bot.pathfinder.setGoal(currentGoal);
+						}, 400);
+					}, 200);
+				}
 				stuckCount = 0;
 			}
 			lastPos = currentPos.clone();
