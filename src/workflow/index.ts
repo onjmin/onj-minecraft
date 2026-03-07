@@ -20,6 +20,7 @@ import { exploreUndergroundSkill } from "../skills/exploring/underground";
 import { gotoBaseSkill } from "../skills/goto/base";
 import { gotoCoordsSkill } from "../skills/goto/coords";
 import { gotoPlayerSkill } from "../skills/goto/player";
+import { gotoSurfaceSkill } from "../skills/goto/surface";
 
 const allSkills = [
 	// --- Collecting Domain (With integrated Eat/Equip routine) ---
@@ -51,6 +52,7 @@ const allSkills = [
 	gotoCoordsSkill, // 座標へ移動
 	gotoBaseSkill, // 拠点帰還
 	gotoPlayerSkill, // プレイヤーへ移動
+	gotoSurfaceSkill, // 地上へ移動
 ];
 /**
  * Initialize and start all agents
