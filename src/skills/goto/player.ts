@@ -23,6 +23,8 @@ export const gotoPlayerSkill = createSkill<void, { target: string; distance: num
 		let minDist = Infinity;
 
 		for (const player of players) {
+			// 自分自身を除外
+			if (player.username === bot.username) continue;
 			if (!player.entity) continue;
 			const dist = botPos.distanceTo(player.entity.position);
 			if (dist < minDist) {
