@@ -244,7 +244,6 @@ export class MinecraftAgent {
 		movements.allowParkour = true; // ジャンプが必要な地形に対応
 		movements.allowFreeMotion = true;
 		movements.maxDropDown = 4; // 4ブロックまでの落下を許容
-		movements.stepHeight = 2;
 
 		// --- 修正ポイント：破壊不可能なリストから「土」や「葉っぱ」を除去する ---
 		const diggableNames = ["dirt", "grass_block", "sand", "gravel", "oak_leaves", "birch_leaves"];
@@ -284,14 +283,11 @@ export class MinecraftAgent {
 
 		// 3. movements に反映
 		movements.scafoldingBlocks = Array.from(buildableBlockIds);
-		movements.walkSpeed = 1.5;
 		movements.digCost = 1;
 
 		this.bot.pathfinder.setMovements(movements);
 		this.bot.pathfinder.thinkTimeout = 5000;
 		this.bot.pathfinder.tickTimeout = 100;
-
-		this.bot.physics.speed = 1.5;
 
 		if ((this.bot as any).collectBlock) {
 			(this.bot as any).collectBlock.movements = movements;
