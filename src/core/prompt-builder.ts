@@ -44,6 +44,7 @@ export function buildThinkingPrompt(state: ThinkingState): string {
 	const sections: string[] = [];
 
 	sections.push(buildIdentitySection(state));
+	sections.push(buildAgentRulesSection());
 	sections.push(buildEnvironmentSection(state));
 	sections.push(buildInventorySection(state));
 	sections.push(buildStrategicSection(state));
@@ -61,6 +62,17 @@ You are ${state.profile.name}, an autonomous Minecraft agent.
 Personality: ${state.profile.personality ?? "calm, rational, survival-focused"}.
 
 Think strategically and act efficiently.
+`.trim();
+}
+
+function buildAgentRulesSection(): string {
+	return `
+=== AGENT RULES ===
+If the same skill fails repeatedly or produces no progress for 3 consecutive steps, treat the strategy as stalled and update it instead of repeating the same action.
+
+When a strategy is stalled, prioritize movement or exploration skills to change the environment (e.g., explore_land, goto.player, goto.surface, explore_underground) before attempting the same resource task again.
+
+Never repeat a skill that failed twice in the same environment unless the environment has changed.
 `.trim();
 }
 
