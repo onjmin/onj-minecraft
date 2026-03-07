@@ -17,7 +17,6 @@ export const gotoCoordsSkill = createSkill<
 		signal,
 		args,
 	}): Promise<SkillResponse<{ x: number; y: number; z: number }>> => {
-		const { bot } = agent;
 		const { x, y, z } = args;
 
 		agent.log(`[goto.coords] Moving to (${x}, ${y}, ${z})`);

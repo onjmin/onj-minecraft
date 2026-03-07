@@ -18,8 +18,16 @@ export async function tryPlaceBlock(
 	itemName: string,
 	blockId: number,
 	agent: MinecraftAgent,
+	targetPos?: Vec3,
 ): Promise<Block | null> {
-	const positions = findAllPlaceablePositions(bot) as PlaceableBlock[];
+	let positions: PlaceableBlock[];
+	if (targetPos) {
+		const block = bot.blockAt(targetPos.offset(0, -1, 0)); // 下のブロックを土台にする
+		if (!block) return null;
+		positions = [block as PlaceableBlock];
+	} else {
+		positions = findAllPlaceablePositions(bot) as PlaceableBlock[];
+	}
 	agent.log(`[tryPlaceBlock] Found ${positions.length} positions`);
 
 	if (positions.length === 0) {
@@ -442,5 +450,5 @@ export async function ensurePlanks(agent: MinecraftAgent, minCount = 4): Promise
 	const planksAfter = bot.inventory.items().find((i) => i.name.endsWith("_planks"));
 	agent.log(`[ensurePlanks] After crafting: count=${planksAfter?.count || 0}`);
 
-	return planksAfter && planksAfter.count >= minCount;
+	return Boolean(planksAfter && planksAfter.count >= minCount);
 }

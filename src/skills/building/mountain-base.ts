@@ -1,4 +1,5 @@
 import { goals } from "mineflayer-pathfinder";
+import { Vec3 } from "vec3";
 import { ensureCraftingTable, ensureFurnace, tryPlaceBlock } from "../crafting/util";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
@@ -12,254 +13,135 @@ export const buildingMountainSkill = createSkill<void, { baseId: string; items: 
 		signal,
 	}): Promise<SkillResponse<{ baseId: string; items: string[] }>> => {
 		const { bot } = agent;
-		const pos = bot.entity.position;
 		const toolPlugin = (bot as any).tool;
+		// 座標を整数に固定
+		const startPos = bot.entity.position.floored();
 
-		agent.log(
-			"[building.mountain] Started at position:",
-			Math.floor(pos.x),
-			Math.floor(pos.y),
-			Math.floor(pos.z),
-		);
+		agent.log(`[building.mountain] Started at ${startPos}`);
 
-		const digTargets = [
-			{ x: 1, y: 0, z: 0 },
-			{ x: 2, y: 0, z: 0 },
-			{ x: 3, y: 0, z: 0 },
-			{ x: 1, y: 1, z: 0 },
-			{ x: 2, y: 1, z: 0 },
-			{ x: 3, y: 1, z: 0 },
-			{ x: 1, y: -1, z: 0 },
-			{ x: 2, y: -1, z: 0 },
-			{ x: 3, y: -1, z: 0 },
-			{ x: 1, y: 0, z: 1 },
-			{ x: 2, y: 0, z: 1 },
-			{ x: 3, y: 0, z: 1 },
-			{ x: 1, y: 0, z: -1 },
-			{ x: 2, y: 0, z: -1 },
-			{ x: 3, y: 0, z: -1 },
+		// 掘削ターゲット（正面3マス × 高さ2マス × 幅3マス程度の空間を確保）
+		// 相対座標をVec3インスタンスとして定義
+		const digOffsets = [
+			// 正面中央
+			new Vec3(1, 0, 0),
+			new Vec3(2, 0, 0),
+			new Vec3(1, 1, 0),
+			new Vec3(2, 1, 0),
+			// 正面左右（幅を広げる）
+			new Vec3(1, 0, 1),
+			new Vec3(2, 0, 1),
+			new Vec3(1, 1, 1),
+			new Vec3(2, 1, 1),
+			new Vec3(1, 0, -1),
+			new Vec3(2, 0, -1),
+			new Vec3(1, 1, -1),
+			new Vec3(2, 1, -1),
 		];
-
-		agent.log("[building.mountain] Phase 0a: Checking floor stability...");
-		const unstableFloorBlocks = ["water", "lava", "air", "void_air", "cave_air"];
-		const floorCheckTargets = [
-			{ x: 0, y: 0, z: 0 },
-			{ x: 1, y: 0, z: 0 },
-			{ x: 2, y: 0, z: 0 },
-			{ x: 3, y: 0, z: 0 },
-		];
-		for (const offset of floorCheckTargets) {
-			const targetPos = pos.offset(offset.x, offset.y, offset.z);
-			const groundPos = targetPos.offset(0, -1, 0);
-			const groundBlock = bot.blockAt(groundPos);
-			if (!groundBlock || unstableFloorBlocks.includes(groundBlock.name)) {
-				agent.log(
-					`[building.mountain] Failed: Unstable floor at ${offset.x},${offset.z}: ${groundBlock?.name || "none"}`,
-				);
-				return skillResult.fail(
-					`Cannot build here: floor is unstable (${groundBlock?.name || "air"}).`,
-				);
-			}
-		}
-
-		agent.log("[building.mountain] Phase 0b: Checking for unbreakable blocks...");
-		const unbreakableBlocks = [
-			"bedrock",
-			"obsidian",
-			"end_portal",
-			"end_gateway",
-			"portal",
-			"command_block",
-			"repeating_command_block",
-			"chain_command_block",
-			"structure_block",
-			"jigsaw",
-		];
-		for (const offset of digTargets) {
-			const targetPos = pos.offset(offset.x, offset.y, offset.z);
-			const block = bot.blockAt(targetPos);
-			if (
-				block &&
-				block.name !== "air" &&
-				(unbreakableBlocks.includes(block.name) || !bot.canDigBlock(block))
-			) {
-				agent.log(
-					`[building.mountain] Failed: Cannot break ${block.name} at ${offset.x},${offset.y},${offset.z}`,
-				);
-				return skillResult.fail(
-					`Cannot build here: ${block.name} blocks the way and cannot be broken.`,
-				);
-			}
-		}
-		agent.log("[building.mountain] Phase 0: Location check passed");
 
 		let dugCount = 0;
-		for (const offset of digTargets) {
-			if (agent.checkAbort(signal)) break;
-			const targetPos = pos.offset(offset.x, offset.y, offset.z);
-			const block = bot.blockAt(targetPos);
-			if (!block || block.name === "air") continue;
-			if (["water", "lava", "bedrock"].includes(block.name)) continue;
-			if (!bot.canDigBlock(block)) continue;
+		let airCount = 0;
 
-			await agent.abortableGoto(
-				signal,
-				new goals.GoalNear(targetPos.x, targetPos.y, targetPos.z, 1),
-			);
-			const currentBlock = bot.blockAt(targetPos);
-			if (currentBlock && currentBlock.name !== "air" && bot.canDigBlock(currentBlock)) {
-				if (toolPlugin) await toolPlugin.equipForBlock(currentBlock);
-				await agent.abortableDig(signal, currentBlock);
+		agent.log("[building.mountain] Phase 1: Excavating cave...");
+		for (const offset of digOffsets) {
+			if (agent.checkAbort(signal)) break;
+			const targetPos = startPos.plus(offset);
+			const block = bot.blockAt(targetPos);
+
+			if (!block || block.name === "air" || block.name.includes("air")) {
+				airCount++;
+				continue;
+			}
+
+			// 掘削不可ブロックのチェック
+			if (["bedrock", "barrier", "obsidian"].includes(block.name)) continue;
+
+			try {
+				// 掘削位置に近づくが、重ならないようにする
+				await bot.pathfinder.setGoal(new goals.GoalLookAtBlock(targetPos, bot.world));
+
+				if (toolPlugin) await toolPlugin.equipForBlock(block);
+				await bot.dig(block);
 				dugCount++;
-				await agent.pickupNearbyItems();
+			} catch (e) {
+				agent.log(`[building.mountain] Digging failed at ${offset}: ${e}`);
 			}
 		}
 
-		if (dugCount < 6) {
-			return skillResult.fail(`Not enough space dug. Need at least 6 blocks, got ${dugCount}.`);
+		// 空間が確保されているか（掘った数 + もともと空気だった数）
+		if (dugCount + airCount < 4) {
+			return skillResult.fail(
+				`Failed to secure enough space. (Dug: ${dugCount}, Air: ${airCount})`,
+			);
 		}
-
-		agent.log("[building.mountain] Phase 1b: Placing dirt walls...");
-		const dirtBlocks = ["dirt", "grass_block"];
-		const wallTargets = [
-			{ x: 4, y: 0, z: 0 },
-			{ x: 4, y: 1, z: 0 },
-			{ x: 4, y: -1, z: 0 },
-			{ x: 4, y: 0, z: 1 },
-			{ x: 4, y: 0, z: -1 },
-		];
-		let wallCount = 0;
-		for (const offset of wallTargets) {
-			if (agent.checkAbort(signal)) break;
-			const targetPos = pos.offset(offset.x, offset.y, offset.z);
-			const block = bot.blockAt(targetPos);
-			const groundPos = targetPos.offset(0, -1, 0);
-			const groundBlock = bot.blockAt(groundPos);
-			if (block && block.name === "air" && groundBlock && groundBlock.name !== "air") {
-				const dirt = bot.inventory.items().find((i) => dirtBlocks.includes(i.name));
-				if (dirt) {
-					await bot.equip(dirt, "hand");
-					try {
-						await bot.placeBlock(groundBlock, new (require("vec3"))(0, 1, 0));
-						wallCount++;
-					} catch (e) {}
-				}
-			}
-		}
-		agent.log(`[building.mountain] Placed ${wallCount} wall blocks`);
 
 		const installedItems: string[] = ["space"];
 
+		// Phase 2: ユーティリティ設置 (あるものだけでOK、設置失敗も許容)
+		agent.log("[building.mountain] Phase 2: Installing utilities...");
+
+		// 松明の設置 (足元ではなく、掘った穴の奥の壁や床)
 		const torchItem = bot.inventory.items().find((i) => i.name === "torch");
 		if (torchItem) {
-			await bot.equip(torchItem, "hand");
-			const centerPos = pos.offset(2, 1, 0);
-			const blockAtCenter = bot.blockAt(centerPos);
-			if (blockAtCenter && blockAtCenter.name === "air") {
-				try {
-					await bot.placeBlock(blockAtCenter, new (require("vec3"))(0, -1, 0));
-					installedItems.push("torch");
-				} catch (e) {}
+			const torchPos = startPos.offset(2, 0, 0);
+			const success = await tryPlaceBlock(
+				bot,
+				"torch",
+				bot.registry.blocksByName.torch.id,
+				agent,
+				torchPos,
+			);
+
+			if (success) {
+				installedItems.push("torch");
+				agent.log(`[building.mountain] Torch placed at ${torchPos}`);
 			}
 		}
-		if (!installedItems.includes("torch")) {
-			return skillResult.fail("Failed to place torch. Cannot proceed without light.");
+
+		// 作業台と竃 (ユーティリティ関数の活用)
+		try {
+			const table = await ensureCraftingTable(agent);
+			if (table) installedItems.push("crafting_table");
+
+			const furnace = await ensureFurnace(agent);
+			if (furnace) installedItems.push("furnace");
+		} catch {
+			agent.log("[building.mountain] Utility placement encountered an error, continuing...");
 		}
 
-		const table = await ensureCraftingTable(agent);
-		if (!table) {
-			return skillResult.fail("Failed to place crafting table.");
-		}
-		installedItems.push("crafting_table");
+		// チェストとドア (あれば設置)
+		const optionalItems = [
+			{ name: "chest", id: bot.registry.blocksByName.chest?.id },
+			{ name: "door", id: bot.inventory.items().find((i) => i.name.endsWith("_door"))?.type },
+		];
 
-		const furnace = await ensureFurnace(agent);
-		if (!furnace) {
-			return skillResult.fail("Failed to place furnace.");
-		}
-		installedItems.push("furnace");
-
-		const chestItem = bot.inventory.items().find((i) => i.name === "chest");
-		if (chestItem) {
-			const placed = await tryPlaceBlock(bot, "chest", bot.registry.blocksByName.chest.id, agent);
-			if (placed) installedItems.push("chest");
+		for (const item of optionalItems) {
+			if (item.id) {
+				const success = await tryPlaceBlock(bot, item.name, item.id, agent);
+				if (success) installedItems.push(item.name);
+			}
 		}
 
-		const doorItem = bot.inventory.items().find((i) => i.name.endsWith("_door"));
-		if (doorItem) {
-			const placed = await tryPlaceBlock(
-				bot,
-				doorItem.name,
-				bot.registry.blocksByName[doorItem.name].id,
-				agent,
-			);
-			if (placed) installedItems.push("door");
-		}
-
+		// Phase 3: 拠点の登録
 		const baseId = `mountain_${Date.now()}`;
 		const registered = agent.addBase({
 			id: baseId,
-			type: "mountain",
-			position: { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) },
+			type: "mountain-cave",
+			position: { x: startPos.x, y: startPos.y, z: startPos.z },
 			safe: true,
-			functional: true,
+			functional: installedItems.includes("crafting_table"),
 			hasStorage: installedItems.includes("chest"),
 		});
 
 		if (!registered) {
-			return skillResult.fail("Base too close to existing base. Choose a different location.");
+			return skillResult.fail("Base location rejected by agent (too close to another base).");
 		}
 
-		agent.log(`[building.mountain] Base ${baseId} registered: ${installedItems.join(", ")}`);
-
-		agent.log("[building.mountain] Phase 2: Initial maintenance...");
-		const maintenanceActions: string[] = [];
-
-		const torchCenterPos = pos.offset(2, 1, 0);
-		const blockAtTorch = bot.blockAt(torchCenterPos);
-		if (!blockAtTorch || blockAtTorch.name !== "torch") {
-			const torchItem = bot.inventory.items().find((i) => i.name === "torch");
-			if (torchItem) {
-				await bot.equip(torchItem, "hand");
-				const groundPos = torchCenterPos.offset(0, -1, 0);
-				const groundBlock = bot.blockAt(groundPos);
-				if (groundBlock && groundBlock.name !== "air") {
-					try {
-						await bot.placeBlock(groundBlock, new (require("vec3"))(0, -1, 0));
-						maintenanceActions.push("torch_placed");
-					} catch (e) {}
-				}
-			}
-		}
-
-		let repairedCount = 0;
-		for (const offset of wallTargets) {
-			const targetPos = pos.offset(offset.x, offset.y, offset.z);
-			const block = bot.blockAt(targetPos);
-			const groundPos = targetPos.offset(0, -1, 0);
-			const groundBlock = bot.blockAt(groundPos);
-			if (!block || block.name === "air") {
-				if (groundBlock && groundBlock.name !== "air") {
-					const dirt = bot.inventory.items().find((i) => dirtBlocks.includes(i.name));
-					if (dirt) {
-						await bot.equip(dirt, "hand");
-						try {
-							await bot.placeBlock(groundBlock, new (require("vec3"))(0, 1, 0));
-							repairedCount++;
-						} catch (e) {}
-					}
-				}
-			}
-		}
-		if (repairedCount > 0) {
-			maintenanceActions.push(`walls_repaired:${repairedCount}`);
-		}
-
-		const finalItems = [...installedItems, ...maintenanceActions];
-		agent.log(`[building.mountain] Maintenance: ${maintenanceActions.join(", ")}`);
-
-		return skillResult.ok(`Built mountain base. Items: ${finalItems.join(", ")}`, {
-			baseId,
-			items: finalItems,
-		});
+		return skillResult.ok(
+			`Mountain base established. Space secured and items installed: ${installedItems.join(", ")}`,
+			{
+				baseId,
+				items: installedItems,
+			},
+		);
 	},
 });

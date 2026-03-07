@@ -58,7 +58,7 @@ export function createPerceptionSnapshot(
 
 			// 4. 名前を取得（例: "plains"）
 			biomeName = biomeInfo?.name || bot.game.dimension || "unknown";
-		} catch (err) {
+		} catch {
 			// まだチャンクが読み込まれていない場合はここに来る
 			biomeName = bot.game.dimension || "unknown";
 		}

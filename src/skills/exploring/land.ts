@@ -81,7 +81,7 @@ export const exploreLandSkill = createSkill<void, { x: number; z: number }>({
 			]);
 
 			return skillResult.ok("Reached destination.", { x: targetPos.x, z: targetPos.z });
-		} catch (err) {
+		} catch {
 			// --- 3. リカバリ (スタック解除) ---
 			bot.clearControlStates();
 			// 失敗時は少し後ろに下がってジャンプ（挟まり防止）

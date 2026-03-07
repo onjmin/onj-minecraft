@@ -8,7 +8,7 @@ import { exploreLandSkill } from "../skills/exploring/land";
 import type { SkillResponse } from "../skills/types";
 import { llm } from "./llm-client";
 import { parseLlmOutput } from "./llm-output-parser";
-import { createPerceptionSnapshot } from "./perception";
+import { createPerceptionSnapshot, type DamageInfo } from "./perception";
 import { buildThinkingPrompt } from "./prompt-builder";
 import { emitDiscordWebhook, translateWithRoleplay } from "./utils/discord-webhook";
 import { isSameSimhash } from "./utils/simhash";
@@ -64,7 +64,7 @@ export class MinecraftAgent {
 	private currentTaskName: string = "idle";
 	private observationHistory: ObservationRecord[] = [];
 	private maxHistory = 3;
-	private lastDamageCause: string = "None";
+	private lastDamageCause: DamageInfo = { type: "fall" };
 	private hasSetSkin: boolean = false;
 	private latestRationale: string = "";
 	private isInCombat: boolean = false;
@@ -326,8 +326,8 @@ export class MinecraftAgent {
 					e.position.distanceTo(this.bot.entity.position) < 16,
 			);
 			this.lastDamageCause = attacker
-				? `Attacked by ${attacker.name || attacker.type}`
-				: "Taken damage from unknown source";
+				? { type: "attack", attacker: attacker.name || attacker.type }
+				: { type: "attack", attacker: "unknown" };
 
 			if (attacker && (attacker.type === "mob" || attacker.type === "hostile")) {
 				this.enterCombat(attacker);
@@ -405,20 +405,20 @@ export class MinecraftAgent {
 
 		// 落下判定
 		if (!entity.onGround && entity.velocity.y < -0.6) {
-			this.lastDamageCause = "Falling";
+			this.lastDamageCause = { type: "fall" };
 		}
 
 		// 環境判定
 		const blockAtFeet = this.bot.blockAt(entity.position);
 		if (blockAtFeet) {
-			if (blockAtFeet.name === "lava") this.lastDamageCause = "Burning in Lava";
-			else if (blockAtFeet.name === "fire") this.lastDamageCause = "Burning in Fire";
+			if (blockAtFeet.name === "lava") this.lastDamageCause = { type: "lava" };
+			else if (blockAtFeet.name === "fire") this.lastDamageCause = { type: "fire" };
 		}
 
 		// 窒息判定
 		const oxygen = (this.bot as any).oxygenLevel;
 		if (oxygen !== undefined && oxygen <= 0) {
-			this.lastDamageCause = "Drowning/Suffocating";
+			this.lastDamageCause = { type: "drowning" };
 		}
 	}
 
@@ -1065,7 +1065,7 @@ export class MinecraftAgent {
 								await this.bot.pathfinder.goto(goal);
 								this.log("Moved to land successfully");
 								return;
-							} catch (e) {}
+							} catch {}
 						}
 					}
 				}

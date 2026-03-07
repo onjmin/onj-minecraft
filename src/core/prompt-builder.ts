@@ -1,3 +1,5 @@
+import { type DamageInfo } from "./perception";
+
 export interface ThinkingState {
 	profile: {
 		name: string;
@@ -33,7 +35,7 @@ export interface ThinkingState {
 
 	chatHistory?: string[];
 
-	lastDamageCause?: string;
+	lastDamageCause?: DamageInfo;
 
 	memorySummary?: string;
 }
@@ -80,7 +82,7 @@ Nearby Players: ${formatList(e.nearbyPlayers)}
 Nearby Mobs: ${formatList(e.nearbyMobs)}
 Nearby Blocks (sample): ${e.nearbyBlocks ?? "None"}
 
-Last Damage Cause: ${state.lastDamageCause ?? "none"}
+Last Damage Cause: ${state.lastDamageCause ? `${state.lastDamageCause.type}${state.lastDamageCause.attacker ? ` by ${state.lastDamageCause.attacker}` : ""}` : "none"}
 `.trim();
 }
 
