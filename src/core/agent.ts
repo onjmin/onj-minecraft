@@ -456,10 +456,10 @@ export class MinecraftAgent {
 						this.currentAbort.abort();
 					}
 
-					await this.ensureOnLand();
-
 					const controller = new AbortController();
 					this.currentAbort = controller;
+
+					await this.ensureOnLand(controller.signal);
 
 					let result: SkillResponse | undefined;
 
@@ -999,7 +999,7 @@ export class MinecraftAgent {
 		}
 	}
 
-	public async pickupNearbyItems(): Promise<void> {
+	public async pickupNearbyItems(signal: AbortSignal): Promise<void> {
 		const distance = 8;
 		const getNearestItem = () => {
 			return Object.values(this.bot.entities).find(
@@ -1012,7 +1012,7 @@ export class MinecraftAgent {
 
 		while (nearestItem && pickedUp < 10) {
 			try {
-				await this.bot.pathfinder.goto(new goals.GoalFollow(nearestItem, 1));
+				await this.abortableGoto(signal, new goals.GoalFollow(nearestItem, 1));
 				await new Promise((resolve) => setTimeout(resolve, 200));
 				nearestItem = getNearestItem();
 				pickedUp++;
@@ -1025,7 +1025,7 @@ export class MinecraftAgent {
 	/**
 	 * 人間の目に近づけた明るさ知覚
 	 */
-	private async ensureOnLand(): Promise<void> {
+	private async ensureOnLand(signal: AbortSignal): Promise<void> {
 		const { bot } = this;
 		const pos = bot.entity.position;
 		const blockAtFeet = bot.blockAt(pos);
@@ -1058,7 +1058,7 @@ export class MinecraftAgent {
 							this.log(`Found land at ${checkPos}, moving...`);
 							try {
 								const goal = new goals.GoalNear(checkPos.x, checkPos.y, checkPos.z, 1);
-								await this.bot.pathfinder.goto(goal);
+								await this.abortableGoto(signal, goal);
 								this.log("Moved to land successfully");
 								return;
 							} catch {}

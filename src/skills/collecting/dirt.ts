@@ -41,7 +41,7 @@ export const collectDirtSkill = createSkill<void, { count: number }>({
 				}
 				await agent.abortableDig(signal, currentBlock);
 				collected++;
-				await agent.pickupNearbyItems();
+				await agent.pickupNearbyItems(signal);
 			}
 		}
 

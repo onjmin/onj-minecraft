@@ -78,7 +78,7 @@ export const buildingUndergroundSkill = createSkill<void, { baseId: string; item
 				if (toolPlugin) await toolPlugin.equipForBlock(block);
 				await agent.abortableDig(signal, block);
 				dugCount++;
-				await agent.pickupNearbyItems();
+				await agent.pickupNearbyItems(signal);
 			} catch (e) {
 				agent.log(`Failed to dig at ${offset}: ${e}`);
 			}

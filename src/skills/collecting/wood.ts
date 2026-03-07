@@ -75,7 +75,7 @@ export const collectWoodSkill = createSkill<void, { felledCount: number; planted
 						}
 						await agent.abortableDig(signal, block);
 						felledCount++;
-						await agent.pickupNearbyItems();
+						await agent.pickupNearbyItems(signal);
 					}
 				}
 			} catch (err) {
