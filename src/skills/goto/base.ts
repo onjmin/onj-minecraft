@@ -11,6 +11,7 @@ export const gotoBaseSkill = createSkill<void, { baseId: string; reason: string 
 		signal,
 	}): Promise<SkillResponse<{ baseId: string; reason: string }>> => {
 		const { bot } = agent;
+		if (!bot.entity) return skillResult.fail("Bot entity not loaded");
 		const bases = agent.getBases();
 
 		if (bases.length === 0) {
