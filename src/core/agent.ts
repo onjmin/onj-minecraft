@@ -78,6 +78,9 @@ export class MinecraftAgent {
 	private chatSimhashCache: Map<string, number[]> = new Map();
 	private rationaleSimhashCache: Map<string, number[]> = new Map();
 
+	private isReconnecting: boolean = false;
+	private hasStartedLoops: boolean = false;
+
 	private currentGoal: goals.Goal | null = null;
 
 	private currentAbort?: AbortController;
@@ -193,9 +196,11 @@ export class MinecraftAgent {
 			this.log("First spawn - Initializing pathfinder");
 			this.setupPathfinderConfig();
 
-			// ループは初回のスポーン時に一度だけ開始
-			this.startReflexLoop();
-			this.startThinkingLoop();
+			if (!this.hasStartedLoops) {
+				this.hasStartedLoops = true;
+				this.startReflexLoop();
+				this.startThinkingLoop();
+			}
 		});
 
 		this.bot.on("spawn", () => {
@@ -229,6 +234,130 @@ export class MinecraftAgent {
 				this.chatHistory.shift();
 			}
 		});
+
+		this.bot.on("kicked", (reason: string, loggedIn: boolean) => {
+			this.log(`Kicked from server: ${reason}, loggedIn: ${loggedIn}`);
+			this.handleDisconnect("kicked");
+		});
+
+		this.bot.on("end", (reason: string) => {
+			this.log(`Disconnected: ${reason}`);
+			this.handleDisconnect(reason);
+		});
+
+		this.bot.on("error", (err: Error) => {
+			this.log(`Bot error: ${err.message}`);
+			if (err.message.includes("ECONNREFUSED") || err.message.includes("socket")) {
+				this.handleDisconnect("error");
+			}
+		});
+	}
+
+	private async handleDisconnect(reason: string) {
+		if (this.isReconnecting) return;
+		this.isReconnecting = true;
+
+		this.log(`Handling disconnect: ${reason}`);
+
+		this.cancelAllTasks();
+
+		await this.reconnect();
+	}
+
+	private async reconnect() {
+		const RECONNECT_DELAY = 5000;
+		const MAX_RETRIES = 10;
+
+		this.log(`Reconnecting in ${RECONNECT_DELAY / 1000} seconds...`);
+
+		for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+			try {
+				await new Promise((resolve) => setTimeout(resolve, RECONNECT_DELAY));
+
+				this.log(`Reconnect attempt ${attempt}/${MAX_RETRIES}...`);
+
+				this.bot = mineflayer.createBot({
+					host: process.env.MINECRAFT_HOST,
+					port: Number(process.env.MINECRAFT_PORT),
+					username: this.profile.minecraftName,
+					auth: "offline",
+				});
+
+				this.bot.loadPlugin(pathfinder);
+
+				tryLoad(this.bot, "autoEat", require("mineflayer-auto-eat"));
+				tryLoad(this.bot, "armorManager", require("mineflayer-armor-manager"));
+				tryLoad(this.bot, "pvp", require("mineflayer-pvp"));
+				tryLoad(this.bot, "collectblock", require("mineflayer-collectblock"));
+				tryLoad(this.bot, "tool", require("mineflayer-tool"));
+
+				if ((this.bot as any).autoEat) {
+					(this.bot as any).autoEat.options.priority = "foodPoints";
+					(this.bot as any).autoEat.options.bannedFood = ["rotten_flesh", "pufferfish"];
+				}
+
+				if ((this.bot as any).collectBlock) {
+					(this.bot as any).collectBlock.setInventoryFilter((item: any) => {
+						return item.name.includes("axe") || item.name.includes("pickaxe");
+					});
+				}
+
+				if ((this.bot as any).tool) {
+					(this.bot as any).tool.setPrimaryHand();
+				}
+
+				if ((this.bot as any).pvp) {
+					(this.bot as any).pvp.setOptions({
+						attackRange: 4,
+						enemyBlacklist: [],
+						halfSpeed: false,
+					});
+				}
+
+				this.initEvents();
+
+				await new Promise<void>((resolve, reject) => {
+					const timeout = setTimeout(() => reject(new Error("Connection timeout")), 30000);
+					const onSpawn = () => {
+						clearTimeout(timeout);
+						this.bot.off("spawn", onSpawn);
+						this.bot.off("end", onEnd);
+						this.bot.off("error", onError);
+						resolve();
+					};
+					const onEnd = () => {
+						clearTimeout(timeout);
+						this.bot.off("spawn", onSpawn);
+						this.bot.off("end", onEnd);
+						this.bot.off("error", onError);
+						reject(new Error("Connection ended before spawn"));
+					};
+					const onError = (err: Error) => {
+						clearTimeout(timeout);
+						this.bot.off("spawn", onSpawn);
+						this.bot.off("end", onEnd);
+						this.bot.off("error", onError);
+						reject(err);
+					};
+					this.bot.once("spawn", onSpawn);
+					this.bot.once("end", onEnd);
+					this.bot.once("error", onError);
+				});
+
+				this.log("Reconnected successfully!");
+				this.isReconnecting = false;
+				return;
+			} catch (err) {
+				this.log(`Reconnect attempt ${attempt} failed: ${err}`);
+				if (attempt < MAX_RETRIES) {
+					const delay = Math.min(RECONNECT_DELAY * attempt, 60000);
+					await new Promise((resolve) => setTimeout(resolve, delay));
+				}
+			}
+		}
+
+		this.log("Max reconnect attempts reached. Giving up.");
+		this.isReconnecting = false;
 	}
 
 	/**

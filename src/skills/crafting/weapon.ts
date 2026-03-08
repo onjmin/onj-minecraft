@@ -1,4 +1,4 @@
-import type { Bot } from "mineflayer";
+import type { MinecraftAgent } from "../../core/agent";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 import { ensureCraftingTable, ensurePlanks, ensureSticks } from "./util";
 
@@ -74,7 +74,8 @@ export const craftingManager = {
 	materials: ["diamond", "iron", "gold", "stone", "wooden"],
 	weaponTypes: ["sword", "shield", "helmet", "chestplate", "leggings", "boots"],
 
-	determineNextWeapon: (bot: Bot): { skillType: string; material: string } | null => {
+	determineNextWeapon: (agent: MinecraftAgent): { skillType: string; material: string } | null => {
+		const { bot } = agent;
 		const items = bot.inventory.items();
 
 		for (const type of craftingManager.weaponTypes) {

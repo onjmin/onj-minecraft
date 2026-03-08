@@ -1,5 +1,5 @@
 import { createSkill, type SkillResponse, skillResult } from "../types";
-import { ensureCraftingTable, ensureSticks } from "./util";
+import { ensureSticks } from "./util";
 
 /**
  * Crafting Domain: Torch management.
