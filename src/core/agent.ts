@@ -1283,32 +1283,4 @@ export class MinecraftAgent {
 		}
 		this.log("Could not find nearby land");
 	}
-
-	/**
-	 * 人間の目に近づけた明るさ知覚
-	 */
-	private getPerceivedLight(samples = 30, radius = 4) {
-		let total = 0;
-		let count = 0;
-
-		for (let i = 0; i < samples; i++) {
-			const offset = new Vec3(
-				(Math.random() - 0.5) * radius * 2,
-				1 + Math.random(), // 目線高さ付近
-				(Math.random() - 0.5) * radius * 2,
-			);
-
-			const pos = this.bot.entity.position.plus(offset);
-			const block = this.bot.blockAt(pos);
-
-			if (block) {
-				const raw = Math.max(block.light, block.skyLight);
-				const perceived = Math.log2(raw + 1) / Math.log2(16);
-				total += perceived;
-				count++;
-			}
-		}
-
-		return count > 0 ? total / count : 0;
-	}
 }
