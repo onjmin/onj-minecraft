@@ -1081,15 +1081,28 @@ export class MinecraftAgent {
 				this.bot.clearControlStates();
 
 				if (inWater) {
-					// 【水中リカバリ】とにかく上を目指して前進
-					this.bot.setControlState("jump", true);
-					this.bot.setControlState("forward", true);
+					// 【水中リカバリ】
+					this.log(`Pathfinding: Water recovery initiated...`);
+
+					// 1. 一度少しだけ後ろに下がる（ブロックの角への引っかかりを解消）
+					this.bot.setControlState("back", true);
 
 					setTimeout(() => {
-						this.bot.setControlState("jump", false);
-						this.bot.clearControlStates();
-						if (currentGoal) this.bot.pathfinder.setGoal(currentGoal);
-					}, 1000); // 水中なら少し長めに（1秒程度）浮上を試みる
+						this.bot.setControlState("back", false);
+
+						// 2. ジャンプ（浮上）と前進を同時に開始
+						this.bot.setControlState("jump", true);
+						this.bot.setControlState("forward", true);
+						this.bot.setControlState("sprint", true); // スプリントを入れると勢いで上がりやすい
+
+						setTimeout(() => {
+							// 3. 1.5秒ほどかけてしっかり陸に乗り上げる
+							this.bot.clearControlStates();
+							if (currentGoal) {
+								this.bot.pathfinder.setGoal(currentGoal);
+							}
+						}, 1500);
+					}, 300); // 0.3秒だけ後退
 				} else {
 					// 【陸上リカバリ】既存の「後ろに下がって斜めジャンプ」
 					this.bot.setControlState("back", true);
