@@ -1201,7 +1201,14 @@ export class MinecraftAgent {
 
 								this.log("Moved to land successfully");
 								return;
-							} catch {}
+							} catch (err) {
+								if (err instanceof Error) {
+									this.log(`Failed to move to land at ${checkPos}: ${err.message}`);
+									if (err.stack) {
+										console.error("Pathfinding error stack:", err.stack);
+									}
+								}
+							}
 						}
 					}
 				}
