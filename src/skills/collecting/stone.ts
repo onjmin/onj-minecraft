@@ -1,6 +1,6 @@
-import type { Bot } from "mineflayer";
 import { goals } from "mineflayer-pathfinder";
 import type { Vec3 } from "vec3";
+import type { SafeBot } from "../../core/types";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
 export const collectStoneSkill = createSkill<void, { minedCount: number }>({
@@ -59,7 +59,7 @@ export const stoneScanner = {
 		return stoneScanner.stoneBlocks.includes(name);
 	},
 
-	findNearbyStone: (bot: Bot, radius = 8): Vec3[] => {
+	findNearbyStone: (bot: SafeBot, radius = 8): Vec3[] => {
 		return bot.findBlocks({
 			matching: (block: any) => stoneScanner.isStone(block.name),
 			maxDistance: radius,

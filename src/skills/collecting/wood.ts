@@ -1,6 +1,6 @@
-import type { Bot } from "mineflayer";
 import { goals } from "mineflayer-pathfinder";
 import type { Vec3 } from "vec3";
+import type { SafeBot } from "../../core/types";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
 const SINGLE_SAPLING_TREES = ["oak", "birch", "acacia", "cherry"];
@@ -28,6 +28,8 @@ export const collectWoodSkill = createSkill<void, { felledCount: number; planted
 		signal,
 	}): Promise<SkillResponse<{ felledCount: number; plantedCount: number }>> => {
 		const { bot } = agent;
+		if (!bot.entity) return skillResult.fail("Bot entity not loaded");
+
 		const logs = woodScanner.findNearbyLogs(bot);
 
 		let felledCount = 0;
@@ -172,10 +174,16 @@ function isLog(name: string): boolean {
 }
 
 function isLeaves(name: string): boolean {
-	return name.endsWith("_leaves") || name.endsWith("_wart_block") || name === "shroomlight" || name === "dead_bush";
+	return (
+		name.endsWith("_leaves") ||
+		name.endsWith("_wart_block") ||
+		name === "shroomlight" ||
+		name === "dead_bush"
+	);
 }
 
-function findPlaceableForSaplings(bot: Bot, radius: number, isQuad: boolean): Vec3[] {
+function findPlaceableForSaplings(bot: SafeBot, radius: number, isQuad: boolean): Vec3[] {
+	if (!bot.entity) return [];
 	const candidates: { pos: Vec3; dist: number; gridScore: number }[] = [];
 	const agentPos = bot.entity.position;
 
@@ -251,7 +259,9 @@ function isPlantable(block: any): boolean {
 }
 
 export const woodScanner = {
-	findNearbyLogs: (bot: Bot, radius = 24): Vec3[] => {
+	findNearbyLogs: (bot: SafeBot, radius = 24): Vec3[] => {
+		if (!bot.entity) return [];
+		const entityPos = bot.entity.position;
 		return bot
 			.findBlocks({
 				matching: (block: any) => isLog(block.name),
@@ -259,7 +269,7 @@ export const woodScanner = {
 				count: 10,
 			})
 			.sort((a, b) => {
-				return bot.entity.position.distanceTo(a) - bot.entity.position.distanceTo(b);
+				return entityPos.distanceTo(a) - entityPos.distanceTo(b);
 			});
 	},
 };

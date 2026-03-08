@@ -1,6 +1,6 @@
-import type { Bot } from "mineflayer";
 import { goals } from "mineflayer-pathfinder";
 import type { Vec3 } from "vec3";
+import type { SafeBot } from "../../core/types";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
 export const mineOresSkill = createSkill<void, { minedCount: number }>({
@@ -51,7 +51,7 @@ export const mineOresSkill = createSkill<void, { minedCount: number }>({
 });
 
 export const miningScanner = {
-	findNearbyOres: (bot: Bot, radius = 16): Vec3[] => {
+	findNearbyOres: (bot: SafeBot, radius = 16): Vec3[] => {
 		const targetOres = [
 			"coal_ore",
 			"iron_ore",

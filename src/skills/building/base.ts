@@ -14,6 +14,7 @@ export const buildingBaseSkill = createSkill<void, { baseId: string; items: stri
 		signal,
 	}): Promise<SkillResponse<{ baseId: string; items: string[] }>> => {
 		const { bot } = agent;
+		if (!bot.entity) return skillResult.fail("Bot entity not loaded");
 		const pos = bot.entity.position.floored();
 
 		// ★重要: 建築開始時の座標を「固定」する。これ以降、この 'baseCenter' を基準にする。

@@ -10,6 +10,7 @@ import { llm } from "./llm-client";
 import { parseLlmOutput } from "./llm-output-parser";
 import { createPerceptionSnapshot, type DamageInfo } from "./perception";
 import { buildThinkingPrompt } from "./prompt-builder";
+import type { SafeBot } from "./types";
 import { emitDiscordWebhook, translateWithRoleplay } from "./utils/discord-webhook";
 import { isSameSimhash } from "./utils/simhash";
 
@@ -58,7 +59,7 @@ type StrategicState = {
 };
 
 export class MinecraftAgent {
-	public bot: mineflayer.Bot;
+	public bot: SafeBot;
 	private profile: AgentProfile;
 	private skills: Map<string, any>;
 	private currentTaskName: string = "idle";
@@ -364,7 +365,7 @@ export class MinecraftAgent {
 	 * パスファインダーの初期設定
 	 */
 	private setupPathfinderConfig() {
-		const movements = new Movements(this.bot);
+		const movements = new Movements(this.bot as any);
 
 		movements.allowFreeMotion = true;
 		movements.allowSprinting = true;
@@ -444,10 +445,12 @@ export class MinecraftAgent {
 	}
 
 	private handleEntityHurt(entity: any) {
+		if (!this.bot.entity) return;
 		if (entity === this.bot.entity) {
 			const attacker = this.bot.nearestEntity(
 				(e) =>
 					(e.type === "mob" || e.type === "hostile") &&
+					!!this.bot.entity &&
 					e.position.distanceTo(this.bot.entity.position) < 16,
 			);
 			this.lastDamageCause = attacker
@@ -527,6 +530,7 @@ export class MinecraftAgent {
 
 	private handleEnvironmentCheck() {
 		const entity = this.bot.entity;
+		if (!entity) return;
 
 		// 落下判定
 		if (!entity.onGround && entity.velocity.y < -0.6) {
@@ -645,6 +649,10 @@ export class MinecraftAgent {
 		}
 
 		const nearbyHostiles = [];
+		if (!this.bot.entity) {
+			this.isInCombat = false;
+			return;
+		}
 		for (const id in this.bot.entities) {
 			const e = this.bot.entities[id];
 			if (e.type !== "mob" && e.type !== "hostile") continue;
@@ -728,6 +736,35 @@ export class MinecraftAgent {
 		// Nearby blocks sampling (radius 8, random 10 points)
 		const sampleRadius = 8;
 		const sampledBlocks: string[] = [];
+		if (!this.bot.entity) {
+			return {
+				profile: {
+					name: this.profile.minecraftName,
+					personality: this.profile.personality,
+				},
+				environment: {
+					biome: "unknown",
+					timeOfDay: "day",
+					weather: "clear",
+					lightLevel: 0,
+					health: 0,
+					hunger: 0,
+					position: { x: 0, y: 0, z: 0 },
+					nearbyPlayers: [],
+					nearbyMobs: [],
+					nearbyBlocks: "None",
+					heldItem: "bare_hands",
+				},
+				inventorySummary: "Empty",
+				strategies: [],
+				achievements: [],
+				bases: [],
+				skills: skillsContext,
+				chatHistory: [chatLogContext],
+				lastDamageCause: this.lastDamageCause,
+				memorySummary: historyText,
+			};
+		}
 		for (let i = 0; i < 10; i++) {
 			const dx = Math.floor(Math.random() * sampleRadius * 2 - sampleRadius);
 			const dy = Math.floor(Math.random() * sampleRadius * 2 - sampleRadius);
@@ -948,6 +985,7 @@ export class MinecraftAgent {
 		hasStorage: boolean;
 	} | null {
 		if (this.bases.length === 0) return null;
+		if (!this.bot.entity) return null;
 		const pos = this.bot.entity.position;
 		let nearest = this.bases[0];
 		let minDist = Infinity;
@@ -1094,6 +1132,10 @@ export class MinecraftAgent {
 
 		this.isMoving = true;
 
+		if (!this.bot.entity) {
+			this.isMoving = false;
+			return;
+		}
 		const startPos = this.bot.entity.position.clone();
 		let lastPos = startPos.clone();
 		let stuckCount = 0;
@@ -1102,6 +1144,7 @@ export class MinecraftAgent {
 				clearInterval(checkStuck);
 				return;
 			}
+			if (!this.bot.entity) return;
 			const currentPos = this.bot.entity.position;
 			if (currentPos.distanceTo(lastPos) < 0.05) {
 				stuckCount++;
@@ -1204,10 +1247,14 @@ export class MinecraftAgent {
 	}
 
 	public async pickupNearbyItems(signal: AbortSignal): Promise<void> {
+		if (!this.bot.entity) return;
 		const distance = 8;
 		const getNearestItem = () => {
 			return Object.values(this.bot.entities).find(
-				(e) => e.name === "item" && this.bot.entity.position.distanceTo(e.position) < distance,
+				(e) =>
+					e.name === "item" &&
+					!!this.bot.entity &&
+					this.bot.entity.position.distanceTo(e.position) < distance,
 			);
 		};
 
@@ -1228,6 +1275,7 @@ export class MinecraftAgent {
 
 	private async ensureOnLand(signal: AbortSignal): Promise<void> {
 		const { bot } = this;
+		if (!bot.entity) return;
 		const pos = bot.entity.position;
 		const blockAtFeet = bot.blockAt(pos);
 		const blockAtHead = bot.blockAt(pos.offset(0, 1, 0));
@@ -1282,33 +1330,5 @@ export class MinecraftAgent {
 			}
 		}
 		this.log("Could not find nearby land");
-	}
-
-	/**
-	 * 人間の目に近づけた明るさ知覚
-	 */
-	private getPerceivedLight(samples = 30, radius = 4) {
-		let total = 0;
-		let count = 0;
-
-		for (let i = 0; i < samples; i++) {
-			const offset = new Vec3(
-				(Math.random() - 0.5) * radius * 2,
-				1 + Math.random(), // 目線高さ付近
-				(Math.random() - 0.5) * radius * 2,
-			);
-
-			const pos = this.bot.entity.position.plus(offset);
-			const block = this.bot.blockAt(pos);
-
-			if (block) {
-				const raw = Math.max(block.light, block.skyLight);
-				const perceived = Math.log2(raw + 1) / Math.log2(16);
-				total += perceived;
-				count++;
-			}
-		}
-
-		return count > 0 ? total / count : 0;
 	}
 }

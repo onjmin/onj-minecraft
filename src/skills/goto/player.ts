@@ -13,6 +13,7 @@ export const gotoPlayerSkill = createSkill<void, { target: string; distance: num
 		const { bot } = agent;
 
 		const players = Object.values(bot.players);
+		if (!bot.entity) return skillResult.fail("Bot entity not loaded");
 		const botPos = bot.entity.position;
 
 		if (players.length === 0) {

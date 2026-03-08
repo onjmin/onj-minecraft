@@ -1,8 +1,8 @@
-import type { Bot } from "mineflayer";
 import { Vec3 } from "vec3";
 import type { MinecraftAgent } from "../../core/agent";
+import type { SafeBot } from "../../core/types";
 
-type Block = NonNullable<ReturnType<Bot["blockAt"]>>;
+type Block = NonNullable<ReturnType<SafeBot["blockAt"]>>;
 
 interface PlaceableBlock extends Block {
 	_needsDig?: boolean;
@@ -14,7 +14,7 @@ interface PlaceableBlock extends Block {
  * 候補が埋まっている場合は、掘ってでも設置を試みる
  */
 export async function tryPlaceBlock(
-	bot: Bot,
+	bot: SafeBot,
 	itemName: string,
 	blockId: number,
 	agent: MinecraftAgent,
@@ -123,8 +123,9 @@ function isDiggable(name: string): boolean {
  * 設置可能な位置をすべて取得（拡張版）
  * 設置可能な場所がない場合は、掘ってでも場所を作る候補を含める
  */
-export function findAllPlaceablePositions(bot: Bot): Block[] {
+export function findAllPlaceablePositions(bot: SafeBot): Block[] {
 	const candidates: { block: Block; dist: number; needsDig: boolean; digTarget?: Block }[] = [];
+	if (!bot.entity) return [];
 	const agentY = Math.floor(bot.entity.position.y);
 
 	for (let dx = -3; dx <= 3; dx++) {
@@ -476,9 +477,7 @@ export async function ensureChest(agent: MinecraftAgent): Promise<Block | null> 
 	// 3. なければ作る（板材 x 8 -> チェスト）
 	if (!chestItem) {
 		let planks = bot.inventory.items().find((i) => i.name.endsWith("_planks"));
-		agent.log(
-			`[ensureChest] Planks in inventory: found=${!!planks}, count=${planks?.count || 0}`,
-		);
+		agent.log(`[ensureChest] Planks in inventory: found=${!!planks}, count=${planks?.count || 0}`);
 
 		if (!planks || planks.count < 8) {
 			agent.log(`[ensureChest] Not enough planks (need 8)`);
@@ -497,12 +496,7 @@ export async function ensureChest(agent: MinecraftAgent): Promise<Block | null> 
 				return null;
 			}
 
-			const chestRecipe = bot.recipesFor(
-				bot.registry.itemsByName.chest.id,
-				null,
-				1,
-				table,
-			)[0];
+			const chestRecipe = bot.recipesFor(bot.registry.itemsByName.chest.id, null, 1, table)[0];
 			agent.log(`[ensureChest] Chest recipe: found=${!!chestRecipe}`);
 
 			if (!chestRecipe) return null;
