@@ -36,7 +36,6 @@ export const gotoSurfaceSkill = createSkill<void, { y: number; method: string }>
 	inputSchema: {} as any,
 	handler: async ({ agent, signal }): Promise<SkillResponse<{ y: number; method: string }>> => {
 		const { bot } = agent;
-		if (!bot.entity) return skillResult.fail("Bot entity not loaded");
 		const currentPos = bot.entity.position.clone();
 		const startY = Math.floor(currentPos.y);
 

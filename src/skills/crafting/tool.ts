@@ -1,4 +1,4 @@
-import type { SafeBot } from "../../core/types";
+import type { Bot } from "mineflayer";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 import { ensureCraftingTable, ensurePlanks, ensureSticks } from "./util";
 
@@ -94,7 +94,7 @@ export const craftingManager = {
 	// 優先順位: ピッケル > オノ > シャベル > クワ
 	types: ["pickaxe", "axe", "shovel", "hoe"],
 
-	determineNextSkill: (bot: SafeBot): { skillType: string; material: string } | null => {
+	determineNextSkill: (bot: Bot): { skillType: string; material: string } | null => {
 		const items = bot.inventory.items();
 
 		for (const type of craftingManager.types) {

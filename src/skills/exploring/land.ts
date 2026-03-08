@@ -9,7 +9,6 @@ export const exploreLandSkill = createSkill<void, { x: number; z: number }>({
 	inputSchema: {} as any,
 	handler: async ({ agent, signal }): Promise<SkillResponse<{ x: number; z: number }>> => {
 		const { bot } = agent;
-		if (!bot.entity) return skillResult.fail("Bot entity not loaded");
 		const currentPos = bot.entity.position;
 		const currentY = Math.floor(currentPos.y);
 		const yaw = bot.entity.yaw; // 現在の向き

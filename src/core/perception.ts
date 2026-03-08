@@ -1,5 +1,5 @@
+import type { Bot } from "mineflayer";
 import type { Vec3 } from "vec3";
-import type { SafeBot } from "./types";
 
 export interface EnvironmentSnapshot {
 	biome: string;
@@ -33,29 +33,9 @@ export interface PerceptionSnapshot {
 }
 
 export function createPerceptionSnapshot(
-	bot: SafeBot,
+	bot: Bot,
 	lastDamageCause?: DamageInfo,
 ): PerceptionSnapshot {
-	if (!bot.entity) {
-		return {
-			position: new (require("vec3"))(0, 0, 0),
-			health: bot.health,
-			food: bot.food,
-			environment: {
-				biome: "unknown",
-				timeOfDay: "day",
-				weather: "clear",
-				lightLevel: 0,
-				nearbyPlayers: [],
-				nearbyMobs: [],
-			},
-			inventory: {
-				items: [],
-				heldItem: "bare_hands",
-			},
-			lastDamageCause,
-		};
-	}
 	const position = bot.entity.position.clone();
 	const health = bot.health;
 	const food = bot.food;
@@ -126,29 +106,26 @@ function detectTimeOfDay(tick: number): "sunrise" | "day" | "sunset" | "night" {
 	return "night";
 }
 
-function getNearbyPlayers(bot: SafeBot, radius: number): string[] {
+function getNearbyPlayers(bot: Bot, radius: number): string[] {
 	if (!bot.entity?.position) return [];
-	const entityPos = bot.entity.position;
 
 	return Object.values(bot.players)
-		.filter((p) => p.entity && p.entity.position.distanceTo(entityPos) < radius)
+		.filter((p) => p.entity && p.entity.position.distanceTo(bot.entity.position) < radius)
 		.map((p) => p.username);
 }
 
-function getNearbyMobs(bot: SafeBot, radius: number): { name: string; distance: number }[] {
+function getNearbyMobs(bot: Bot, radius: number): { name: string; distance: number }[] {
 	if (!bot.entity?.position) return [];
-	const entityPos = bot.entity.position;
 
 	return Object.values(bot.entities)
-		.filter((e) => e.type === "mob" && e.position.distanceTo(entityPos) < radius)
+		.filter((e) => e.type === "mob" && e.position.distanceTo(bot.entity.position) < radius)
 		.map((e) => ({
 			name: e.name ?? e.displayName ?? e.type,
-			distance: Math.round(e.position.distanceTo(entityPos)),
+			distance: Math.round(e.position.distanceTo(bot.entity.position)),
 		}));
 }
 
-function getPerceivedLight(bot: SafeBot): number {
-	if (!bot.entity) return 0;
+function getPerceivedLight(bot: Bot): number {
 	const pos = bot.entity.position.floored();
 	const samples: number[] = [];
 
