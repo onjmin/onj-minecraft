@@ -860,7 +860,7 @@ export class MinecraftAgent {
 				);
 				if (
 					process.env.DISCORD_WEBHOOK_URL &&
-					now - lastDiscordEmitAt >= 10_000 &&
+					now - lastDiscordEmitAt >= 30_000 &&
 					isNewRationale
 				) {
 					lastDiscordEmitAt = now;
