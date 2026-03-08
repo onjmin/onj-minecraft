@@ -899,6 +899,38 @@ export class MinecraftAgent {
 		return this.bases;
 	}
 
+	public upsertBase(base: {
+		id: string;
+		type: string;
+		position: { x: number; y: number; z: number };
+		safe: boolean;
+		functional: boolean;
+		hasStorage: boolean;
+	}): boolean {
+		const MIN_DISTANCE = 50;
+		const existingIndex = this.bases.findIndex((b) => b.id === base.id);
+		if (existingIndex >= 0) {
+			this.bases[existingIndex] = base;
+			this.log(`Updated base: ${base.id} at (${base.position.x}, ${base.position.y}, ${base.position.z})`);
+			return true;
+		}
+		for (const existing of this.bases) {
+			const dist =
+				Math.abs(existing.position.x - base.position.x) +
+				Math.abs(existing.position.z - base.position.z);
+			if (dist < MIN_DISTANCE) {
+				this.log(`Base too close to existing base (${dist} < ${MIN_DISTANCE}), not adding.`);
+				return false;
+			}
+		}
+		if (this.bases.length >= 3) {
+			this.bases.shift();
+		}
+		this.bases.push(base);
+		this.log(`Added base: ${base.id} at (${base.position.x}, ${base.position.y}, ${base.position.z})`);
+		return true;
+	}
+
 	public getNearestBase(): {
 		id: string;
 		type: string;
