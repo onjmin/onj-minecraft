@@ -1159,9 +1159,6 @@ export class MinecraftAgent {
 		}
 	}
 
-	/**
-	 * 人間の目に近づけた明るさ知覚
-	 */
 	private async ensureOnLand(signal: AbortSignal): Promise<void> {
 		const { bot } = this;
 		const pos = bot.entity.position;
@@ -1194,8 +1191,14 @@ export class MinecraftAgent {
 						) {
 							this.log(`Found land at ${checkPos}, moving...`);
 							try {
-								const goal = new goals.GoalNear(checkPos.x, checkPos.y, checkPos.z, 1);
+								// .floored() で整数化したあと、0.5を足して中心を指定する
+								const targetX = Math.floor(checkPos.x) + 0.5;
+								const targetY = Math.floor(checkPos.y); // Yは足元なので整数のままでOK
+								const targetZ = Math.floor(checkPos.z) + 0.5;
+
+								const goal = new goals.GoalNear(targetX, targetY, targetZ, 1);
 								await this.abortableGoto(signal, goal);
+
 								this.log("Moved to land successfully");
 								return;
 							} catch {}
@@ -1207,6 +1210,9 @@ export class MinecraftAgent {
 		this.log("Could not find nearby land");
 	}
 
+	/**
+	 * 人間の目に近づけた明るさ知覚
+	 */
 	private getPerceivedLight(samples = 30, radius = 4) {
 		let total = 0;
 		let count = 0;
