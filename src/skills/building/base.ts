@@ -1,7 +1,7 @@
 import { goals } from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
 import type { MinecraftAgent } from "../../core/agent";
-import { ensureCraftingTable, ensureFurnace, tryPlaceBlock } from "../crafting/util";
+import { ensureChest, ensureCraftingTable, ensureFurnace, tryPlaceBlock } from "../crafting/util";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
 export const buildingBaseSkill = createSkill<void, { baseId: string; items: string[] }>({
@@ -15,19 +15,37 @@ export const buildingBaseSkill = createSkill<void, { baseId: string; items: stri
 	}): Promise<SkillResponse<{ baseId: string; items: string[] }>> => {
 		const { bot } = agent;
 		const pos = bot.entity.position.floored();
+
+		// ★重要: 建築開始時の座標を「固定」する。これ以降、この 'baseCenter' を基準にする。
+		const baseCenter = bot.entity.position.floored();
 		const installedItems: string[] = [];
 
+		// 既存拠点の検索も固定座標で行う
 		const existingBase = agent
 			.getBases()
-			.find((b) => Math.abs(b.position.x - pos.x) < 5 && Math.abs(b.position.z - pos.z) < 5);
+			.find(
+				(b) =>
+					Math.abs(b.position.x - baseCenter.x) < 5 && Math.abs(b.position.z - baseCenter.z) < 5,
+			);
 
 		if (existingBase) {
-			agent.log("[building.base] Existing base found. Performing maintenance...");
-			return await performMaintenance(agent, signal, pos, installedItems, existingBase);
+			// メンテナンス時も baseCenter を引き継ぐ
+			return await performMaintenance(agent, signal, baseCenter, installedItems, existingBase);
 		}
 
-		// 1. 壁のオフセットを Vec3 インスタンスとして定義 (型エラー回避)
-		const surroundingOffsets = [
+		// --- Phase 0: 居住空間のクリア ---
+		agent.log("[building.base] Phase 0: Clearing interior space...");
+		const interiorPositions = [baseCenter, baseCenter.offset(0, 1, 0)];
+		for (const p of interiorPositions) {
+			const block = bot.blockAt(p);
+			if (block && block.name !== "air" && !["water", "lava"].includes(block.name)) {
+				await bot.dig(block);
+			}
+		}
+
+		// 1. 壁のオフセットを2段分定義
+		const wallOffsets = [
+			// 1段目 (y: 0)
 			new Vec3(1, 0, 0),
 			new Vec3(-1, 0, 0),
 			new Vec3(0, 0, 1),
@@ -36,38 +54,65 @@ export const buildingBaseSkill = createSkill<void, { baseId: string; items: stri
 			new Vec3(1, 0, -1),
 			new Vec3(-1, 0, 1),
 			new Vec3(-1, 0, -1),
+			// 2段目 (y: 1)
+			new Vec3(1, 1, 0),
+			new Vec3(-1, 1, 0),
+			new Vec3(0, 1, 1),
+			new Vec3(0, 1, -1),
+			new Vec3(1, 1, 1),
+			new Vec3(1, 1, -1),
+			new Vec3(-1, 1, 1),
+			new Vec3(-1, 1, -1),
 		];
 
 		agent.log("[building.house] Phase 1: Securing walls...");
 
-		for (const offset of surroundingOffsets) {
+		// --- 修正版：壁の設置ロジック ---
+
+		// 建築に使用可能なブロックのリスト（優先順位順）
+		const VALID_BUILD_MATERIALS = ["cobblestone", "stone", "dirt"];
+
+		for (const offset of wallOffsets) {
 			if (agent.checkAbort(signal)) break;
 			const targetPos = pos.plus(offset);
 			const block = bot.blockAt(targetPos);
 
-			// すでに壁があるならスキップ
+			// 1. 障害物のチェックと除去
 			if (block && block.name !== "air" && !["water", "lava"].includes(block.name)) {
-				continue;
+				// 壁として機能しない「柔らかいブロック（草や花など）」は破壊してスペースを確保
+				const isReplaceable =
+					block.name.includes("grass") ||
+					block.name.includes("flower") ||
+					block.name === "fern" ||
+					block.name.includes("shrub");
+
+				if (isReplaceable) {
+					agent.log(`Removing obstacle (${block.name}) at ${targetPos}`);
+					// ツール（シャベル等）があれば最適化されますが、素手でも破壊可能
+					await bot.dig(block);
+				} else {
+					// すでに硬いブロックがある場合はスキップ
+					continue;
+				}
 			}
 
-			// 壁を設置 (tryPlaceBlock内で移動や向きの調整が行われる前提)
+			// 2. インベントリから土・石系の資材を探す
 			const inventory = bot.inventory.items();
-			const buildMaterial = inventory.find(
-				(i) =>
-					i.name.includes("planks") ||
-					i.name.includes("log") ||
-					i.name === "dirt" ||
-					i.name === "cobblestone" ||
-					i.name === "stone",
-			);
+			const buildMaterial = inventory.find((item) => VALID_BUILD_MATERIALS.includes(item.name));
 
 			if (buildMaterial) {
-				// 自分が邪魔にならないよう一歩下がる(簡易版)
-				const awayGoal = new goals.GoalLookAtBlock(targetPos, bot.world);
-				await bot.pathfinder.setGoal(awayGoal);
+				// 自分が邪魔にならないよう中心点に移動
+				await bot.pathfinder.goto(new goals.GoalGetToBlock(pos.x, pos.y, pos.z));
 
+				// 設置実行
 				const success = await tryPlaceBlock(bot, buildMaterial.name, buildMaterial.type, agent);
-				if (success) agent.log(`Placed wall at ${targetPos}`);
+				if (success) {
+					agent.log(`Placed ${buildMaterial.name} wall at ${targetPos}`);
+				}
+			} else {
+				agent.log("Warning: No dirt or stone blocks available for walls.");
+				// 資材が尽きたら中断、あるいは資材収集タスクへ
+				break;
 			}
 		}
 
@@ -79,6 +124,25 @@ export const buildingBaseSkill = createSkill<void, { baseId: string; items: stri
 		if (table) {
 			installedItems.push("crafting_table");
 			agent.log("Crafting table ensured.");
+		}
+
+		if (!installedItems.includes("crafting_table")) {
+			return skillResult.fail(
+				"Maintenance failed: Base is no longer functional without a crafting table.",
+			);
+		}
+
+		// チェスト (素材があれば作成して設置まで行う)
+		const chest = await ensureChest(agent);
+		if (chest) {
+			installedItems.push("crafting_chest");
+			agent.log("Crafting chest ensured.");
+		}
+
+		if (!installedItems.includes("crafting_chest")) {
+			return skillResult.fail(
+				"Maintenance failed: Base is no longer functional without a crafting chest.",
+			);
 		}
 
 		// かまど (丸石があれば作成して設置まで行う)
@@ -189,6 +253,10 @@ async function performMaintenance(
 	if (table) {
 		installedItems.push("crafting_table");
 		agent.log("Crafting table ensured.");
+	}
+
+	if (!installedItems.includes("crafting_table")) {
+		return skillResult.fail("Failed to establish base: Crafting table could not be placed.");
 	}
 
 	const furnace = await ensureFurnace(agent);

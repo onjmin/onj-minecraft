@@ -452,3 +452,79 @@ export async function ensurePlanks(agent: MinecraftAgent, minCount = 4): Promise
 
 	return Boolean(planksAfter && planksAfter.count >= minCount);
 }
+
+/**
+ * 共通ロジック：チェストを確保する（周辺スキャン -> 作成 -> 設置）
+ * @returns 確保されたチェストのBlockオブジェクト、確保失敗時は null
+ */
+export async function ensureChest(agent: MinecraftAgent): Promise<Block | null> {
+	const { bot } = agent;
+
+	// 1. 周辺スキャン
+	const chestBlock = bot.findBlock({
+		matching: bot.registry.blocksByName.chest.id,
+		maxDistance: 4,
+	});
+
+	agent.log(`[ensureChest] Scanning nearby: found=${!!chestBlock}`);
+	if (chestBlock) return chestBlock;
+
+	// 2. インベントリ確認
+	let chestItem = bot.inventory.items().find((i) => i.name === "chest");
+	agent.log(`[ensureChest] In inventory: found=${!!chestItem}`);
+
+	// 3. なければ作る（板材 x 8 -> チェスト）
+	if (!chestItem) {
+		let planks = bot.inventory.items().find((i) => i.name.endsWith("_planks"));
+		agent.log(
+			`[ensureChest] Planks in inventory: found=${!!planks}, count=${planks?.count || 0}`,
+		);
+
+		if (!planks || planks.count < 8) {
+			agent.log(`[ensureChest] Not enough planks (need 8)`);
+			const ensured = await ensurePlanks(agent, 8);
+			if (!ensured) {
+				agent.log(`[ensureChest] FAIL: Could not ensure planks`);
+				return null;
+			}
+			planks = bot.inventory.items().find((i) => i.name.endsWith("_planks"));
+		}
+
+		if (planks && planks.count >= 8) {
+			const table = await ensureCraftingTable(agent);
+			if (!table) {
+				agent.log(`[ensureChest] FAIL: No crafting table`);
+				return null;
+			}
+
+			const chestRecipe = bot.recipesFor(
+				bot.registry.itemsByName.chest.id,
+				null,
+				1,
+				table,
+			)[0];
+			agent.log(`[ensureChest] Chest recipe: found=${!!chestRecipe}`);
+
+			if (!chestRecipe) return null;
+
+			await bot.craft(chestRecipe, 1, table);
+			chestItem = bot.inventory.items().find((i) => i.name === "chest");
+			agent.log(`[ensureChest] Crafted chest: found=${!!chestItem}`);
+		}
+	}
+
+	// 4. 設置する
+	if (chestItem) {
+		const placed = await tryPlaceBlock(
+			bot,
+			chestItem.name,
+			bot.registry.blocksByName.chest.id,
+			agent,
+		);
+		agent.log(`[ensureChest] Placed: found=${!!placed}`);
+		return placed;
+	}
+
+	agent.log(`[ensureChest] FAIL: Cannot place chest`);
+	return null;
+}
