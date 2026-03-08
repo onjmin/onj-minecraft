@@ -101,16 +101,9 @@ export const buildingBaseSkill = createSkill<void, { baseId: string; items: stri
 		}
 
 		// 3. 最終的な密閉判定
-		const isFloorSolid = bot.blockAt(pos.offset(0, -1, 0))?.name !== "air";
 		let wallCount = 0;
 		for (const offset of surroundingOffsets) {
 			if (bot.blockAt(pos.plus(offset))?.name !== "air") wallCount++;
-		}
-
-		if (!isFloorSolid || wallCount < 4) {
-			// return skillResult.fail(
-			// 	`Failed to secure space. Walls: ${wallCount}/8, Floor: ${isFloorSolid}`,
-			// );
 		}
 
 		// 4. Baseの登録
