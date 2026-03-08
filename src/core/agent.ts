@@ -821,7 +821,11 @@ export class MinecraftAgent {
 					`rationale:${this.profile.minecraftName}`,
 					this.rationaleSimhashCache,
 				);
-				if (now - lastDiscordEmitAt >= 10_000 && isNewRationale) {
+				if (
+					process.env.DISCORD_WEBHOOK_URL &&
+					now - lastDiscordEmitAt >= 10_000 &&
+					isNewRationale
+				) {
 					lastDiscordEmitAt = now;
 					translateWithRoleplay(rationale, this.profile).then((translatedText) =>
 						emitDiscordWebhook({
@@ -911,7 +915,9 @@ export class MinecraftAgent {
 		const existingIndex = this.bases.findIndex((b) => b.id === base.id);
 		if (existingIndex >= 0) {
 			this.bases[existingIndex] = base;
-			this.log(`Updated base: ${base.id} at (${base.position.x}, ${base.position.y}, ${base.position.z})`);
+			this.log(
+				`Updated base: ${base.id} at (${base.position.x}, ${base.position.y}, ${base.position.z})`,
+			);
 			return true;
 		}
 		for (const existing of this.bases) {
@@ -927,7 +933,9 @@ export class MinecraftAgent {
 			this.bases.shift();
 		}
 		this.bases.push(base);
-		this.log(`Added base: ${base.id} at (${base.position.x}, ${base.position.y}, ${base.position.z})`);
+		this.log(
+			`Added base: ${base.id} at (${base.position.x}, ${base.position.y}, ${base.position.z})`,
+		);
 		return true;
 	}
 
