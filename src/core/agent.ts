@@ -2,7 +2,6 @@ import fs from "node:fs";
 import path from "node:path";
 import mineflayer, { type ControlState } from "mineflayer";
 import { goals, Movements, pathfinder } from "mineflayer-pathfinder";
-import { Vec3 } from "vec3";
 import type { AgentProfile } from "../profiles/types";
 import { exploreLandSkill } from "../skills/exploring/land";
 import type { SkillResponse } from "../skills/types";
@@ -966,19 +965,23 @@ export class MinecraftAgent {
 		control: ControlState,
 		value: boolean,
 	): Promise<void> {
+		const { bot } = this;
+
 		if (this.checkAbort(signal)) {
 			throw new Error("Aborted");
 		}
-		this.bot.setControlState(control, value);
+		bot.setControlState(control, value);
 	}
 
 	public async abortableDig(signal: AbortSignal, block: any): Promise<void> {
+		const { bot } = this;
+
 		if (this.checkAbort(signal)) {
 			throw new Error("Aborted");
 		}
 		const p = new Promise<void>((resolve, reject) => {
 			const onAbort = () => {
-				this.bot.stopDigging();
+				bot.stopDigging();
 				reject(new Error("Aborted"));
 			};
 
@@ -990,23 +993,23 @@ export class MinecraftAgent {
 			const abortHandler = () => onAbort();
 			signal?.addEventListener("abort", abortHandler);
 
-			this.bot.once("blockBreakProgressObserved", () => {
+			bot.once("blockBreakProgressObserved", () => {
 				if (this.checkAbort(signal)) {
-					this.bot.stopDigging();
+					bot.stopDigging();
 				}
 			});
 
-			this.bot.once("diggingCompleted", () => {
+			bot.once("diggingCompleted", () => {
 				signal?.removeEventListener("abort", abortHandler);
 				resolve();
 			});
 
-			this.bot.once("diggingAborted", () => {
+			bot.once("diggingAborted", () => {
 				signal?.removeEventListener("abort", abortHandler);
 				reject(new Error("Digging aborted"));
 			});
 
-			this.bot
+			bot
 				.dig(block)
 				.then(() => {
 					signal?.removeEventListener("abort", abortHandler);
@@ -1039,6 +1042,8 @@ export class MinecraftAgent {
 	}
 
 	public async abortableAttack(signal: AbortSignal, target: any): Promise<void> {
+		const { bot } = this;
+
 		if (this.checkAbort(signal)) {
 			throw new Error("Aborted");
 		}
@@ -1049,7 +1054,7 @@ export class MinecraftAgent {
 					throw new Error("Aborted");
 				}
 				try {
-					await this.bot.attack(target);
+					await bot.attack(target);
 				} catch (err) {
 					const errorMsg = err instanceof Error ? err.message : String(err);
 					if (errorMsg.includes("Cancelled") || errorMsg.includes("stop")) {
@@ -1066,7 +1071,7 @@ export class MinecraftAgent {
 			signal.addEventListener(
 				"abort",
 				() => {
-					this.bot.attack(target);
+					bot.attack(target);
 				},
 				{ once: true },
 			);
@@ -1076,6 +1081,8 @@ export class MinecraftAgent {
 	}
 
 	public async abortableGoto(signal: AbortSignal, goal: goals.Goal): Promise<void> {
+		const { bot } = this;
+
 		if (this.checkAbort(signal)) {
 			throw new Error("Aborted");
 		}
@@ -1087,14 +1094,14 @@ export class MinecraftAgent {
 		this.currentGoal = goal;
 
 		if (this.isMoving) {
-			this.bot.pathfinder.stop();
-			this.bot.clearControlStates();
+			bot.pathfinder.stop();
+			bot.clearControlStates();
 			await new Promise((r) => setTimeout(r, 200));
 		}
 
 		this.isMoving = true;
 
-		const startPos = this.bot.entity.position.clone();
+		const startPos = bot.entity.position.clone();
 		let lastPos = startPos.clone();
 		let stuckCount = 0;
 		const checkStuck = setInterval(() => {
@@ -1102,7 +1109,7 @@ export class MinecraftAgent {
 				clearInterval(checkStuck);
 				return;
 			}
-			const currentPos = this.bot.entity.position;
+			const currentPos = bot.entity.position;
 			if (currentPos.distanceTo(lastPos) < 0.05) {
 				stuckCount++;
 			} else {
@@ -1111,64 +1118,64 @@ export class MinecraftAgent {
 			if (stuckCount >= 2) {
 				this.log(`Pathfinding: Stuck detected...`);
 
-				const pos = this.bot.entity.position;
-				const block = this.bot.blockAt(pos);
-				const inWater = block?.name === "water" || (this.bot.entity as any).isInWater;
+				const pos = bot.entity.position;
+				const block = bot.blockAt(pos);
+				const inWater = block?.name === "water" || (bot.entity as any).isInWater;
 
 				// 1. Pathfinderを停止
-				const currentGoal = this.bot.pathfinder.goal;
-				this.bot.pathfinder.setGoal(null);
-				this.bot.clearControlStates();
+				const currentGoal = bot.pathfinder.goal;
+				bot.pathfinder.setGoal(null);
+				bot.clearControlStates();
 
 				if (inWater) {
 					this.log(`Pathfinding: Force water recovery initiated...`);
 
 					// 1. 型エラーを回避しつつターゲットを特定
-					const goal: any = this.bot.pathfinder.goal;
+					const goal: any = bot.pathfinder.goal;
 					let targetVec = null;
 					if (goal && goal.x !== undefined) {
-						targetVec = new (require("vec3"))(goal.x, goal.y ?? this.bot.entity.position.y, goal.z);
+						targetVec = new (require("vec3"))(goal.x, goal.y ?? bot.entity.position.y, goal.z);
 					}
 
 					// 2. 物理スタック解消シーケンス
 					// 目的地を向く
-					if (targetVec) this.bot.lookAt(targetVec, true);
+					if (targetVec) bot.lookAt(targetVec, true);
 
 					// 一旦、斜め後ろに下がって「角」から完全に離れる
 					const side = Math.random() > 0.5 ? "left" : "right";
-					this.bot.setControlState("back", true);
-					this.bot.setControlState(side as any, true);
+					bot.setControlState("back", true);
+					bot.setControlState(side as any, true);
 
 					setTimeout(() => {
-						this.bot.clearControlStates();
+						bot.clearControlStates();
 
 						// 3. 勢いをつけてジャンプ・スプリントで上陸を試みる
-						if (targetVec) this.bot.lookAt(targetVec, true);
-						this.bot.setControlState("forward", true);
-						this.bot.setControlState("jump", true);
-						this.bot.setControlState("sprint", true);
+						if (targetVec) bot.lookAt(targetVec, true);
+						bot.setControlState("forward", true);
+						bot.setControlState("jump", true);
+						bot.setControlState("sprint", true);
 
 						setTimeout(() => {
-							this.bot.clearControlStates();
+							bot.clearControlStates();
 							// 4. パスファインダーをリセットして再計算を強制
 							if (currentGoal) {
-								this.bot.pathfinder.setGoal(null); // 一度クリア
-								setTimeout(() => this.bot.pathfinder.setGoal(currentGoal), 100);
+								bot.pathfinder.setGoal(null); // 一度クリア
+								setTimeout(() => bot.pathfinder.setGoal(currentGoal), 100);
 							}
 						}, 1500); // 滞空・上陸時間を長めに確保
 					}, 500); // 下がる時間を0.5秒に延長
 				} else {
 					// 【陸上リカバリ】既存の「後ろに下がって斜めジャンプ」
-					this.bot.setControlState("back", true);
+					bot.setControlState("back", true);
 					setTimeout(() => {
-						this.bot.setControlState("back", false);
-						this.bot.setControlState("jump", true);
-						this.bot.setControlState("forward", true);
-						this.bot.setControlState("right", true);
+						bot.setControlState("back", false);
+						bot.setControlState("jump", true);
+						bot.setControlState("forward", true);
+						bot.setControlState("right", true);
 
 						setTimeout(() => {
-							this.bot.clearControlStates();
-							if (currentGoal) this.bot.pathfinder.setGoal(currentGoal);
+							bot.clearControlStates();
+							if (currentGoal) bot.pathfinder.setGoal(currentGoal);
 						}, 400);
 					}, 200);
 				}
@@ -1185,12 +1192,12 @@ export class MinecraftAgent {
 					throw new Error("Aborted");
 				}
 				try {
-					await this.bot.pathfinder.goto(goal);
+					await bot.pathfinder.goto(goal);
 					this.log(`Pathfinding: Reached goal successfully!`);
 					break;
 				} catch (err) {
 					this.log(`Pathfinding Error: ${err instanceof Error ? err.message : String(err)}`);
-					this.log(`Pathfinding: Current pos after error: ${this.bot.entity.position}`);
+					this.log(`Pathfinding: Current pos after error: ${bot.entity.position}`);
 					await new Promise((r) => setTimeout(r, 1000 * retry));
 				}
 				retry++;
@@ -1199,15 +1206,16 @@ export class MinecraftAgent {
 		} finally {
 			clearInterval(checkStuck);
 			this.isMoving = false;
-			this.bot.clearControlStates();
+			bot.clearControlStates();
 		}
 	}
 
 	public async pickupNearbyItems(signal: AbortSignal): Promise<void> {
+		const { bot } = this;
 		const distance = 8;
 		const getNearestItem = () => {
-			return Object.values(this.bot.entities).find(
-				(e) => e.name === "item" && this.bot.entity.position.distanceTo(e.position) < distance,
+			return Object.values(bot.entities).find(
+				(e) => e.name === "item" && bot.entity.position.distanceTo(e.position) < distance,
 			);
 		};
 
