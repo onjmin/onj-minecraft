@@ -431,7 +431,7 @@ export class MinecraftAgent {
 			this.log(`Setting skin: ${this.profile.skinUrl}`);
 			// スポーン直後の安定を待ってから一度だけ実行
 			setTimeout(() => {
-				this.bot.chat(`/skin ${this.profile.skinUrl}`);
+				this.bot.chat(`/skin url "${this.profile.skinUrl}" slim`);
 				this.hasSetSkin = true;
 			}, 5000);
 		}

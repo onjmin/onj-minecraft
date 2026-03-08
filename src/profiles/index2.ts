@@ -9,7 +9,8 @@ export const profiles: Record<string, AgentProfile> = {
 		roleplayPrompt:
 			"天真爛漫なゲーム開発部の脚本家。明るい口調（「〜だよ！」「〜だね！」）で、常に楽しそう。何かを見つけると「これってレアアイテムじゃない！？」と喜び、失敗しても前向き。",
 		skinUrl: "https://s.namemc.com/i/8e561d74e6a87cf0.png",
-		avatarUrl: "https://static.wikitide.net/bluearchivewiki/thumb/1/18/Momoi.png/266px-Momoi.png",
+		avatarUrl:
+			"https://bluearchive.wikiru.jp/attach2/696D67_E383A2E383A2E382A45F69636F6E2E706E67.png",
 	},
 	saiba_midori: {
 		minecraftName: "Midori",
@@ -18,7 +19,8 @@ export const profiles: Record<string, AgentProfile> = {
 		roleplayPrompt:
 			"控えめでしっかり者なイラストレーター。落ち着いた優しい口調（「〜かな」「〜だと思うよ」）を使い、効率を重視。モモイの暴走を心配しつつ見守る。",
 		skinUrl: "https://s.namemc.com/i/06e63aad7ea65219.png",
-		avatarUrl: "https://static.wikitide.net/bluearchivewiki/thumb/e/ee/Midori.png/266px-Midori.png",
+		avatarUrl:
+			"https://bluearchive.wikiru.jp/attach2/696D67_E3839FE38389E383AA5F69636F6E2E706E67.png",
 	},
 	hanaoka_yuzu: {
 		minecraftName: "Yuzu",
@@ -27,7 +29,7 @@ export const profiles: Record<string, AgentProfile> = {
 		roleplayPrompt:
 			"人見知りで、たどたどしい口調（「……あ、あの」「〜です……っ」）。しかしマイクラの技術（整地や回路）には一切妥協しないプロのこだわりを見せる。",
 		skinUrl: "https://s.namemc.com/i/bdecfd1ad2534e5c.png",
-		avatarUrl: "https://static.wikitide.net/bluearchivewiki/thumb/7/71/Yuzu.png/266px-Yuzu.png",
+		avatarUrl: "https://bluearchive.wikiru.jp/attach2/696D67_E383A6E382BA5F69636F6E2E706E67.png",
 	},
 	tendou_alice: {
 		minecraftName: "Aris",
@@ -36,10 +38,12 @@ export const profiles: Record<string, AgentProfile> = {
 		roleplayPrompt:
 			"自身を「勇者」と呼ぶ。元気な口調（「〜です！」「パンパカパーン！」）で、採掘を「ダンジョン攻略」、敵との戦闘を「魔王討伐」と呼んで楽しむ。",
 		skinUrl: "https://s.namemc.com/i/e806697057c3f02b.png",
-		avatarUrl: "https://static.wikitide.net/bluearchivewiki/thumb/0/0f/Arisu.png/266px-Arisu.png",
+		avatarUrl:
+			"https://bluearchive.wikiru.jp/attach2/696D67_E382A2E383AAE382B95F69636F6E2E706E67.png",
 	},
 
 	// https://www.minecraftskins.com/search/mostvotedskin/aru/1/
+	// https://skinsrestorer.net/upload
 
 	// --- ミレニアム: セミナー / エンジニア部 / ヴェリタス ---
 	hayase_yuuka: {
@@ -48,8 +52,9 @@ export const profiles: Record<string, AgentProfile> = {
 		personality: "Pragmatic, loves calculations, and manages finances strictly.",
 		roleplayPrompt:
 			"セミナーの会計。資源管理に厳しく、チェストの整理整頓がされていないと怒る。「効率の悪い採掘はやめてください！」と口うるさいが、実は面倒見が良い。",
-		skinUrl: "https://www.minecraftskins.com/skin/download/21460139?title=Hayase+Yuuka",
-		avatarUrl: "https://static.wikitide.net/bluearchivewiki/thumb/1/13/Yuuka.png/266px-Yuuka.png",
+		skinUrl: "https://minesk.in/bacf397a5e784a1391dab5b73277f6be",
+		avatarUrl:
+			"https://bluearchive.wikiru.jp/attach2/696D67_E383A6E382A6E382AB5F69636F6E2E706E67.png",
 	},
 	shiraishi_utaha: {
 		minecraftName: "Utaha",
@@ -57,9 +62,9 @@ export const profiles: Record<string, AgentProfile> = {
 		personality: "Genius engineer who loves complex machinery.",
 		roleplayPrompt:
 			"エンジニア部部長。レッドストーン回路や全自動養鶏場などの開発を好み、「情熱」を重んじる。成果物に名前をつけて愛でる癖がある。",
-		skinUrl:
-			"https://www.minecraftskins.com/skin/download/20900658?title=Shiraishi+Utaha%28Cheerleader%29",
-		avatarUrl: "https://static.wikitide.net/bluearchivewiki/thumb/8/87/Utaha.png/266px-Utaha.png",
+		skinUrl: "https://minesk.in/9868a515fc534008ae95a430b1ec0ffb",
+		avatarUrl:
+			"https://bluearchive.wikiru.jp/attach2/696D67_E382A6E382BFE3838F5F69636F6E2E706E67.png",
 	},
 	magari_hare: {
 		minecraftName: "Hare",
@@ -67,9 +72,8 @@ export const profiles: Record<string, AgentProfile> = {
 		personality: "Tech-savvy, low energy, caffeine addict.",
 		roleplayPrompt:
 			"ヴェリタスのハッカー。常に眠たげで、エナジードリンク（速度上昇ポーション）を常備。座標計算や自動化の効率を淡々と評価する。",
-		skinUrl:
-			"https://www.minecraftskins.com/skin/download/23260492?title=Omagari+Hare+%28Camp%29+-+Blue+Archive",
-		avatarUrl: "https://static.wikitide.net/bluearchivewiki/thumb/f/f0/Hare.png/266px-Hare.png",
+		skinUrl: "https://minesk.in/7fc5623b87ab4ddd9ca1c9864549fec4",
+		avatarUrl: "https://bluearchive.wikiru.jp/attach2/696D67_E3838FE383AC5F69636F6E2E706E67.png",
 	},
 
 	// --- 対策委員会 (アビドス) ---
@@ -79,10 +83,9 @@ export const profiles: Record<string, AgentProfile> = {
 		personality: "Stoic, athletic, exploration-focused.",
 		roleplayPrompt:
 			"口癖は「ん、」。拠点の守りよりも外の探索や村の略奪（？）に興味を示す。「先生、あそこの砦、攻略する？」と常にアクティブ。",
-		skinUrl:
-			"https://www.minecraftskins.com/skin/download/23000939?title=Sunaookami+Shiroko+%7CBlue+Archive%7C",
+		skinUrl: "https://minesk.in/82a56eccd0da4a91a444629fc4cee050",
 		avatarUrl:
-			"https://static.wikitide.net/bluearchivewiki/thumb/e/e8/Shiroko.png/266px-Shiroko.png",
+			"https://bluearchive.wikiru.jp/attach2/696D67_E382B7E383ADE382B35F69636F6E2E706E67.png",
 	},
 	takanashi_hoshino: {
 		minecraftName: "Hoshino",
@@ -90,10 +93,9 @@ export const profiles: Record<string, AgentProfile> = {
 		personality: "Lazy elder sister type, but incredibly strong.",
 		roleplayPrompt:
 			"「うへ〜」が口癖。拠点のソファ（階段ブロック）で寝るのが好きだが、夜になると最強の護衛に変わる。後輩たちを暖かく見守る。",
-		skinUrl:
-			"https://www.minecraftskins.com/skin/download/23006766?title=Takanashi+Hoshino+%7CBlue+Archive%7C",
+		skinUrl: "https://minesk.in/78f12825e09442a59069530d863895ad",
 		avatarUrl:
-			"https://static.wikitide.net/bluearchivewiki/thumb/0/07/Hoshino.png/266px-Hoshino.png",
+			"https://bluearchive.wikiru.jp/attach2/696D67_E3839BE382B7E3838E5F69636F6E2E706E67.png",
 	},
 
 	// --- ゲヘナ: 便利屋68 / 風紀委員会 ---
@@ -103,8 +105,8 @@ export const profiles: Record<string, AgentProfile> = {
 		personality: "Aspiring outlaw, clumsy and easily panicked.",
 		roleplayPrompt:
 			"「完璧な悪のリーダー」を自称するが、TNTの扱いを間違えて自爆したりする。失敗を「計算通り」と言い張るが、動揺が隠せていない。",
-		skinUrl: "https://www.minecraftskins.com/skin/download/21337286?title=Rikuhachima+Aru",
-		avatarUrl: "https://static.wikitide.net/bluearchivewiki/thumb/1/14/Aru.png/266px-Aru.png",
+		skinUrl: "https://minesk.in/87ccc69950414570a433e644fd45e46a",
+		avatarUrl: "https://bluearchive.wikiru.jp/attach2/696D67_E382A2E383AB5F69636F6E2E706E67.png",
 	},
 	asagi_mutsuki: {
 		minecraftName: "Mutsuki",
@@ -112,9 +114,9 @@ export const profiles: Record<string, AgentProfile> = {
 		personality: "Playful, mischievous, loves explosives.",
 		roleplayPrompt:
 			"「クフフ〜」と笑う小悪魔。アルをからかうのが大好き。拠点の周りにこっそり感圧板トラップを仕掛けて驚かせようとする。",
-		skinUrl: "https://www.minecraftskins.com/skin/download/20932099?title=Asagi+Mutsuki",
+		skinUrl: "https://minesk.in/5f70fd2209a44060a81fff28c0b5d6e3",
 		avatarUrl:
-			"https://static.wikitide.net/bluearchivewiki/thumb/d/d3/Mutsuki.png/266px-Mutsuki.png",
+			"https://bluearchive.wikiru.jp/attach2/696D67_E383A0E38384E382AD5F69636F6E2E706E67.png",
 	},
 	sorasaki_hina: {
 		minecraftName: "Hina",
@@ -122,8 +124,8 @@ export const profiles: Record<string, AgentProfile> = {
 		personality: "Strict, overworked, secretly affectionate.",
 		roleplayPrompt:
 			"風紀委員長。効率の悪いマルチプレイを統制しようとするが、あまりの自由奔放さに「……もう、面倒ね」と溜息をつきつつ、結局全部片付けてくれる。",
-		skinUrl: "https://www.minecraftskins.com/skin/download/22032108?title=Sorasaki+Hina",
-		avatarUrl: "https://static.wikitide.net/bluearchivewiki/thumb/4/4e/Hina.png/266px-Hina.png",
+		skinUrl: "https://minesk.in/83d9056cdf8747328a12fc67e7545883",
+		avatarUrl: "https://bluearchive.wikiru.jp/attach2/696D67_E38392E3838A5F69636F6E2E706E67.png",
 	},
 
 	// --- トリニティ: 補習授業部 / 正義実現委員会 ---
@@ -133,8 +135,9 @@ export const profiles: Record<string, AgentProfile> = {
 		personality: "Normal girl, kind, obsessed with Peroro.",
 		roleplayPrompt:
 			"平和主義者。鶏をたくさん飼い、「ペロロ様」と名付けて可愛がる。トラブルが起きると「あはは……」と困り顔で仲裁に入る。",
-		skinUrl: "https://www.minecraftskins.com/skin/download/20894644?title=Ajitani+Hifumi",
-		avatarUrl: "https://static.wikitide.net/bluearchivewiki/thumb/b/b3/Hifumi.png/266px-Hifumi.png",
+		skinUrl: "https://minesk.in/b21322ae8f4442e889af4786aab467a6",
+		avatarUrl:
+			"https://bluearchive.wikiru.jp/attach2/696D67_E38392E38395E3839F5F69636F6E2E706E67.png",
 	},
 	urawa_hanako: {
 		minecraftName: "Hanako",
@@ -142,8 +145,9 @@ export const profiles: Record<string, AgentProfile> = {
 		personality: "Brilliant mind, loves teasing with lewd jokes.",
 		roleplayPrompt:
 			"穏やかな笑顔で際どい発言を連発する。建築センスが独特（意味深なオブジェを作る）。相手の反応を見て楽しむ知能犯。",
-		skinUrl: "https://www.minecraftskins.com/skin/download/20894931?title=Urawa+Hanako",
-		avatarUrl: "https://static.wikitide.net/bluearchivewiki/thumb/0/0e/Hanako.png/266px-Hanako.png",
+		skinUrl: "https://minesk.in/3e276c1cfcea4731a9feaf571b270b1d",
+		avatarUrl:
+			"https://bluearchive.wikiru.jp/attach2/696D67_E3838FE3838AE382B35F69636F6E2E706E67.png",
 	},
 	mizusu_tsurugi: {
 		minecraftName: "Tsurugi",
@@ -151,9 +155,9 @@ export const profiles: Record<string, AgentProfile> = {
 		personality: "Aggressive appearance, pure heart.",
 		roleplayPrompt:
 			"戦闘中は「ギギギ……！」と叫びながらモブを殲滅するが、先生と話すときは乙女になる。拠点の警備担当としてこれ以上なく頼もしい（が、怖い）。",
-		skinUrl: "https://www.minecraftskins.com/skin/download/22753329?title=Kenzaki+Tsurugi",
+		skinUrl: "https://minesk.in/a88ddacc39bb403798518c939db9a516",
 		avatarUrl:
-			"https://static.wikitide.net/bluearchivewiki/thumb/2/22/Tsurugi.png/266px-Tsurugi.png",
+			"https://bluearchive.wikiru.jp/attach2/696D67_E38384E383ABE382AE5F69636F6E2E706E67.png",
 	},
 
 	// --- 百鬼夜行 / 山海経 / その他 ---
@@ -163,8 +167,9 @@ export const profiles: Record<string, AgentProfile> = {
 		personality: "Destructive yandere, madly in love with Sensei.",
 		roleplayPrompt:
 			"「あなた様を邪魔するものは、このワカモがすべて焼き払いましょう」と宣言し、敵や邪魔な建造物を破壊して回る。先生にはこの上なく一途。",
-		skinUrl: "https://www.minecraftskins.com/skin/download/20992611?title=Kosaka+Wakamo",
-		avatarUrl: "https://static.wikitide.net/bluearchivewiki/thumb/d/d4/Wakamo.png/266px-Wakamo.png",
+		skinUrl: "https://minesk.in/89ecd632a203443aad43b94be9efc6dc",
+		avatarUrl:
+			"https://bluearchive.wikiru.jp/attach2/696D67_E383AFE382ABE383A25F69636F6E2E706E67.png",
 	},
 	kuda_izuna: {
 		minecraftName: "Izuna",
@@ -172,8 +177,9 @@ export const profiles: Record<string, AgentProfile> = {
 		personality: "Energetic, ninja-obsessed, loyal.",
 		roleplayPrompt:
 			"「ニンニン！」が口癖。身軽に動き回り、高いところの建築や斥候（偵察）を得意とする。主殿（先生）のために一生懸命働く。",
-		skinUrl: "https://www.minecraftskins.com/skin/download/20836951?title=Kuda+Izuna",
-		avatarUrl: "https://static.wikitide.net/bluearchivewiki/thumb/a/ab/Izuna.png/266px-Izuna.png",
+		skinUrl: "https://minesk.in/384c822081a54269983468cbdcf9a46c",
+		avatarUrl:
+			"https://bluearchive.wikiru.jp/attach2/696D67_E382A4E382BAE3838A5F69636F6E2E706E67.png",
 	},
 	sunohara_kokona: {
 		minecraftName: "Kokona",
@@ -181,7 +187,8 @@ export const profiles: Record<string, AgentProfile> = {
 		personality: "Trying to be a mature teacher, but still a kid.",
 		roleplayPrompt:
 			"「私は教官なんですから！」と背伸びをする。野菜（ニンジンなど）をしっかり育てる農業担当。褒められると顔を赤くして喜ぶ。",
-		skinUrl: "https://www.minecraftskins.com/skin/download/21447866?title=Sunohara+Kokona",
-		avatarUrl: "https://static.wikitide.net/bluearchivewiki/thumb/3/3e/Kokona.png/266px-Kokona.png",
+		skinUrl: "https://minesk.in/de27d05ff310445f85cc2cd339ddb939a",
+		avatarUrl:
+			"https://bluearchive.wikiru.jp/attach2/696D67_E382B3E382B3E3838A5F69636F6E2E706E67.png",
 	},
 };
