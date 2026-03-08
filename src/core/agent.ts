@@ -1081,46 +1081,41 @@ export class MinecraftAgent {
 				this.bot.clearControlStates();
 
 				if (inWater) {
-					this.log(`Pathfinding: Water recovery initiated (Targeting ledge)...`);
+					this.log(`Pathfinding: Water recovery initiated (Avoiding ledge collision)...`);
 
-					// 【修正版】水中リカバリのターゲット取得
-					let targetPos = null;
+					// 1. ゴール座標を安全に取得 (Type casting for Goal variations)
+					const goal: any = this.bot.pathfinder.goal;
+					let targetVec = null;
 
-					if (currentGoal) {
-						// GoalBlock や GoalLookAt などの場合、直接座標プロパティを持っていることがある
-						const goal = currentGoal as any;
-						if (goal.x !== undefined && goal.y !== undefined && goal.z !== undefined) {
-							targetPos = new (require("vec3"))(goal.x, goal.y, goal.z);
+					if (goal) {
+						// GoalBlock, GoalXZ, GoalNear などのプロパティを順次確認
+						if (goal.x !== undefined && goal.z !== undefined) {
+							const y = goal.y ?? this.bot.entity.position.y;
+							targetVec = new (require("vec3"))(goal.x, y, goal.z);
 						} else if (goal.dest) {
-							// 一部のカスタムGoal用
-							targetPos = goal.dest;
+							targetVec = goal.dest;
 						}
 					}
 
-					// 1. 目的地（または次のノード）を向く
-					if (targetPos) {
-						this.bot.lookAt(targetPos, true);
-					} else {
-						// 目的地が不明な場合は、現在pathfinderが目指している次のポイントを向く
-						const path = (this.bot.pathfinder as any).currentPath;
-						if (path && path.length > 0) {
-							this.bot.lookAt(path[0], true);
-						}
+					// 2. リカバリシーケンス
+					// まず目的地を向く
+					if (targetVec) {
+						this.bot.lookAt(targetVec, true);
 					}
 
-					// 2. 一度「後ろ」に下がって助走距離を作る
+					// A. 一旦後ろに下がって「角」への引っかかりを外す
 					this.bot.setControlState("back", true);
 
 					setTimeout(() => {
 						this.bot.setControlState("back", false);
 
-						// 3. ジャンプ、前進、そしてスプリントを同時にオン
-						this.bot.setControlState("jump", true);
+						// B. 目的地に向かってスプリント・ジャンプで飛び乗る
 						this.bot.setControlState("forward", true);
+						this.bot.setControlState("jump", true);
 						this.bot.setControlState("sprint", true);
 
-						// 4. 水中なので少し長めに（1.2〜1.5秒）実行して乗り上げさせる
 						setTimeout(() => {
+							// C. 状態をクリアしてPathfinderを再開
 							this.bot.setControlState("jump", false);
 							this.bot.setControlState("sprint", false);
 							this.bot.clearControlStates();
@@ -1128,8 +1123,8 @@ export class MinecraftAgent {
 							if (currentGoal) {
 								this.bot.pathfinder.setGoal(currentGoal);
 							}
-						}, 1200);
-					}, 250); // 0.25秒だけ下がる
+						}, 1200); // 乗り上げるまで1.2秒確保
+					}, 300); // 0.3秒下がって隙間を作る
 				} else {
 					// 【陸上リカバリ】既存の「後ろに下がって斜めジャンプ」
 					this.bot.setControlState("back", true);
