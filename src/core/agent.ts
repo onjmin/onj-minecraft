@@ -138,6 +138,13 @@ export class MinecraftAgent {
 			port: Number(process.env.MINECRAFT_PORT),
 			username: profile.minecraftName,
 			auth: "offline",
+			// 未指定なら mineflayer の自動判定に任せる。
+			// 自動判定はサーバーのプロトコル番号から minecraftVersion を1つ選ぶが、
+			// 同一プロトコルに複数バージョンがぶら下がる場合、
+			// minecraft-data にデータが無い方を引いて "No data available" で落ちることがある。
+			// 例: protocol 775 は 26.1 / 26.1.1 / 26.1.2 が該当し、データがあるのは 26.1 のみ。
+			// その場合は MINECRAFT_VERSION でデータのある版を明示する。
+			...(process.env.MINECRAFT_VERSION ? { version: process.env.MINECRAFT_VERSION } : {}),
 		});
 
 		// エディション差を吸収する操作層。Java版なので JavaDriver を割り当てる。

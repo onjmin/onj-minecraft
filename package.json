@@ -1,37 +1,42 @@
 {
-  "name": "onj-minecraft",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
-  "scripts": {
-    "start": "tsx src/workflow/index.ts",
-    "dev": "tsx --watch src/workflow/index.ts",
-    "lint": "biome check .",
-    "format": "biome format --write ."
-  },
-  "keywords": [],
-  "author": "onjmin",
-  "license": "MIT",
-  "packageManager": "pnpm@10.17.1",
-  "volta": {
-    "node": "24.13.1",
-    "pnpm": "10.30.1"
-  },
-  "devDependencies": {
-    "@biomejs/biome": "2.4.4",
-    "@types/node": "25.3.0",
-    "tsx": "4.21.0",
-    "typescript": "5.9.3"
-  },
-  "dependencies": {
-    "mineflayer": "4.35.0",
-    "mineflayer-armor-manager": "2.0.1",
-    "mineflayer-auto-eat": "5.0.3",
-    "mineflayer-collectblock": "1.6.0",
-    "mineflayer-pathfinder": "2.4.5",
-    "mineflayer-pvp": "1.3.2",
-    "mineflayer-tool": "1.2.0",
-    "vec3": "0.1.10",
-    "zod": "4.3.6"
-  }
+	"name": "onj-minecraft",
+	"version": "1.0.0",
+	"description": "",
+	"main": "index.js",
+	"scripts": {
+		"start": "tsx src/workflow/index.ts",
+		"dev": "tsx --watch src/workflow/index.ts",
+		"lint": "biome check .",
+		"format": "biome format --write ."
+	},
+	"keywords": [],
+	"author": "onjmin",
+	"license": "MIT",
+	"packageManager": "pnpm@10.17.1",
+	"volta": {
+		"node": "24.13.1",
+		"pnpm": "10.30.1"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "2.4.4",
+		"@types/node": "25.3.0",
+		"tsx": "4.21.0",
+		"typescript": "5.9.3"
+	},
+	"dependencies": {
+		"mineflayer": "4.38.0",
+		"mineflayer-armor-manager": "2.0.1",
+		"mineflayer-auto-eat": "5.0.3",
+		"mineflayer-collectblock": "1.6.0",
+		"mineflayer-pathfinder": "2.4.5",
+		"mineflayer-pvp": "1.3.2",
+		"mineflayer-tool": "1.2.0",
+		"vec3": "0.1.10",
+		"zod": "4.3.6"
+	},
+	"pnpm": {
+		"overrides": {
+			"prismarine-physics>minecraft-data": "3.114.0"
+		}
+	}
 }
