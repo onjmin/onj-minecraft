@@ -1,9 +1,13 @@
-import { type DamageInfo } from "./perception";
+import type { DamageInfo } from "./perception";
 
 export interface ThinkingState {
 	profile: {
 		name: string;
 		personality?: string;
+		/** なりきりの指示。会話の口調はこれで決まる。 */
+		roleplay?: string;
+		/** 会話で使う言語。未指定なら言語を指定しない。 */
+		chatLanguage?: string;
 	};
 
 	environment: {
@@ -51,18 +55,27 @@ export function buildThinkingPrompt(state: ThinkingState): string {
 	sections.push(buildSkillSection(state));
 	sections.push(buildMemorySection(state));
 	sections.push(buildChatSection(state));
-	sections.push(buildOutputFormatSection());
+	sections.push(buildOutputFormatSection(state));
 
 	return sections.filter(Boolean).join("\n\n");
 }
 
 function buildIdentitySection(state: ThinkingState): string {
-	return `
-You are ${state.profile.name}, an autonomous Minecraft agent.
-Personality: ${state.profile.personality ?? "calm, rational, survival-focused"}.
+	const roleplay = state.profile.roleplay?.trim();
 
-Think strategically and act efficiently.
-`.trim();
+	const parts = [
+		`You are ${state.profile.name}, an autonomous Minecraft agent.`,
+		`Personality: ${state.profile.personality ?? "calm, rational, survival-focused"}.`,
+	];
+
+	// なりきりの指示は会話の口調を決めるので、思考プロンプトにも載せる
+	if (roleplay) {
+		parts.push("", "=== PERSONA (how you speak) ===", roleplay);
+	}
+
+	parts.push("", "Think strategically and act efficiently.");
+
+	return parts.join("\n");
 }
 
 function buildAgentRulesSection(): string {
@@ -161,7 +174,14 @@ ${state.chatHistory.join("\n")}
 `.trim();
 }
 
-function buildOutputFormatSection(): string {
+function buildOutputFormatSection(state: ThinkingState): string {
+	// Chat だけは人間に読ませるものなので言語を指定できるようにする。
+	// Rationale などは内部用なので英語のままでよい。
+	const lang = state.profile.chatLanguage?.trim();
+	const chatLine = lang
+		? `Chat: (optional, message to send. Write it in ${lang}. Stay in character.)`
+		: "Chat: (optional, message to send)";
+
 	return `
 === OUTPUT FORMAT ===
 
@@ -169,7 +189,7 @@ Rationale: (optional, internal reasoning)
 Strategy: (optional, update or keep current)
 Achievement: (optional, if something was completed)
 Skill: (exact name)
-Chat: (optional, message to send)
+${chatLine}
 `.trim();
 }
 

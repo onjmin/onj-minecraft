@@ -12,6 +12,11 @@ export interface AgentProfile {
 	skinUrl: string;
 	/** Discordの通知アイコン用 (正方形の顔画像など) **/
 	avatarUrl: string;
+	/**
+	 * 会話で使う言語。未指定ならプロンプト側で言語を指定しない。
+	 * 例: "日本語"
+	 */
+	chatLanguage?: string;
 	/** オプション: 初期装備やスポーン地点などの追加設定 */
 	metadata?: Record<string, any>;
 }

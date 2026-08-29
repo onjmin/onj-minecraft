@@ -13,7 +13,7 @@
  */
 import { MinecraftAgent } from "../core/agent";
 import { BedrockDriver } from "../core/driver/bedrock";
-import { profiles } from "../profiles";
+import { kusabot } from "../profiles/kusabot";
 import { gotoCoordsSkill } from "../skills/goto/coords";
 import { gotoPlayerSkill } from "../skills/goto/player";
 
@@ -27,7 +27,9 @@ async function main() {
 	const invite = process.env.REALM_INVITE;
 	if (!invite) throw new Error("REALM_INVITE を指定してください");
 
-	const profile = Object.values(profiles)[0];
+	// 統合版は1体だけで、話し相手は日本語話者の人間。
+	// 複数体の社会シミュレーション向けに書かれた既存キャラではなく専用の人格を使う。
+	const profile = kusabot;
 
 	const driver = new BedrockDriver({
 		realmInvite: invite,

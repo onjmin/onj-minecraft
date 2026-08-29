@@ -235,7 +235,11 @@ export class MinecraftAgent {
 	 * ここで積んだ履歴が思考プロンプトに載り、返答の材料になる。
 	 */
 	private handleIncomingChat(username: string, message: string): void {
-		if (!username || username === this.profile.minecraftName) return;
+		if (!username) return;
+		// 統合版の表示名は Xbox アカウント側で決まりプロフィールと一致しないため、
+		// Driver が把握している実際のユーザー名でも自己発言を弾く
+		const selfNames = [this.profile.minecraftName, this.driver.getState().username].filter(Boolean);
+		if (selfNames.includes(username)) return;
 
 		this.chatHistory.push({ username, message, timestamp: Date.now() });
 		if (this.chatHistory.length > this.maxChatHistory) {
@@ -859,6 +863,8 @@ export class MinecraftAgent {
 				profile: {
 					name: this.profile.minecraftName,
 					personality: this.profile.personality,
+					roleplay: this.profile.roleplayPrompt,
+					chatLanguage: this.profile.chatLanguage,
 				},
 				environment: {
 					biome: "unknown",
@@ -908,6 +914,8 @@ export class MinecraftAgent {
 			profile: {
 				name: this.profile.minecraftName,
 				personality: this.profile.personality,
+				roleplay: this.profile.roleplayPrompt,
+				chatLanguage: this.profile.chatLanguage,
 			},
 			environment: {
 				biome: perception.environment.biome,
