@@ -281,12 +281,17 @@ export class JavaDriver implements BotDriver {
 	): Promise<void> {
 		const block = this.bot.blockAt(toVec3(furnace));
 		if (!block) throw new Error("No furnace at given position");
+
+		// アイテムの解決は「かまどを開く前」に行う。
+		// 開いた後だと currentWindow が furnace に切り替わっており、
+		// putFuel/putInput が期待するスロット範囲で見つけられなくなる。
+		const fuelItem = this.bot.inventory.items().find((i: any) => i.name === fuel);
+		const inputItem = this.bot.inventory.items().find((i: any) => i.name === input);
+		if (!fuelItem) throw new Error(`No fuel ${fuel}`);
+		if (!inputItem) throw new Error(`No input ${input}`);
+
 		const f = await this.bot.openFurnace(block);
 		try {
-			const fuelItem = this.bot.inventory.items().find((i: any) => i.name === fuel);
-			const inputItem = this.bot.inventory.items().find((i: any) => i.name === input);
-			if (!fuelItem) throw new Error(`No fuel ${fuel}`);
-			if (!inputItem) throw new Error(`No input ${input}`);
 			await f.putFuel(fuelItem.type, null, fuelCount);
 			await f.putInput(inputItem.type, null, inputCount);
 		} finally {

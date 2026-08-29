@@ -5,12 +5,12 @@ import { goals, Movements, pathfinder } from "mineflayer-pathfinder";
 import type { AgentProfile } from "../profiles/types";
 import { exploreLandSkill } from "../skills/exploring/land";
 import type { SkillResponse } from "../skills/types";
+import { JavaDriver } from "./driver/java";
+import type { BotDriver } from "./driver/types";
 import { llm } from "./llm-client";
 import { parseLlmOutput } from "./llm-output-parser";
 import { createPerceptionSnapshot, type DamageInfo } from "./perception";
 import { buildThinkingPrompt } from "./prompt-builder";
-import { JavaDriver } from "./driver/java";
-import type { BotDriver } from "./driver/types";
 import type { SafeBot } from "./types";
 import { emitDiscordWebhook, translateWithRoleplay } from "./utils/discord-webhook";
 import { isSameSimhash } from "./utils/simhash";
@@ -213,7 +213,9 @@ export class MinecraftAgent {
 			this.log("First spawn - Initializing pathfinder");
 			this.setupPathfinderConfig();
 
-			if (!this.hasStartedLoops) {
+			// DISABLE_AUTONOMY=1 のときは反射ループ・思考ループを起動しない。
+			// スキルを外部から直接呼んで検証する用途で、割り込みを防ぐために使う。
+			if (!this.hasStartedLoops && process.env.DISABLE_AUTONOMY !== "1") {
 				this.hasStartedLoops = true;
 				this.startReflexLoop();
 				this.startThinkingLoop();
@@ -252,8 +254,11 @@ export class MinecraftAgent {
 			}
 		});
 
-		this.bot.on("kicked", (reason: string, loggedIn: boolean) => {
-			this.log(`Kicked from server: ${reason}, loggedIn: ${loggedIn}`);
+		this.bot.on("kicked", (reason: unknown, loggedIn: boolean) => {
+			// kick 理由は文字列ではなく JSON テキストコンポーネントで届くため、
+			// そのまま埋め込むと [object Object] になって原因が追えない。
+			const text = typeof reason === "string" ? reason : JSON.stringify(reason);
+			this.log(`Kicked from server: ${text}, loggedIn: ${loggedIn}`);
 			this.handleDisconnect("kicked");
 		});
 
@@ -285,6 +290,13 @@ export class MinecraftAgent {
 		const RECONNECT_DELAY = 5000;
 		const MAX_RETRIES = 10;
 
+		// 古い接続を残したまま同名で繋ぎ直すと、サーバーに二重ログインと判定され
+		// multiplayer.disconnect.duplicate_login で蹴られ続ける。先に確実に切る。
+		try {
+			this.bot.removeAllListeners();
+			this.bot.quit();
+		} catch {}
+
 		this.log(`Reconnecting in ${RECONNECT_DELAY / 1000} seconds...`);
 
 		for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
@@ -298,6 +310,9 @@ export class MinecraftAgent {
 					port: Number(process.env.MINECRAFT_PORT),
 					username: this.profile.minecraftName,
 					auth: "offline",
+					// 初回接続と同じ条件で繋ぐ。ここを揃えないと再接続時だけ
+					// 自動判定になり "No data available" で失敗しうる。
+					...(process.env.MINECRAFT_VERSION ? { version: process.env.MINECRAFT_VERSION } : {}),
 				});
 
 				this.bot.loadPlugin(pathfinder);
