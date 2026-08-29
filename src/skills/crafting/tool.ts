@@ -1,4 +1,4 @@
-import type { SafeBot } from "../../core/types";
+import type { BotDriver } from "../../core/driver/types";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 import { ensureCraftingTable, ensurePlanks, ensureSticks } from "./util";
 
@@ -15,7 +15,7 @@ export const craftToolSkill = createSkill<void, { item: string; material: string
 		agent,
 		signal,
 	}): Promise<SkillResponse<{ item: string; material: string }>> => {
-		const { bot } = agent;
+		const { driver } = agent;
 
 		agent.log(`[craftTool] Starting tool crafting...`);
 
@@ -34,7 +34,7 @@ export const craftToolSkill = createSkill<void, { item: string; material: string
 		await ensurePlanks(agent, 3);
 
 		// 1. 次に作るべきツールと素材を判定
-		const target = craftingManager.determineNextSkill(bot);
+		const target = craftingManager.determineNextSkill(driver);
 		agent.log(
 			`[craftTool] Target tool: ${target ? `${target.material}_${target.skillType}` : "none"}`,
 		);
@@ -59,17 +59,16 @@ export const craftToolSkill = createSkill<void, { item: string; material: string
 				);
 			}
 
-			// 3. レシピの取得とクラフト
-			const item = bot.registry.itemsByName[itemName];
-			const recipes = bot.recipesFor(item.id, null, 1, craftingTable);
-			agent.log(`[craftTool] Found ${recipes.length} recipes for ${itemName}`);
+			// 3. レシピの確認とクラフト
+			const canCraft = driver.canCraft(itemName, craftingTable.position);
+			agent.log(`[craftTool] Recipe for ${itemName}: found=${canCraft}`);
 
-			if (recipes.length === 0) {
+			if (!canCraft) {
 				return skillResult.fail(`Insufficient materials or no recipe for ${itemName}.`);
 			}
 
 			// 最大3個までクラフト
-			await bot.craft(recipes[0], maxCraft, craftingTable);
+			await driver.craft(itemName, maxCraft, craftingTable.position);
 			agent.log(`[craftTool] SUCCESS: Crafted up to ${maxCraft} ${itemName}`);
 
 			return skillResult.ok(`Upgraded equipment: Crafted 1 ${itemName}.`, {
@@ -94,8 +93,8 @@ export const craftingManager = {
 	// 優先順位: ピッケル > オノ > シャベル > クワ
 	types: ["pickaxe", "axe", "shovel", "hoe"],
 
-	determineNextSkill: (bot: SafeBot): { skillType: string; material: string } | null => {
-		const items = bot.inventory.items();
+	determineNextSkill: (driver: BotDriver): { skillType: string; material: string } | null => {
+		const items = driver.inventory.items();
 
 		for (const type of craftingManager.types) {
 			// 現在そのカテゴリで持っている最高の素材と数を特定

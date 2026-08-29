@@ -16,7 +16,7 @@ export const craftWeaponSkill = createSkill<void, { item: string; material: stri
 		agent,
 		signal,
 	}): Promise<SkillResponse<{ item: string; material: string }>> => {
-		const { bot } = agent;
+		const { driver } = agent;
 
 		// 棒を確保（武器作成には最低2本必要）
 		const sticksReady = await ensureSticks(agent, 2);
@@ -48,14 +48,11 @@ export const craftWeaponSkill = createSkill<void, { item: string; material: stri
 			// 3. 装備のクラフト
 			const itemName =
 				target.skillType === "shield" ? "shield" : `${target.material}_${target.skillType}`;
-			const item = bot.registry.itemsByName[itemName];
-			const recipes = bot.recipesFor(item.id, null, 1, craftingTable);
-
-			if (recipes.length === 0) {
+			if (!driver.canCraft(itemName, craftingTable.position)) {
 				return skillResult.fail(`Insufficient materials for ${itemName}.`);
 			}
 
-			await bot.craft(recipes[0], 1, craftingTable);
+			await driver.craft(itemName, 1, craftingTable.position);
 
 			return skillResult.ok(`Battle readiness improved: Crafted 1 ${itemName}.`, {
 				item: target.skillType,
@@ -75,8 +72,7 @@ export const craftingManager = {
 	weaponTypes: ["sword", "shield", "helmet", "chestplate", "leggings", "boots"],
 
 	determineNextWeapon: (agent: MinecraftAgent): { skillType: string; material: string } | null => {
-		const { bot } = agent;
-		const items = bot.inventory.items();
+		const items = agent.driver.inventory.items();
 
 		for (const type of craftingManager.weaponTypes) {
 			// 盾は素材の概念が特殊（基本木+鉄）なので個別処理

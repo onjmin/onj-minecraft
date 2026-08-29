@@ -1,4 +1,3 @@
-import { goals } from "mineflayer-pathfinder";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
 /**
@@ -14,14 +13,18 @@ export const huntAnimalsSkill = createSkill<void, { hunted: string; success: boo
 		agent,
 		signal,
 	}): Promise<SkillResponse<{ hunted: string; success: boolean }>> => {
-		const { bot } = agent;
+		const { driver } = agent;
+		const origin = driver.getState().position;
 
 		// 1. Target animals (passive mobs)
 		// 対象とする動物のリスト
 		const targetNames = ["cow", "pig", "sheep", "chicken", "rabbit"];
-		const target = bot.nearestEntity((e) => {
-			return e.name ? targetNames.includes(e.name) : false;
-		});
+		const distanceTo = (p: { x: number; y: number; z: number }) =>
+			Math.hypot(p.x - origin.x, p.y - origin.y, p.z - origin.z);
+		const [target] = driver
+			.nearbyEntities(32)
+			.filter((e) => targetNames.includes(e.name))
+			.sort((a, b) => distanceTo(a.position) - distanceTo(b.position));
 
 		if (!target) {
 			return skillResult.fail("No animals found nearby to hunt.");
@@ -30,25 +33,25 @@ export const huntAnimalsSkill = createSkill<void, { hunted: string; success: boo
 		try {
 			// 2. Equip weapon (sword or axe)
 			// 武器を装備（剣を優先、なければ斧）
-			const weapon = bot.inventory
+			const weapon = driver.inventory
 				.items()
 				.find((item) => item.name.includes("sword") || item.name.includes("axe"));
-			if (weapon) await bot.equip(weapon, "hand");
+			if (weapon) await driver.equip(weapon.name, "hand");
 
 			// 3. Approach and attack
 			// 動物に近づいて攻撃
 			const pos = target.position;
-			await agent.abortableGoto(signal, new goals.GoalFollow(target, 1));
+			await driver.goto(signal, { kind: "follow", entityId: target.id, distance: 1 });
 
 			// Attack the entity
 			// 攻撃実行
-			await agent.abortableAttack(signal, target);
+			await driver.attack(signal, target.id);
 
 			// 4. Wait a moment and collect drops (Reflex)
 			// ドロップアイテムを拾うために少し待機して移動（脊髄反射）
 			await new Promise((r) => setTimeout(r, 800));
-			await agent.abortableGoto(signal, new goals.GoalNear(pos.x, pos.y, pos.z, 1));
-			await agent.pickupNearbyItems(signal);
+			await driver.goto(signal, { kind: "near", position: pos, distance: 1 });
+			await driver.pickupNearbyItems(signal);
 
 			return skillResult.ok(`Successfully hunted a ${target.name}.`, {
 				hunted: target.name || "unknown",

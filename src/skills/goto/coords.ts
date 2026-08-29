@@ -1,4 +1,3 @@
-import { goals } from "mineflayer-pathfinder";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
 export const gotoCoordsSkill = createSkill<
@@ -22,8 +21,7 @@ export const gotoCoordsSkill = createSkill<
 		agent.log(`[goto.coords] Moving to (${x}, ${y}, ${z})`);
 
 		try {
-			const goal = new goals.GoalNear(x, y, z, 2);
-			await agent.abortableGoto(signal, goal);
+			await agent.driver.goto(signal, { kind: "near", position: { x, y, z }, distance: 2 });
 			return skillResult.ok(`Moved to coordinates (${x}, ${y}, ${z}).`, { x, y, z });
 		} catch (err) {
 			return skillResult.fail(

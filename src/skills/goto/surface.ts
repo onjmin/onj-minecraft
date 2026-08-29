@@ -1,5 +1,4 @@
-import { goals } from "mineflayer-pathfinder";
-import { Vec3 } from "vec3";
+import type { Position } from "../../core/driver/types";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
 const SAFE_BLOCKS = [
@@ -35,15 +34,16 @@ export const gotoSurfaceSkill = createSkill<void, { y: number; method: string }>
 		"Moves up to reach the surface. Efficiently samples nearby ground levels. Falls back to digging straight up if no path is found.",
 	inputSchema: {} as any,
 	handler: async ({ agent, signal }): Promise<SkillResponse<{ y: number; method: string }>> => {
-		const { bot } = agent;
-		if (!bot.entity) return skillResult.fail("Bot entity not loaded");
-		const currentPos = bot.entity.position.clone();
+		const { driver } = agent;
+		const state = driver.getState();
+		if (!state.isReady) return skillResult.fail("Bot entity not loaded");
+		const currentPos = state.position;
 		const startY = Math.floor(currentPos.y);
 
 		agent.log(`[goto.surface] Current Y: ${startY}, searching for surface...`);
 
 		const radii = [16, 8, 4];
-		let targetPos: Vec3 | null = null;
+		let targetPos: Position | null = null;
 
 		search: for (const radius of radii) {
 			const attempts = radius <= 4 ? 4 : Math.min(12, radius);
@@ -59,10 +59,9 @@ export const gotoSurfaceSkill = createSkill<void, { y: number; method: string }>
 				const tz = Math.floor(currentPos.z + Math.sin(angle) * dist);
 
 				for (let ty = 120; ty >= 60; ty--) {
-					const checkPos = new Vec3(tx, ty, tz);
-					const block = bot.blockAt(checkPos);
-					const up1 = bot.blockAt(checkPos.offset(0, 1, 0));
-					const up2 = bot.blockAt(checkPos.offset(0, 2, 0));
+					const block = driver.world.blockAt({ x: tx, y: ty, z: tz });
+					const up1 = driver.world.blockAt({ x: tx, y: ty + 1, z: tz });
+					const up2 = driver.world.blockAt({ x: tx, y: ty + 2, z: tz });
 
 					if (!block || !up1 || !up2) continue;
 
@@ -72,7 +71,7 @@ export const gotoSurfaceSkill = createSkill<void, { y: number; method: string }>
 						isTransparent(up1.name) &&
 						isTransparent(up2.name)
 					) {
-						targetPos = new Vec3(tx + 0.5, ty + 1, tz + 0.5);
+						targetPos = { x: tx + 0.5, y: ty + 1, z: tz + 0.5 };
 						agent.log(`[goto.surface] Found surface at (${tx}, ${ty}, ${tz}), radius=${radius}`);
 						break search;
 					}
@@ -82,8 +81,7 @@ export const gotoSurfaceSkill = createSkill<void, { y: number; method: string }>
 
 		if (targetPos) {
 			try {
-				const goal = new goals.GoalNear(targetPos.x, targetPos.y, targetPos.z, 1);
-				await agent.abortableGoto(signal, goal);
+				await agent.driver.goto(signal, { kind: "near", position: targetPos, distance: 1 });
 				return skillResult.ok(`Reached surface at Y=${Math.floor(targetPos.y)}.`, {
 					y: Math.floor(targetPos.y),
 					method: "pathfinder",
@@ -103,13 +101,13 @@ export const gotoSurfaceSkill = createSkill<void, { y: number; method: string }>
 				return skillResult.fail("Aborted");
 			}
 
-			const checkPos = new Vec3(
-				Math.floor(currentPos.x),
-				currentDigY + 1,
-				Math.floor(currentPos.z),
-			);
-			const block = bot.blockAt(checkPos);
-			const above = bot.blockAt(checkPos.offset(0, 1, 0));
+			const checkPos: Position = {
+				x: Math.floor(currentPos.x),
+				y: currentDigY + 1,
+				z: Math.floor(currentPos.z),
+			};
+			const block = driver.world.blockAt(checkPos);
+			const above = driver.world.blockAt({ ...checkPos, y: checkPos.y + 1 });
 
 			if (!block || block.name === "air") {
 				currentDigY++;
@@ -117,9 +115,8 @@ export const gotoSurfaceSkill = createSkill<void, { y: number; method: string }>
 			}
 
 			if (!above || above.name === "air") {
-				const goal = new goals.GoalNear(checkPos.x, checkPos.y, checkPos.z, 1);
 				try {
-					await agent.abortableGoto(signal, goal);
+					await driver.goto(signal, { kind: "near", position: checkPos, distance: 1 });
 					return skillResult.ok(`Reached surface at Y=${checkPos.y}.`, {
 						y: checkPos.y,
 						method: "dig-up",
@@ -131,13 +128,10 @@ export const gotoSurfaceSkill = createSkill<void, { y: number; method: string }>
 			}
 
 			agent.log(`[goto.surface] Digging up at Y=${currentDigY + 1}...`);
-			const toolPlugin = (bot as any).tool;
-			if (toolPlugin) {
-				await toolPlugin.equipForBlock(block);
-			}
+			await driver.equipBestTool(checkPos);
 
 			try {
-				await agent.abortableDig(signal, block);
+				await driver.dig(signal, checkPos);
 				await new Promise((r) => setTimeout(r, 100));
 			} catch {
 				return skillResult.fail("Dig-up aborted or failed");

@@ -12,7 +12,7 @@ export const craftSmeltingSkill = createSkill<void, { item: string; amount: numb
 		"Automatically identifies smeltable items and fuels using recipe data, and starts the smelting process. Also supports creating charcoal (from wood/logs) for crafting torches.",
 	inputSchema: {} as any,
 	handler: async ({ agent, signal }): Promise<SkillResponse<{ item: string; amount: number }>> => {
-		const { bot } = agent;
+		const { driver } = agent;
 
 		// 1. かまどの確保（util.ts の共通関数を使用）
 		const furnaceBlock = await ensureFurnace(agent);
@@ -22,14 +22,11 @@ export const craftSmeltingSkill = createSkill<void, { item: string; amount: numb
 			);
 		}
 
-		const items = bot.inventory.items();
+		const items = driver.inventory.items();
 
 		// 2. 精錬対象（Input）の厳密な判定
 		// かまどのレシピデータにそのアイテムが材料として含まれているかを確認
-		const smeltable = items.find((item) => {
-			const recipes = bot.recipesAll(item.type, 1, false);
-			return recipes.length > 0;
-		});
+		const smeltable = items.find((item) => driver.canSmelt(item.name));
 
 		if (!smeltable) {
 			return skillResult.fail("No items in inventory can be smelted in a furnace.");
@@ -56,16 +53,14 @@ export const craftSmeltingSkill = createSkill<void, { item: string; amount: numb
 		}
 
 		try {
-			// 4. かまどを開いて投入
-			const furnace = await bot.openFurnace(furnaceBlock);
-
-			// 燃料を投入（最大スタック、または現在必要な分だけ）
-			await furnace.putFuel(fuel.type, null, fuel.count);
-
-			// 素材を投入
-			await furnace.putInput(smeltable.type, null, smeltable.count);
-
-			furnace.close();
+			// 4. かまどを開いて投入（燃料は最大スタック、素材は手持ちすべて）
+			await driver.smelt(
+				furnaceBlock.position,
+				smeltable.name,
+				smeltable.count,
+				fuel.name,
+				fuel.count,
+			);
 
 			return skillResult.ok(
 				`Started smelting ${smeltable.count}x ${smeltable.name} using ${fuel.name}.`,

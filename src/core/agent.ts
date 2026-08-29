@@ -9,6 +9,8 @@ import { llm } from "./llm-client";
 import { parseLlmOutput } from "./llm-output-parser";
 import { createPerceptionSnapshot, type DamageInfo } from "./perception";
 import { buildThinkingPrompt } from "./prompt-builder";
+import { JavaDriver } from "./driver/java";
+import type { BotDriver } from "./driver/types";
 import type { SafeBot } from "./types";
 import { emitDiscordWebhook, translateWithRoleplay } from "./utils/discord-webhook";
 import { isSameSimhash } from "./utils/simhash";
@@ -59,6 +61,11 @@ type StrategicState = {
 
 export class MinecraftAgent {
 	public bot: SafeBot;
+	/**
+	 * エディション差を吸収する操作層。skills/ からは bot ではなく driver を使うこと。
+	 * Java版は JavaDriver、統合版は BedrockDriver に差し替える。
+	 */
+	public driver: BotDriver;
 	private profile: AgentProfile;
 	private skills: Map<string, any>;
 	private currentTaskName: string = "idle";
@@ -132,6 +139,9 @@ export class MinecraftAgent {
 			username: profile.minecraftName,
 			auth: "offline",
 		});
+
+		// エディション差を吸収する操作層。Java版なので JavaDriver を割り当てる。
+		this.driver = new JavaDriver(this);
 
 		// インスタンス作成時に一度だけプラグインをロード
 		this.bot.loadPlugin(pathfinder);

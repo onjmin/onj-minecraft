@@ -1,4 +1,3 @@
-import { goals } from "mineflayer-pathfinder";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
 export const collectDirtSkill = createSkill<void, { count: number }>({
@@ -7,14 +6,9 @@ export const collectDirtSkill = createSkill<void, { count: number }>({
 		"Collects dirt blocks for scaffolding or building base walls. Digs nearby dirt/grass blocks.",
 	inputSchema: {} as any,
 	handler: async ({ agent, signal }): Promise<SkillResponse<{ count: number }>> => {
-		const { bot } = agent;
-		const toolPlugin = (bot as any).tool;
+		const { driver } = agent;
 
-		const dirtBlocks = bot.findBlocks({
-			matching: (b: any) => b.name === "dirt" || b.name === "grass_block",
-			maxDistance: 16,
-			count: 20,
-		});
+		const dirtBlocks = driver.world.findBlocks(["dirt", "grass_block"], 16, 20);
 
 		if (dirtBlocks.length === 0) {
 			return skillResult.fail("No dirt or grass blocks found nearby.");
@@ -25,23 +19,21 @@ export const collectDirtSkill = createSkill<void, { count: number }>({
 		let collected = 0;
 		const maxCollect = 16;
 
-		for (const pos of dirtBlocks) {
+		for (const block of dirtBlocks) {
 			if (collected >= maxCollect) break;
 			if (agent.checkAbort(signal)) break;
 
-			const block = bot.blockAt(pos);
-			if (!block || !bot.canDigBlock(block)) continue;
+			if (!block.diggable) continue;
 
-			await agent.abortableGoto(signal, new goals.GoalNear(pos.x, pos.y, pos.z, 1));
+			await driver.goto(signal, { kind: "near", position: block.position, distance: 1 });
 
-			const currentBlock = bot.blockAt(pos);
-			if (currentBlock && bot.canDigBlock(currentBlock)) {
-				if (toolPlugin) {
-					await toolPlugin.equipForBlock(currentBlock);
-				}
-				await agent.abortableDig(signal, currentBlock);
+			// 移動中に地形が変わりうるので取り直す
+			const currentBlock = driver.world.blockAt(block.position);
+			if (currentBlock?.diggable) {
+				await driver.equipBestTool(block.position);
+				await driver.dig(signal, block.position);
 				collected++;
-				await agent.pickupNearbyItems(signal);
+				await driver.pickupNearbyItems(signal);
 			}
 		}
 

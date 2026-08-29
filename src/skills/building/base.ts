@@ -1,6 +1,5 @@
-import { goals } from "mineflayer-pathfinder";
-import { Vec3 } from "vec3";
 import type { MinecraftAgent } from "../../core/agent";
+import type { Position } from "../../core/driver/types";
 import { ensureChest, ensureCraftingTable, ensureFurnace, tryPlaceBlock } from "../crafting/util";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
@@ -13,12 +12,13 @@ export const buildingBaseSkill = createSkill<void, { baseId: string; items: stri
 		agent,
 		signal,
 	}): Promise<SkillResponse<{ baseId: string; items: string[] }>> => {
-		const { bot } = agent;
-		if (!bot.entity) return skillResult.fail("Bot entity not loaded");
-		const pos = bot.entity.position.floored();
+		const { driver } = agent;
+		const state = driver.getState();
+		if (!state.isReady) return skillResult.fail("Bot entity not loaded");
+		const pos = floored(state.position);
 
 		// ★重要: 建築開始時の座標を「固定」する。これ以降、この 'baseCenter' を基準にする。
-		const baseCenter = bot.entity.position.floored();
+		const baseCenter = floored(state.position);
 		const installedItems: string[] = [];
 
 		// 既存拠点の検索も固定座標で行う
@@ -36,34 +36,34 @@ export const buildingBaseSkill = createSkill<void, { baseId: string; items: stri
 
 		// --- Phase 0: 居住空間のクリア ---
 		agent.log("[building.base] Phase 0: Clearing interior space...");
-		const interiorPositions = [baseCenter, baseCenter.offset(0, 1, 0)];
+		const interiorPositions: Position[] = [baseCenter, { ...baseCenter, y: baseCenter.y + 1 }];
 		for (const p of interiorPositions) {
-			const block = bot.blockAt(p);
+			const block = driver.world.blockAt(p);
 			if (block && block.name !== "air" && !["water", "lava"].includes(block.name)) {
-				await bot.dig(block);
+				await driver.dig(signal, p);
 			}
 		}
 
 		// 1. 壁のオフセットを2段分定義
-		const wallOffsets = [
+		const wallOffsets: Position[] = [
 			// 1段目 (y: 0)
-			new Vec3(1, 0, 0),
-			new Vec3(-1, 0, 0),
-			new Vec3(0, 0, 1),
-			new Vec3(0, 0, -1),
-			new Vec3(1, 0, 1),
-			new Vec3(1, 0, -1),
-			new Vec3(-1, 0, 1),
-			new Vec3(-1, 0, -1),
+			{ x: 1, y: 0, z: 0 },
+			{ x: -1, y: 0, z: 0 },
+			{ x: 0, y: 0, z: 1 },
+			{ x: 0, y: 0, z: -1 },
+			{ x: 1, y: 0, z: 1 },
+			{ x: 1, y: 0, z: -1 },
+			{ x: -1, y: 0, z: 1 },
+			{ x: -1, y: 0, z: -1 },
 			// 2段目 (y: 1)
-			new Vec3(1, 1, 0),
-			new Vec3(-1, 1, 0),
-			new Vec3(0, 1, 1),
-			new Vec3(0, 1, -1),
-			new Vec3(1, 1, 1),
-			new Vec3(1, 1, -1),
-			new Vec3(-1, 1, 1),
-			new Vec3(-1, 1, -1),
+			{ x: 1, y: 1, z: 0 },
+			{ x: -1, y: 1, z: 0 },
+			{ x: 0, y: 1, z: 1 },
+			{ x: 0, y: 1, z: -1 },
+			{ x: 1, y: 1, z: 1 },
+			{ x: 1, y: 1, z: -1 },
+			{ x: -1, y: 1, z: 1 },
+			{ x: -1, y: 1, z: -1 },
 		];
 
 		agent.log("[building.house] Phase 1: Securing walls...");
@@ -75,8 +75,8 @@ export const buildingBaseSkill = createSkill<void, { baseId: string; items: stri
 
 		for (const offset of wallOffsets) {
 			if (agent.checkAbort(signal)) break;
-			const targetPos = pos.plus(offset);
-			const block = bot.blockAt(targetPos);
+			const targetPos = plus(pos, offset);
+			const block = driver.world.blockAt(targetPos);
 
 			// 1. 障害物のチェックと除去
 			if (block && block.name !== "air" && !["water", "lava"].includes(block.name)) {
@@ -88,9 +88,10 @@ export const buildingBaseSkill = createSkill<void, { baseId: string; items: stri
 					block.name.includes("shrub");
 
 				if (isReplaceable) {
-					agent.log(`Removing obstacle (${block.name}) at ${targetPos}`);
+					agent.log(`Removing obstacle (${block.name}) at ${fmt(targetPos)}`);
 					// ツール（シャベル等）があれば最適化されますが、素手でも破壊可能
-					await bot.dig(block);
+					await driver.equipBestTool(targetPos);
+					await driver.dig(signal, targetPos);
 				} else {
 					// すでに硬いブロックがある場合はスキップ
 					continue;
@@ -98,17 +99,19 @@ export const buildingBaseSkill = createSkill<void, { baseId: string; items: stri
 			}
 
 			// 2. インベントリから土・石系の資材を探す
-			const inventory = bot.inventory.items();
+			const inventory = driver.inventory.items();
 			const buildMaterial = inventory.find((item) => VALID_BUILD_MATERIALS.includes(item.name));
 
 			if (buildMaterial) {
 				// 自分が邪魔にならないよう中心点に移動
-				await bot.pathfinder.goto(new goals.GoalGetToBlock(pos.x, pos.y, pos.z));
+				await driver.goto(signal, { kind: "getToBlock", position: pos });
 
 				// 設置実行
-				const success = await tryPlaceBlock(bot, buildMaterial.name, buildMaterial.type, agent);
+				// NOTE: 旧実装は検証用の ID に buildMaterial.type（アイテムID）を渡していたが、
+				//       必要なのはブロック側の識別子。名前で照合することで修正している。
+				const success = await tryPlaceBlock(agent, buildMaterial.name, buildMaterial.name);
 				if (success) {
-					agent.log(`Placed ${buildMaterial.name} wall at ${targetPos}`);
+					agent.log(`Placed ${buildMaterial.name} wall at ${fmt(targetPos)}`);
 				}
 			} else {
 				agent.log("Warning: No dirt or stone blocks available for walls.");
@@ -154,21 +157,16 @@ export const buildingBaseSkill = createSkill<void, { baseId: string; items: stri
 		}
 
 		// 松明 (持っていれば設置)
-		const torchItem = bot.inventory.items().find((i) => i.name === "torch");
+		const torchItem = driver.inventory.items().find((i) => i.name === "torch");
 		if (torchItem) {
-			const torchSuccess = await tryPlaceBlock(
-				bot,
-				"torch",
-				bot.registry.blocksByName.torch.id,
-				agent,
-			);
+			const torchSuccess = await tryPlaceBlock(agent, "torch", "torch");
 			if (torchSuccess) installedItems.push("torch");
 		}
 
 		// 3. 最終的な密閉判定
 		let wallCount = 0;
 		for (const offset of surroundingOffsets) {
-			if (bot.blockAt(pos.plus(offset))?.name !== "air") wallCount++;
+			if (driver.world.blockAt(plus(pos, offset))?.name !== "air") wallCount++;
 		}
 
 		// 4. Baseの登録
@@ -191,21 +189,36 @@ export const buildingBaseSkill = createSkill<void, { baseId: string; items: stri
 	},
 });
 
-const surroundingOffsets = [
-	new Vec3(1, 0, 0),
-	new Vec3(-1, 0, 0),
-	new Vec3(0, 0, 1),
-	new Vec3(0, 0, -1),
-	new Vec3(1, 0, 1),
-	new Vec3(1, 0, -1),
-	new Vec3(-1, 0, 1),
-	new Vec3(-1, 0, -1),
+const surroundingOffsets: Position[] = [
+	{ x: 1, y: 0, z: 0 },
+	{ x: -1, y: 0, z: 0 },
+	{ x: 0, y: 0, z: 1 },
+	{ x: 0, y: 0, z: -1 },
+	{ x: 1, y: 0, z: 1 },
+	{ x: 1, y: 0, z: -1 },
+	{ x: -1, y: 0, z: 1 },
+	{ x: -1, y: 0, z: -1 },
 ];
+
+/** 座標にオフセットを足す。Vec3.plus() の置き換え。 */
+function plus(a: Position, b: Position): Position {
+	return { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z };
+}
+
+/** 座標を切り下げる。Vec3.floored() の置き換え。 */
+function floored(p: Position): Position {
+	return { x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z) };
+}
+
+/** ログ出力用の座標整形。 */
+function fmt(p: Position): string {
+	return `(${p.x}, ${p.y}, ${p.z})`;
+}
 
 async function performMaintenance(
 	agent: MinecraftAgent,
 	signal: AbortSignal,
-	pos: Vec3,
+	pos: Position,
 	installedItems: string[],
 	existingBase: {
 		id: string;
@@ -216,20 +229,20 @@ async function performMaintenance(
 		hasStorage: boolean;
 	},
 ): Promise<SkillResponse<{ baseId: string; items: string[] }>> {
-	const { bot } = agent;
+	const { driver } = agent;
 
 	agent.log("[building.base] Phase 1: Checking walls...");
 
 	for (const offset of surroundingOffsets) {
 		if (agent.checkAbort(signal)) break;
-		const targetPos = pos.plus(offset);
-		const block = bot.blockAt(targetPos);
+		const targetPos = plus(pos, offset);
+		const block = driver.world.blockAt(targetPos);
 
 		if (block && block.name !== "air" && !["water", "lava"].includes(block.name)) {
 			continue;
 		}
 
-		const inventory = bot.inventory.items();
+		const inventory = driver.inventory.items();
 		const buildMaterial = inventory.find(
 			(i) =>
 				i.name.includes("planks") ||
@@ -240,11 +253,10 @@ async function performMaintenance(
 		);
 
 		if (buildMaterial) {
-			const awayGoal = new goals.GoalLookAtBlock(targetPos, bot.world);
-			await bot.pathfinder.setGoal(awayGoal);
+			await driver.goto(signal, { kind: "lookAtBlock", position: targetPos });
 
-			const success = await tryPlaceBlock(bot, buildMaterial.name, buildMaterial.type, agent);
-			if (success) agent.log(`Repaired wall at ${targetPos}`);
+			const success = await tryPlaceBlock(agent, buildMaterial.name, buildMaterial.name);
+			if (success) agent.log(`Repaired wall at ${fmt(targetPos)}`);
 		}
 	}
 
@@ -266,20 +278,15 @@ async function performMaintenance(
 		agent.log("Furnace ensured.");
 	}
 
-	const torchItem = bot.inventory.items().find((i) => i.name === "torch");
+	const torchItem = driver.inventory.items().find((i) => i.name === "torch");
 	if (torchItem) {
-		const torchSuccess = await tryPlaceBlock(
-			bot,
-			"torch",
-			bot.registry.blocksByName.torch.id,
-			agent,
-		);
+		const torchSuccess = await tryPlaceBlock(agent, "torch", "torch");
 		if (torchSuccess) installedItems.push("torch");
 	}
 
 	let wallCount = 0;
 	for (const offset of surroundingOffsets) {
-		if (bot.blockAt(pos.plus(offset))?.name !== "air") wallCount++;
+		if (driver.world.blockAt(plus(pos, offset))?.name !== "air") wallCount++;
 	}
 
 	agent.upsertBase({

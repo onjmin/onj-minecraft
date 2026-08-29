@@ -1,6 +1,4 @@
-import { goals } from "mineflayer-pathfinder";
-import type { Vec3 } from "vec3";
-import type { SafeBot } from "../../core/types";
+import type { BlockInfo, BotDriver } from "../../core/driver/types";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
 export const collectStoneSkill = createSkill<void, { minedCount: number }>({
@@ -8,32 +6,28 @@ export const collectStoneSkill = createSkill<void, { minedCount: number }>({
 	description: "Collects stone-type blocks. Requires a pickaxe to successfully obtain stone.",
 	inputSchema: {} as any,
 	handler: async ({ agent, signal }): Promise<SkillResponse<{ minedCount: number }>> => {
-		const { bot } = agent;
+		const { driver } = agent;
 
 		// 石系ブロックを近場からスキャン
-		const stonePositions = stoneScanner.findNearbyStone(bot);
+		const stonePositions = stoneScanner.findNearbyStone(driver);
 
 		if (stonePositions.length === 0) {
 			return skillResult.fail("No stone blocks found nearby. Try moving to a lower altitude.");
 		}
 
 		let minedCount = 0;
-		const toolPlugin = (bot as any).tool;
 
 		try {
 			// 石は数が必要なので、上位10個をターゲットにする
-			for (const pos of stonePositions) {
-				const goal = new goals.GoalNear(pos.x, pos.y, pos.z, 2);
-				await agent.abortableGoto(signal, goal);
+			for (const stone of stonePositions) {
+				await driver.goto(signal, { kind: "near", position: stone.position, distance: 2 });
 
-				const block = bot.blockAt(pos);
+				const block = driver.world.blockAt(stone.position);
 				// 移動中にブロックが変わっていないかチェック
 				if (block && stoneScanner.isStone(block.name)) {
-					if (toolPlugin) {
-						// 適切なツール（ツルハシ）を装備
-						await toolPlugin.equipForBlock(block);
-					}
-					await agent.abortableDig(signal, block);
+					// 適切なツール（ツルハシ）を装備
+					await driver.equipBestTool(block.position);
+					await driver.dig(signal, block.position);
 					minedCount++;
 				}
 			}
@@ -59,12 +53,8 @@ export const stoneScanner = {
 		return stoneScanner.stoneBlocks.includes(name);
 	},
 
-	findNearbyStone: (bot: SafeBot, radius = 8): Vec3[] => {
-		return bot.findBlocks({
-			matching: (block: any) => stoneScanner.isStone(block.name),
-			maxDistance: radius,
-			// 鉱石より出現率が高いため、一度の取得数を多めに設定
-			count: 10,
-		});
+	findNearbyStone: (driver: BotDriver, radius = 8): BlockInfo[] => {
+		// 鉱石より出現率が高いため、一度の取得数を多めに設定
+		return driver.world.findBlocks(stoneScanner.stoneBlocks, radius, 10);
 	},
 };
