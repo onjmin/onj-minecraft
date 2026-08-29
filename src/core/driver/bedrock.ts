@@ -73,6 +73,8 @@ export class BedrockDriver implements BotDriver {
 	private food = 20;
 	private worldTicks = 0;
 	private dimension = "overworld";
+	/** スポーン地点のバイオーム。チャンク解析が入るまでは全域これを返す近似値。 */
+	private biome = "unknown";
 	private rainLevel = 0;
 	private spawned = false;
 
@@ -107,8 +109,12 @@ export class BedrockDriver implements BotDriver {
 			findBlock: () => notImplemented("world.findBlock"),
 			findBlocks: () => notImplemented("world.findBlocks"),
 			findBlocksMatching: () => notImplemented("world.findBlocksMatching"),
-			getBiome: () => notImplemented("world.getBiome"),
-			getLightLevel: () => notImplemented("world.getLightLevel"),
+			// チャンク解析が入るまでは座標別に引けないため、スポーン地点のバイオームを返す。
+			// 知覚が成立しなくなるので例外にはしない。
+			getBiome: () => this.biome,
+			// 統合版はライトレベルをクライアントへ送らない。時刻と高さからの近似値を返す。
+			// 厳密な値を前提にした判定を skills/ 側に書かないこと。
+			getLightLevel: (position) => this.approximateLight(position),
 		};
 
 		this.inventory = {
@@ -123,6 +129,19 @@ export class BedrockDriver implements BotDriver {
 			hasBlock: (name) => this.hasItemName(name),
 			hasItem: (name) => this.hasItemName(name),
 		};
+	}
+
+	/**
+	 * ライトレベルの近似。統合版はライトレベルを送ってこないため、
+	 * 「地上なら時刻に従う / 地下なら暗い」という粗い推定に留める。
+	 */
+	private approximateLight(position: Position): number {
+		// 海面より十分下は日光が届かないとみなす
+		if (position.y < 50) return 0;
+		const t = ((this.worldTicks % 24000) + 24000) % 24000;
+		// 13000-23000 が夜
+		if (t >= 13000 && t < 23000) return 4;
+		return 15;
 	}
 
 	private hasItemName(name: string): boolean {
@@ -211,6 +230,7 @@ export class BedrockDriver implements BotDriver {
 			// rotation は {x: pitch, z: yaw}
 			this.yaw = p.rotation?.z ?? 0;
 			this.dimension = p.dimension ?? "overworld";
+			this.biome = stripNamespace(p.biome_name ?? "unknown");
 			this.rainLevel = p.rain_level ?? 0;
 
 			// チャンクを受け取るには半径を要求する必要がある

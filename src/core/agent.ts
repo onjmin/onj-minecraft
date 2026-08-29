@@ -60,7 +60,14 @@ type StrategicState = {
 };
 
 export class MinecraftAgent {
-	public bot: SafeBot;
+	/**
+	 * mineflayer のボット本体。Java版でのみ生成される。
+	 * 統合版では Driver を注入するため未定義になるので、
+	 * これを直接触る処理は必ず isJava で守ること。
+	 */
+	public bot!: SafeBot;
+	/** mineflayer 由来の機能（経路探索プラグイン・pvp・ブロック読み取り）が使えるか */
+	public readonly isJava: boolean;
 	/**
 	 * エディション差を吸収する操作層。skills/ からは bot ではなく driver を使うこと。
 	 * Java版は JavaDriver、統合版は BedrockDriver に差し替える。
@@ -129,10 +136,23 @@ export class MinecraftAgent {
 		return true;
 	}
 
-	constructor(profile: AgentProfile, skillList: any[]) {
+	/**
+	 * @param injectedDriver 指定するとそのDriverを使い、mineflayer のボットを作らない。
+	 *                       統合版(BedrockDriver)を動かすための入り口。
+	 */
+	constructor(profile: AgentProfile, skillList: any[], injectedDriver?: BotDriver) {
 		this.profile = profile;
 		this.skills = new Map(skillList.map((t) => [t.name, t]));
 
+		if (injectedDriver) {
+			this.isJava = false;
+			this.driver = injectedDriver;
+			// mineflayer 固有の初期化（プラグイン・経路探索設定・イベント配線）は行わない。
+			// ループの起動は接続完了後に startLoops() を呼び出す側の責務とする。
+			return;
+		}
+
+		this.isJava = true;
 		this.bot = mineflayer.createBot({
 			host: process.env.MINECRAFT_HOST,
 			port: Number(process.env.MINECRAFT_PORT),
@@ -191,6 +211,23 @@ export class MinecraftAgent {
 		this.initEvents();
 	}
 
+	/**
+	 * 反射ループと思考ループを起動する。多重起動はしない。
+	 *
+	 * Java版は spawn 時に自動で呼ばれる。統合版は接続の完了タイミングを
+	 * 呼び出し側が握っているため、接続後に明示的に呼ぶこと。
+	 *
+	 * DISABLE_AUTONOMY=1 のときは起動しない。スキルを外部から直接呼んで
+	 * 検証する用途で、割り込みを防ぐために使う。
+	 */
+	public startLoops(): void {
+		if (this.hasStartedLoops) return;
+		if (process.env.DISABLE_AUTONOMY === "1") return;
+		this.hasStartedLoops = true;
+		this.startReflexLoop();
+		this.startThinkingLoop();
+	}
+
 	public log(...outputs: unknown[]) {
 		const time = new Intl.DateTimeFormat("ja-JP", {
 			hour: "2-digit",
@@ -213,13 +250,7 @@ export class MinecraftAgent {
 			this.log("First spawn - Initializing pathfinder");
 			this.setupPathfinderConfig();
 
-			// DISABLE_AUTONOMY=1 のときは反射ループ・思考ループを起動しない。
-			// スキルを外部から直接呼んで検証する用途で、割り込みを防ぐために使う。
-			if (!this.hasStartedLoops && process.env.DISABLE_AUTONOMY !== "1") {
-				this.hasStartedLoops = true;
-				this.startReflexLoop();
-				this.startThinkingLoop();
-			}
+			this.startLoops();
 		});
 
 		this.bot.on("spawn", () => {
@@ -463,7 +494,8 @@ export class MinecraftAgent {
 			this.log(`Setting skin: ${this.profile.skinUrl}`);
 			// スポーン直後の安定を待ってから一度だけ実行
 			setTimeout(() => {
-				this.bot.chat(`/skin url "${this.profile.skinUrl}" slim`);
+				// /skin は Java サーバー側プラグイン(SkinsRestorer)のコマンド
+				if (this.isJava) this.bot.chat(`/skin url "${this.profile.skinUrl}" slim`);
 				this.hasSetSkin = true;
 			}, 5000);
 		}
@@ -537,6 +569,12 @@ export class MinecraftAgent {
 		}
 
 		try {
+			this.driver.stopMoving();
+		} catch {}
+
+		if (!this.isJava) return;
+
+		try {
 			this.bot.pathfinder.setGoal(null);
 		} catch {}
 
@@ -604,7 +642,7 @@ export class MinecraftAgent {
 		this.log(`ReflexLoop started.`);
 		await new Promise((r) => setTimeout(r, Math.random() * 2000));
 
-		while (this.bot && this.bot.entity) {
+		while (this.driver.getState().isReady) {
 			if (this.isInCombat) {
 				await this.checkCombatStatus();
 				await new Promise((r) => setTimeout(r, 500));
@@ -676,6 +714,11 @@ export class MinecraftAgent {
 	}
 
 	private async checkCombatStatus() {
+		// pvp プラグインと bot.entities に依存するため Java 版限定
+		if (!this.isJava) {
+			this.isInCombat = false;
+			return;
+		}
 		const pvpBot = this.bot as any;
 
 		if (pvpBot.pvp?.target) {
@@ -707,7 +750,7 @@ export class MinecraftAgent {
 	}
 
 	private async startThinkingLoop() {
-		while (this.bot && this.bot.entity) {
+		while (this.driver.getState().isReady) {
 			try {
 				const state = this.getAgentStateForThinking();
 				const prompt = buildThinkingPrompt(state);
@@ -759,19 +802,19 @@ export class MinecraftAgent {
 				.map((i) => `${i.name} x${i.count}`)
 				.join(", ") || "Empty";
 
-		const heldItem = this.bot.heldItem ? this.bot.heldItem.name : "bare_hands";
+		const heldItem = this.driver.inventory.heldItem()?.name ?? "bare_hands";
 
 		const chatLogContext =
 			this.chatHistory.map((c) => `<${c.username}> ${c.message}`).join("\n") ||
 			"No recent conversations.";
 
 		// Use perception module
-		const perception = createPerceptionSnapshot(this.bot, this.lastDamageCause);
+		const perception = createPerceptionSnapshot(this.driver, this.lastDamageCause);
 
 		// Nearby blocks sampling (radius 8, random 10 points)
 		const sampleRadius = 8;
 		const sampledBlocks: string[] = [];
-		if (!this.bot.entity) {
+		if (!this.driver.getState().isReady) {
 			return {
 				profile: {
 					name: this.profile.minecraftName,
@@ -800,14 +843,23 @@ export class MinecraftAgent {
 				memorySummary: historyText,
 			};
 		}
+		// 統合版は world 未実装なので、引けない場合は周辺ブロックなしとして扱う
+		const origin = this.driver.getState().position;
 		for (let i = 0; i < 10; i++) {
 			const dx = Math.floor(Math.random() * sampleRadius * 2 - sampleRadius);
 			const dy = Math.floor(Math.random() * sampleRadius * 2 - sampleRadius);
 			const dz = Math.floor(Math.random() * sampleRadius * 2 - sampleRadius);
-			const pos = this.bot.entity.position.offset(dx, dy, dz);
-			const block = this.bot.blockAt(pos);
-			if (block && block.name !== "air") {
-				sampledBlocks.push(block.name);
+			try {
+				const block = this.driver.world.blockAt({
+					x: Math.floor(origin.x) + dx,
+					y: Math.floor(origin.y) + dy,
+					z: Math.floor(origin.z) + dz,
+				});
+				if (block && block.name !== "air") {
+					sampledBlocks.push(block.name);
+				}
+			} catch {
+				break;
 			}
 		}
 		const nearbyBlocksText = [...new Set(sampledBlocks)].slice(0, 10).join(", ") || "None";
@@ -878,7 +930,7 @@ export class MinecraftAgent {
 			this.chatSimhashCache,
 		);
 		if (isNewChat && chatMessage && this.updateFIFO(this.strategicState.chats, chatMessage)) {
-			this.bot.chat(chatMessage);
+			this.driver.chat(chatMessage);
 		}
 
 		if (foundSkillName && this.skills.has(foundSkillName)) {
@@ -917,6 +969,13 @@ export class MinecraftAgent {
 		}
 
 		try {
+			this.driver.stopMoving();
+			this.driver.clearControlStates();
+		} catch {}
+
+		if (!this.isJava) return;
+
+		try {
 			this.bot.pathfinder.setGoal(null);
 		} catch {}
 
@@ -927,10 +986,6 @@ export class MinecraftAgent {
 		try {
 			this.bot.stopDigging();
 		} catch {}
-
-		for (const key of Object.keys(this.bot.controlState)) {
-			this.bot.setControlState(key as any, false);
-		}
 	}
 
 	private isMoving: boolean = false;
@@ -1020,8 +1075,9 @@ export class MinecraftAgent {
 		hasStorage: boolean;
 	} | null {
 		if (this.bases.length === 0) return null;
-		if (!this.bot.entity) return null;
-		const pos = this.bot.entity.position;
+		const state = this.driver.getState();
+		if (!state.isReady) return null;
+		const pos = state.position;
 		let nearest = this.bases[0];
 		let minDist = Infinity;
 		for (const base of this.bases) {
@@ -1319,6 +1375,8 @@ export class MinecraftAgent {
 	}
 
 	private async ensureOnLand(signal: AbortSignal): Promise<void> {
+		// ブロック読み取りに依存するため Java 版限定。統合版は world 未実装。
+		if (!this.isJava) return;
 		const { bot } = this;
 		if (!bot.entity) return;
 		const pos = bot.entity.position;
