@@ -103,6 +103,15 @@ export class BedrockDriver implements BotDriver {
 	/** サーバーから位置補正を受けた回数と、直近の補正量。移動が妥当かの目安になる。 */
 	public corrections = { count: 0, lastDistance: 0 };
 
+	/** 最後にサーバーから何らかのパケットを受け取った時刻。無通信の検出に使う。 */
+	private lastPacketAt = 0;
+	/** 切断理由。切断されていなければ null。 */
+	public disconnectReason: string | null = null;
+	private watchdog: NodeJS.Timeout | null = null;
+	private disconnectListeners: ((reason: string) => void)[] = [];
+	/** 直近に受け取ったパケット名。切断原因の調査に使う。 */
+	public recentPackets: string[] = [];
+
 	constructor(options: BedrockDriverOptions) {
 		this.options = options;
 
@@ -202,7 +211,10 @@ export class BedrockDriver implements BotDriver {
 			authTitle: Titles.MinecraftIOS,
 			deviceType: "iOS",
 			flow: "sisu",
-			protocolVersion: 2169,
+			// BedrockX は 2169(1.26.45) を名乗るが、同梱の protocol.json は
+			// 1.26.40 相当のスキーマ。名乗りとスキーマがズレていると
+			// player_auth_input が短く書かれ "read() incomplete" で切断される。
+			protocolVersion: Number(process.env.BEDROCK_PROTOCOL ?? 2169),
 			authflow,
 			skinData: {},
 		});
@@ -222,8 +234,59 @@ export class BedrockDriver implements BotDriver {
 		});
 	}
 
+	/** 切断を確定させる。二重に走らないようにする。 */
+	private markDisconnected(reason: string): void {
+		if (this.disconnectReason) return;
+		this.disconnectReason = reason;
+		this.spawned = false;
+		this.stopInputLoop();
+		if (this.watchdog) {
+			clearInterval(this.watchdog);
+			this.watchdog = null;
+		}
+		for (const cb of this.disconnectListeners) cb(reason);
+	}
+
 	private wirePackets(): void {
 		const c = this.client;
+
+		// どのパケットでもいいので届いていれば生きている。
+		// BedrockX は接続断を必ずしもイベントで教えてくれないため、
+		// 無通信そのものを切断の判定材料にする。
+		const originalEmit = c.emit.bind(c);
+		c.emit = (event: string, ...args: any[]) => {
+			this.lastPacketAt = Date.now();
+			// 切断直前に何が来ていたかを追えるよう、直近の受信を保持する
+			this.recentPackets.push(`${new Date().toISOString().slice(14, 23)} ${event}`);
+			if (this.recentPackets.length > 40) this.recentPackets.shift();
+			return originalEmit(event, ...args);
+		};
+
+		c.on("disconnect", (p: any) => {
+			const msg = p?.message ?? p?.reason ?? JSON.stringify(p);
+			this.markDisconnected(`disconnect: ${String(msg).slice(0, 200)}`);
+		});
+		c.on("kick", (p: any) => {
+			this.markDisconnected(`kick: ${JSON.stringify(p).slice(0, 200)}`);
+		});
+		// サーバーがこちらの送信を不正と判定したときに飛んでくる。
+		// 原因のパケットと理由が入っているので必ず出す。
+		c.on("packet_violation_warning", (p: any) => {
+			console.error("[bedrock] パケット違反の警告:", JSON.stringify(p));
+		});
+
+		c.on("close", (reason: any) => {
+			const text =
+				reason === undefined
+					? "(理由なし)"
+					: typeof reason === "string"
+						? reason
+						: JSON.stringify(reason)?.slice(0, 300);
+			this.markDisconnected(`close: ${text}`);
+		});
+		c.on("error", (e: any) => {
+			this.markDisconnected(`error: ${e?.message ?? e}`);
+		});
 
 		c.on("start_game", (p: any) => {
 			this.runtimeEntityId = p.runtime_entity_id;
@@ -232,6 +295,19 @@ export class BedrockDriver implements BotDriver {
 			// rotation は {x: pitch, z: yaw}
 			this.yaw = p.rotation?.z ?? 0;
 			this.dimension = p.dimension ?? "overworld";
+
+			// player_auth_input の tick はサーバーの現在tickと突き合わせて
+			// rewind に使われる。0 から始めると桁が違いすぎて相関が取れず、
+			// サーバー側から接続を切られる。start_game の current_tick を種にする。
+			// current_tick は [high, low] の形で届く i64。
+			const ct = p.current_tick;
+			if (Array.isArray(ct) && ct.length === 2) {
+				this.tick = (BigInt(ct[0]) << 32n) | BigInt(ct[1] >>> 0);
+			} else if (typeof ct === "bigint") {
+				this.tick = ct;
+			} else if (typeof ct === "number") {
+				this.tick = BigInt(Math.trunc(ct));
+			}
 			this.biome = stripNamespace(p.biome_name ?? "unknown");
 			this.rainLevel = p.rain_level ?? 0;
 
@@ -244,7 +320,9 @@ export class BedrockDriver implements BotDriver {
 				// これを送らないとサーバー側がプレイヤーを操作可能とみなさない
 				c.write("set_local_player_as_initialized", { runtime_entity_id: this.runtimeEntityId });
 				this.spawned = true;
+				this.lastPacketAt = Date.now();
 				this.startInputLoop();
+				this.startWatchdog();
 			}
 		});
 
@@ -422,7 +500,34 @@ export class BedrockDriver implements BotDriver {
 	private static readonly SPRINT_SPEED = 0.15;
 	private static readonly TICK_MS = 50;
 
+	/** 一定時間パケットが来なければ切断とみなす。 */
+	private startWatchdog(): void {
+		if (this.watchdog) return;
+		const SILENCE_MS = 15_000;
+		this.watchdog = setInterval(() => {
+			if (!this.spawned) return;
+			const silence = Date.now() - this.lastPacketAt;
+			if (silence > SILENCE_MS) {
+				this.markDisconnected(`${Math.round(silence / 1000)}秒間サーバーからの通信が途絶えた`);
+			}
+		}, 3000);
+	}
+
 	private startInputLoop(): void {
+		// player_auth_input の送信は既定で無効。
+		//
+		// 理由: サーバーがこちらの送るパケットを malformed と判定して接続を切る。
+		//   {"violation_type":"malformed","severity":"terminating","packet_id":144,
+		//    "reason":"BinaryStream read() incomplete"}
+		//   BedrockX 同梱のスキーマは 1.26.40 相当（minecraft-data の定義と完全一致）だが、
+		//   Realm はそれより新しい版を動かしており player_auth_input のフィールドが増えている。
+		//   minecraft-data 側も 1.26.40 が最新で、借りられる定義が無い。
+		//
+		//   実測: 送ると約15秒で切断、送らなければ5分間安定。
+		//   受信・思考・会話は送信に依存しないため、送らない方が実用的。
+		//
+		// 上流に新しいスキーマが入ったら BEDROCK_ENABLE_INPUT=1 で有効化して検証する。
+		if (process.env.BEDROCK_ENABLE_INPUT !== "1") return;
 		if (this.inputTimer) return;
 		this.inputTimer = setInterval(() => {
 			try {
@@ -511,6 +616,7 @@ export class BedrockDriver implements BotDriver {
 		durationMs?: number,
 	): Promise<void> {
 		if (signal.aborted) throw new Error("Aborted");
+		this.assertMovable();
 		this.controls[state] = value;
 		if (durationMs !== undefined && value) {
 			await sleep(durationMs);
@@ -566,7 +672,19 @@ export class BedrockDriver implements BotDriver {
 		return Math.hypot(dx, dy, dz);
 	}
 
+	/** 入力送信が無効なら移動できない。黙って失敗させず理由を返す。 */
+	private assertMovable(): void {
+		if (!this.inputTimer) {
+			throw new Error(
+				"[BedrockDriver] 移動は無効です: player_auth_input のスキーマが" +
+					"サーバーの版に追いついておらず、送ると切断されるため。" +
+					"上流の対応後に BEDROCK_ENABLE_INPUT=1 で有効化してください。",
+			);
+		}
+	}
+
 	async goto(signal: AbortSignal, goal: MoveGoal): Promise<void> {
+		this.assertMovable();
 		const { target, tolerance, ignoreY } = this.resolveGoal(goal);
 
 		// 目標が数値として成立していないと距離が NaN になり、
@@ -664,6 +782,11 @@ export class BedrockDriver implements BotDriver {
 	// ================= イベント =================
 
 	on(event: string, listener: (...args: any[]) => void): void {
+		// 切断は独自に検出しているので、専用のリスナー配列で配る
+		if (event === "end" || event === "kicked") {
+			this.disconnectListeners.push(listener as (r: string) => void);
+			return;
+		}
 		// chat は text パケットから正規化して配るので、生イベントには繋がない
 		if (event === "chat") {
 			this.chatListeners.push(listener as (u: string, m: string) => void);

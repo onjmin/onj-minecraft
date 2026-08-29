@@ -14,14 +14,17 @@
 import { MinecraftAgent } from "../core/agent";
 import { BedrockDriver } from "../core/driver/bedrock";
 import { kusabot } from "../profiles/kusabot";
-import { gotoCoordsSkill } from "../skills/goto/coords";
-import { gotoPlayerSkill } from "../skills/goto/player";
 
-// 統合版で現状動くスキルのみを渡す。
-// exploring.explore_land は地形サンプリングに world.blockAt を使うため、
-// チャンク解析(M3)が入るまでは失敗し続ける。入れると暴走するので外してある。
-// 採掘・クラフト・建築系も同様に M3 以降。
-const bedrockSkills = [gotoCoordsSkill, gotoPlayerSkill];
+// 統合版で現在動かせるスキルは無い。
+//
+// - 移動系: player_auth_input のスキーマがサーバーの版に追いついておらず、
+//   送ると malformed 判定で切断される。BedrockDriver 側で明示的に落とす。
+// - world 依存(探索/採掘/建築/クラフト): チャンク解析が未実装。
+//
+// 接続・状態読み取り・会話は送信に依存しないため問題なく動く。
+// いまの統合版エージェントは「その場から動かないが会話はできる」状態。
+// 上流のスキーマが更新されたら移動系から戻す。
+const bedrockSkills: unknown[] = [];
 
 async function main() {
 	const invite = process.env.REALM_INVITE;
@@ -36,7 +39,7 @@ async function main() {
 		onMsaCode: (m) => console.log("要サインイン:", m),
 	});
 
-	const agent = new MinecraftAgent(profile, bedrockSkills, driver);
+	const agent = new MinecraftAgent(profile, bedrockSkills as any[], driver);
 
 	console.log(`[bedrock] ${profile.displayName} を Realm に接続します...`);
 	await driver.connect();
@@ -44,6 +47,17 @@ async function main() {
 
 	// 統合版は接続完了のタイミングを呼び出し側が握っているので明示的に起動する
 	agent.startLoops();
+
+	// 切断に気づかず空回りし続けるのを防ぐ。
+	// BedrockX は接続断を必ずしもイベントで教えてくれないため、
+	// Driver 側の無通信監視も含めてここで受ける。
+	driver.on("end", (reason: string) => {
+		console.log(`[bedrock] 切断されました: ${reason}`);
+		console.log("[bedrock] 直近に受信したパケット:");
+		for (const line of driver.recentPackets.slice(-25)) console.log(`  ${line}`);
+		agent.cancelAllTasks();
+		process.exit(1);
+	});
 
 	const shutdown = async () => {
 		console.log("\n[bedrock] 終了します");

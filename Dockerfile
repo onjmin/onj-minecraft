@@ -17,6 +17,13 @@ RUN cp patches/mineflayer-pathfinder+2.4.5.patch node_modules/mineflayer-pathfin
     cd node_modules/mineflayer-pathfinder && \
     patch -p1 < mineflayer-pathfinder+2.4.5.patch
 
+# bedrockxにTURN(ICE)修正を適用
+# Realms用シグナリング(signal-jsonrpc)がTURN認証情報を受け取りながら捨てており、
+# WebRTCが直接経路のみに依存していた。iceServersへ渡すよう修正する。
+# bedrockxのソースは環境によりCRLF/LFが揺れ diff ベースのpatchが当たらないため、
+# 改行を正規化して置換するスクリプトを使う（冪等）。
+RUN node patches/apply-bedrockx-turn-fix.cjs node_modules/bedrockx
+
 # --- Runtime Stage ---
 FROM node:24-bookworm-slim AS runner
 
