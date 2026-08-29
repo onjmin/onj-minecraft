@@ -67,6 +67,8 @@ export class BedrockDriver implements BotDriver {
 	private runtimeEntityId: bigint | null = null;
 	private uniqueEntityId: string | null = null;
 	private username = "";
+	/** 自分の XUID。text パケットの送信者識別に必要。 */
+	private xuid = "";
 	private position: Position = { x: 0, y: 0, z: 0 };
 	private yaw = 0;
 	private health = 20;
@@ -185,6 +187,19 @@ export class BedrockDriver implements BotDriver {
 			{ flow: "sisu", authTitle: Titles.MinecraftIOS, deviceType: "iOS" },
 			(d: any) => this.options.onMsaCode?.(d.message),
 		);
+
+		// text パケットは xuid で発言者を識別する。空だとサーバーが受理しても
+		// 他プレイヤーへ中継されない（本人にだけエコーが返る）ため必ず取得する。
+		try {
+			const xbl = await authflow.getXboxToken();
+			this.xuid = String(xbl?.userXUID ?? "");
+			if (process.env.BEDROCK_LOG_TEXT === "1") {
+				console.log(`[bedrock] xuid=${this.xuid || "(取得できず)"}`);
+			}
+		} catch (e) {
+			// 取れなくても接続自体は続行する
+			console.error("[bedrock] XUID の取得に失敗:", (e as Error)?.message);
+		}
 
 		const api = RealmAPI.from(authflow, "bedrock", { minecraftVersion: "1.21.130" });
 		const realm = await api.getRealmFromInvite(invite);
@@ -494,7 +509,7 @@ export class BedrockDriver implements BotDriver {
 			type: "chat",
 			source_name: this.username,
 			message,
-			xuid: "",
+			xuid: this.xuid,
 			platform_chat_id: "",
 			has_filtered_message: false,
 			filtered_message: "",

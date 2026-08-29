@@ -120,6 +120,10 @@ async function main() {
 		console.log("\n--- chat 送信（明示指定時のみ） ---");
 		await driver.chat(SEND_CHAT);
 		check("chat を送信", true, SEND_CHAT);
+		// 送信後のエコーが返るかを見る。返るなら「送信元への確認応答」であり、
+		// 他プレイヤーへ配信された証拠にはならない（誰もいなくても返るため）。
+		console.log("  エコーを20秒待機...");
+		await new Promise((r) => setTimeout(r, 20000));
 	} else {
 		console.log("\n（chat は SEND_CHAT 未指定のため送信していない）");
 	}
