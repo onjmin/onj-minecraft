@@ -88,6 +88,12 @@ export class MinecraftAgent {
 
 	private chatHistory: ChatLog[] = [];
 	private maxChatHistory = 3;
+	/** 他プレイヤーの発言を最後に受け取った時刻。0 は未受信。 */
+	private lastHeardAt = 0;
+	/** 連続失敗回数。待機時間を伸ばして暴走を防ぐのに使う。 */
+	private consecutiveFailures = 0;
+	/** 直前に失敗したスキル名。別のスキルに切り替わったらカウンタを戻す。 */
+	private lastFailedTask = "";
 
 	private chatSimhashCache: Map<string, number[]> = new Map();
 	private rationaleSimhashCache: Map<string, number[]> = new Map();
@@ -147,6 +153,10 @@ export class MinecraftAgent {
 		if (injectedDriver) {
 			this.isJava = false;
 			this.driver = injectedDriver;
+			// 他プレイヤーとの意思疎通のため、発言の受信だけは共通で購読する
+			this.driver.on("chat", (username: string, message: string) =>
+				this.handleIncomingChat(username, message),
+			);
 			// mineflayer 固有の初期化（プラグイン・経路探索設定・イベント配線）は行わない。
 			// ループの起動は接続完了後に startLoops() を呼び出す側の責務とする。
 			return;
@@ -220,6 +230,26 @@ export class MinecraftAgent {
 	 * DISABLE_AUTONOMY=1 のときは起動しない。スキルを外部から直接呼んで
 	 * 検証する用途で、割り込みを防ぐために使う。
 	 */
+	/**
+	 * 他プレイヤーの発言を受け取る。エディションに依らず同じ扱いにする。
+	 * ここで積んだ履歴が思考プロンプトに載り、返答の材料になる。
+	 */
+	private handleIncomingChat(username: string, message: string): void {
+		if (!username || username === this.profile.minecraftName) return;
+
+		this.chatHistory.push({ username, message, timestamp: Date.now() });
+		if (this.chatHistory.length > this.maxChatHistory) {
+			this.chatHistory.shift();
+		}
+		this.lastHeardAt = Date.now();
+		this.log(`<${username}> ${message}`);
+	}
+
+	/** 直近に話しかけられているか。発言してよいかの判断に使う。 */
+	private wasSpokenToRecently(withinMs = 90_000): boolean {
+		return this.lastHeardAt > 0 && Date.now() - this.lastHeardAt < withinMs;
+	}
+
 	public startLoops(): void {
 		if (this.hasStartedLoops) return;
 		if (process.env.DISABLE_AUTONOMY === "1") return;
@@ -271,19 +301,7 @@ export class MinecraftAgent {
 			}
 		});
 
-		this.bot.on("chat", (username, message) => {
-			// ログに追加
-			this.chatHistory.push({
-				username,
-				message,
-				timestamp: Date.now(),
-			});
-
-			// 履歴制限
-			if (this.chatHistory.length > this.maxChatHistory) {
-				this.chatHistory.shift();
-			}
-		});
+		this.bot.on("chat", (username, message) => this.handleIncomingChat(username, message));
 
 		this.bot.on("kicked", (reason: unknown, loggedIn: boolean) => {
 			// kick 理由は文字列ではなく JSON テキストコンポーネントで届くため、
@@ -670,6 +688,10 @@ export class MinecraftAgent {
 					let result: SkillResponse | undefined;
 
 					const args = this.currentSkillArgs[skill.name] || {};
+					// 実行に入れた時点で暴走カウンタは戻す（結果の成否は下で扱う）
+					if (this.consecutiveFailures > 0 && this.currentTaskName !== this.lastFailedTask) {
+						this.consecutiveFailures = 0;
+					}
 
 					try {
 						this.log(
@@ -703,10 +725,28 @@ export class MinecraftAgent {
 				} catch (e) {
 					const errorMsg = e instanceof Error ? e.message : String(e);
 					this.log(`Reflex Error: ${errorMsg}`);
-					if (errorMsg.includes("No path")) await new Promise((r) => setTimeout(r, 2000));
+					this.lastFailedTask = this.currentTaskName;
+					// 同じ失敗を即座に繰り返すとログを埋め尽くして CPU も食う。
+					// 未実装の機能を踏んだ場合など、回復の見込みがない失敗ほど待つ。
+					this.consecutiveFailures++;
+					const backoff = Math.min(30_000, 1000 * 2 ** Math.min(this.consecutiveFailures, 5));
+					if (errorMsg.includes("まだ実装されていません")) {
+						this.log(`未実装の機能のため ${backoff / 1000}秒待機します`);
+					}
+					await new Promise((r) => setTimeout(r, backoff));
 				}
 			} else {
-				this.currentTaskName = exploreLandSkill.name;
+				// 指定されたスキルが手元に無い場合の待機先。
+				// 探索スキルがあればそれを、無ければ渡された中の最初のものを使う。
+				// エディションによって使えるスキルが違うためハードコードしない。
+				const fallback = this.skills.has(exploreLandSkill.name)
+					? exploreLandSkill.name
+					: (this.skills.keys().next().value ?? "idle");
+				if (this.currentTaskName === fallback) {
+					// 代替先すら無い（または既にそれを指している）なら空回りするので待つ
+					await new Promise((r) => setTimeout(r, 2000));
+				}
+				this.currentTaskName = fallback;
 			}
 
 			await new Promise((r) => setTimeout(r, 1000 + Math.random() * 500));
@@ -797,7 +837,7 @@ export class MinecraftAgent {
 
 		const historyText = this.getHistoryContext();
 		const inventory =
-			this.bot.inventory
+			this.driver.inventory
 				.items()
 				.map((i) => `${i.name} x${i.count}`)
 				.join(", ") || "Empty";
@@ -930,7 +970,15 @@ export class MinecraftAgent {
 			this.chatSimhashCache,
 		);
 		if (isNewChat && chatMessage && this.updateFIFO(this.strategicState.chats, chatMessage)) {
-			this.driver.chat(chatMessage);
+			// 自分の計画を一方的に垂れ流すのはやめ、話しかけられたときの返答に限る。
+			// エージェントが1体だけの環境では独り言は誰にも届かず、
+			// 同居している他プレイヤーにとってはノイズにしかならないため。
+			// ENABLE_CHAT=1 にすると従来通り常に発言する（複数体で会話させる場合）。
+			if (process.env.ENABLE_CHAT === "1" || this.wasSpokenToRecently()) {
+				this.driver.chat(chatMessage);
+			} else {
+				this.log(`(独り言のため発言せず: ${chatMessage})`);
+			}
 		}
 
 		if (foundSkillName && this.skills.has(foundSkillName)) {

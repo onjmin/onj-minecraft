@@ -14,13 +14,14 @@
 import { MinecraftAgent } from "../core/agent";
 import { BedrockDriver } from "../core/driver/bedrock";
 import { profiles } from "../profiles";
-import { exploreLandSkill } from "../skills/exploring/land";
 import { gotoCoordsSkill } from "../skills/goto/coords";
 import { gotoPlayerSkill } from "../skills/goto/player";
 
-// 統合版で現状動く見込みがあるスキルのみを渡す。
-// world 読み取りや採掘に依存するものは M3 以降で追加する。
-const bedrockSkills = [exploreLandSkill, gotoCoordsSkill, gotoPlayerSkill];
+// 統合版で現状動くスキルのみを渡す。
+// exploring.explore_land は地形サンプリングに world.blockAt を使うため、
+// チャンク解析(M3)が入るまでは失敗し続ける。入れると暴走するので外してある。
+// 採掘・クラフト・建築系も同様に M3 以降。
+const bedrockSkills = [gotoCoordsSkill, gotoPlayerSkill];
 
 async function main() {
 	const invite = process.env.REALM_INVITE;

@@ -98,6 +98,8 @@ export class BedrockDriver implements BotDriver {
 		sneak: false,
 	};
 	private inputTimer: NodeJS.Timeout | null = null;
+	/** 正規化した chat イベントの購読者 */
+	private chatListeners: ((username: string, message: string) => void)[] = [];
 	/** サーバーから位置補正を受けた回数と、直近の補正量。移動が妥当かの目安になる。 */
 	public corrections = { count: 0, lastDistance: 0 };
 
@@ -342,6 +344,18 @@ export class BedrockDriver implements BotDriver {
 			}
 		});
 
+		// チャットは text パケットで届く。Java版の bot.on("chat", username, message) と
+		// 同じ形に正規化して、上位（エージェント）が同じコードで扱えるようにする。
+		c.on("text", (p: any) => {
+			if (!p?.message) return;
+			// 自分の発言や、翻訳待ちのシステムメッセージは流さない
+			const from = p.source_name ?? "";
+			if (!from || from === this.username) return;
+			// 装飾コード(§x)を落とす
+			const clean = String(from).replace(/§./g, "");
+			for (const cb of this.chatListeners) cb(clean, String(p.message));
+		});
+
 		// 統合版の時刻は総経過tick。timeOfDay は 24000 の剰余で得る。
 		c.on("sync_world_clocks", (p: any) => {
 			const s = p.sync_states?.[0];
@@ -555,6 +569,12 @@ export class BedrockDriver implements BotDriver {
 	async goto(signal: AbortSignal, goal: MoveGoal): Promise<void> {
 		const { target, tolerance, ignoreY } = this.resolveGoal(goal);
 
+		// 目標が数値として成立していないと距離が NaN になり、
+		// 到達判定が永遠に成立せずタイムアウトまで歩き続けることになる
+		if (!Number.isFinite(target.x) || !Number.isFinite(target.y) || !Number.isFinite(target.z)) {
+			throw new Error(`goto: 目標座標が不正です (${target.x}, ${target.y}, ${target.z})`);
+		}
+
 		const TIMEOUT_MS = 30_000;
 		const started = Date.now();
 		let lastPos = { ...this.position };
@@ -644,9 +664,18 @@ export class BedrockDriver implements BotDriver {
 	// ================= イベント =================
 
 	on(event: string, listener: (...args: any[]) => void): void {
+		// chat は text パケットから正規化して配るので、生イベントには繋がない
+		if (event === "chat") {
+			this.chatListeners.push(listener as (u: string, m: string) => void);
+			return;
+		}
 		this.client?.on(event, listener);
 	}
 	off(event: string, listener: (...args: any[]) => void): void {
+		if (event === "chat") {
+			this.chatListeners = this.chatListeners.filter((l) => l !== listener);
+			return;
+		}
 		this.client?.off(event, listener);
 	}
 
