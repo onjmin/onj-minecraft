@@ -13,6 +13,7 @@
  * 未実装のものは黙って失敗させず、必ず例外を投げる。
  * skillcheck がそれをクラッシュとして拾うので、未対応箇所が一覧で出る。
  */
+import { randomUUID } from "node:crypto";
 import pa from "prismarine-auth";
 import pr from "prismarine-realms";
 import type {
@@ -69,6 +70,8 @@ export class BedrockDriver implements BotDriver {
 	private username = "";
 	/** 自分の XUID。text パケットの送信者識別に必要。 */
 	private xuid = "";
+	/** 最後に発言を送信した時刻。エコーの往復時間を測るために使う。 */
+	private lastChatSentAt = 0;
 	private position: Position = { x: 0, y: 0, z: 0 };
 	private yaw = 0;
 	private health = 20;
@@ -284,6 +287,13 @@ export class BedrockDriver implements BotDriver {
 		c.on("kick", (p: any) => {
 			this.markDisconnected(`kick: ${JSON.stringify(p).slice(0, 200)}`);
 		});
+		// コマンドの実行結果。返ってくればコマンドは受理されている。
+		c.on("command_output", (p: any) => {
+			if (process.env.BEDROCK_LOG_TEXT === "1") {
+				console.log(`[command_output] ${JSON.stringify(p)?.slice(0, 400)}`);
+			}
+		});
+
 		// サーバーがこちらの送信を不正と判定したときに飛んでくる。
 		// 原因のパケットと理由が入っているので必ず出す。
 		c.on("packet_violation_warning", (p: any) => {
@@ -443,7 +453,13 @@ export class BedrockDriver implements BotDriver {
 			// BEDROCK_LOG_TEXT=1 で、フィルタを通す前の生の内容を出す。
 			// 「発言が届いていない」のか「こちらで落としている」のかを切り分けるため。
 			if (process.env.BEDROCK_LOG_TEXT === "1") {
-				console.log(`[text] ${JSON.stringify(p)}`);
+				// 自分の発言のエコーなら往復時間を出す。
+				// 1ms未満ならローカルのループバック、数十ms以上ならサーバー由来。
+				const rtt =
+					this.lastChatSentAt > 0 && String(p?.xuid) === this.xuid
+						? ` rtt=${Date.now() - this.lastChatSentAt}ms`
+						: "";
+				console.log(`[text]${rtt} ${JSON.stringify(p)}`);
 			}
 			if (!p?.message) return;
 			// 自分の発言や、翻訳待ちのシステムメッセージは流さない
@@ -502,6 +518,7 @@ export class BedrockDriver implements BotDriver {
 		// と判定されて即切断される。スキーマ順に漏れなく埋めること。
 		//   needs_translation -> category -> type -> (type による分岐) ->
 		//   xuid -> platform_chat_id -> has_filtered_message -> filtered_message
+		this.lastChatSentAt = Date.now();
 		this.client.write("text", {
 			needs_translation: false,
 			// プレイヤーが書いた発言なので authored
@@ -764,6 +781,39 @@ export class BedrockDriver implements BotDriver {
 		} finally {
 			this.clearControlStates();
 		}
+	}
+
+	/**
+	 * サーバーコマンドを実行する。オペレーター権限が要る。
+	 *
+	 * 通常のチャット(text パケット)はサーバーに受理されエコーも返るのに、
+	 * 他プレイヤーの画面に表示されない問題があるため、
+	 * /say によるシステムメッセージを代替経路として用意している。
+	 * こちらはプレイヤー間チャットの制約を受けない。
+	 */
+	async runCommand(command: string): Promise<void> {
+		if (!this.client) throw new Error("未接続です");
+		// NOTE: 現状このパケットはサーバーに読み違えられる。
+		//   {"packet_id":77,"reason":"Command exceeds maximum size of 512 characters."}
+		//   "list" のような4文字のコマンドでも起きるため、長さの問題ではなく
+		//   BedrockX の command_request スキーマが Realm のプロトコル版と
+		//   食い違っている（player_auth_input と同じ構図）。
+		//   上流が追随するまでコマンド実行は使えない。
+		// BedrockX の write() はシリアライズ失敗を console.log で握り潰すため、
+		// 送れたつもりで進まないよう事前に検証する。
+		this.client.write("command_request", {
+			command,
+			origin: {
+				type: "player",
+				uuid: randomUUID(),
+				request_id: "",
+				// 実クライアントは自分のエンティティIDを載せる。0 だと発行元が特定できない。
+				player_entity_id: this.runtimeEntityId ?? 0n,
+			},
+			internal: false,
+			// スキーマ上 version は文字列。数値を渡すとシリアライズで落ちる。
+			version: "52",
+		});
 	}
 
 	// ================= 未実装 =================
