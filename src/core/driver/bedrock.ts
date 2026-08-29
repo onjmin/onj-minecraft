@@ -1,0 +1,412 @@
+/**
+ * BedrockDriver — 統合版(Bedrock) を BotDriver インターフェースに適合させる実装。
+ *
+ * Java版と違い、土台となる BedrockX は生のプロトコルクライアントで
+ * ワールド・インベントリ・エンティティの状態を一切保持しない。
+ * そのため、このクラスがパケットを受けて状態を組み立てる責務を持つ。
+ *
+ * 実装状況:
+ *   実装済み : getState / nearbyEntities / inventory / registry / chat
+ *   未実装   : world.*（チャンク解析が必要）/ goto / dig / craft / placeBlock など
+ *
+ * 未実装のものは黙って失敗させず、必ず例外を投げる。
+ * skillcheck がそれをクラッシュとして拾うので、未対応箇所が一覧で出る。
+ */
+import pa from "prismarine-auth";
+import pr from "prismarine-realms";
+import type {
+	BlockInfo,
+	BotDriver,
+	BotState,
+	ControlState,
+	EntityInfo,
+	InventoryReader,
+	ItemInfo,
+	MoveGoal,
+	Position,
+	Registry,
+	WorldReader,
+} from "./types";
+
+const { Authflow, Titles } = pa as any;
+const { RealmAPI } = pr as any;
+// bedrockx の index.d.ts は module 宣言のみで実体と噛み合わないため require で受ける
+const bedrockx = require("bedrockx");
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** 統合版で未実装の操作。呼ばれたら必ず落として、対応漏れを可視化する。 */
+function notImplemented(what: string): never {
+	throw new Error(`[BedrockDriver] ${what} は統合版でまだ実装されていません`);
+}
+
+/** "minecraft:oak_log" -> "oak_log"。Java版の呼称に揃える。 */
+function stripNamespace(name: string): string {
+	return name.startsWith("minecraft:") ? name.slice("minecraft:".length) : name;
+}
+
+export interface BedrockDriverOptions {
+	/** Realm の招待コードまたはリンク */
+	realmInvite: string;
+	/** 認証トークンのキャッシュ先 */
+	profilesFolder?: string;
+	/** デバイスコード認証が必要になったときの通知 */
+	onMsaCode?: (message: string) => void;
+}
+
+export class BedrockDriver implements BotDriver {
+	readonly world: WorldReader;
+	readonly inventory: InventoryReader;
+	readonly registry: Registry;
+
+	private client: any = null;
+	private options: BedrockDriverOptions;
+
+	// --- パケットから組み立てる状態 ---
+	private runtimeEntityId: bigint | null = null;
+	private uniqueEntityId: string | null = null;
+	private username = "";
+	private position: Position = { x: 0, y: 0, z: 0 };
+	private yaw = 0;
+	private health = 20;
+	private food = 20;
+	private worldTicks = 0;
+	private dimension = "overworld";
+	private rainLevel = 0;
+	private spawned = false;
+
+	/** runtime_id -> エンティティ */
+	private entities = new Map<string, EntityInfo>();
+	/** network_id -> アイテム名（名前空間なし）。item_registry から作る。 */
+	private itemNames = new Map<number, string>();
+	/** インベントリのスロット内容（window_id が "inventory" のもの） */
+	private slots: { network_id: number; count: number }[] = [];
+
+	constructor(options: BedrockDriverOptions) {
+		this.options = options;
+
+		this.world = {
+			blockAt: () => notImplemented("world.blockAt"),
+			findBlock: () => notImplemented("world.findBlock"),
+			findBlocks: () => notImplemented("world.findBlocks"),
+			findBlocksMatching: () => notImplemented("world.findBlocksMatching"),
+			getBiome: () => notImplemented("world.getBiome"),
+			getLightLevel: () => notImplemented("world.getLightLevel"),
+		};
+
+		this.inventory = {
+			items: () => this.readItems(),
+			heldItem: () => this.readItems()[0] ?? null,
+			emptySlotCount: () => this.slots.filter((s) => s.network_id === 0).length,
+		};
+
+		this.registry = {
+			// item_registry に載っているものだけが確実に存在する。
+			// ブロック名の判定にも暫定的にアイテム名を使う（大半のブロックはアイテムを持つ）。
+			hasBlock: (name) => this.hasItemName(name),
+			hasItem: (name) => this.hasItemName(name),
+		};
+	}
+
+	private hasItemName(name: string): boolean {
+		const target = stripNamespace(name);
+		for (const v of this.itemNames.values()) if (v === target) return true;
+		return false;
+	}
+
+	private readItems(): ItemInfo[] {
+		return this.slots
+			.map((s, slot) => ({ s, slot }))
+			.filter(({ s }) => s.network_id !== 0 && s.count > 0)
+			.map(({ s, slot }) => ({
+				name: this.itemNames.get(s.network_id) ?? `unknown_${s.network_id}`,
+				count: s.count,
+				slot,
+			}));
+	}
+
+	// ================= 接続 =================
+
+	async connect(): Promise<void> {
+		const profilesFolder = this.options.profilesFolder ?? "./.bedrock-auth";
+		const invite = this.options.realmInvite.replace(/https:\/\/realms\.gg\//, "");
+
+		// 認証方式は sisu + iOS でなければ Realm 側に接続を閉じられる（M0で確認済み）
+		const authflow = new Authflow(
+			undefined,
+			profilesFolder,
+			{ flow: "sisu", authTitle: Titles.MinecraftIOS, deviceType: "iOS" },
+			(d: any) => this.options.onMsaCode?.(d.message),
+		);
+
+		const api = RealmAPI.from(authflow, "bedrock", { minecraftVersion: "1.21.130" });
+		const realm = await api.getRealmFromInvite(invite);
+
+		// /worlds/{id}/join は正常時も断続的に 503 を返すのでリトライ必須
+		let join: any = null;
+		let lastError: unknown = null;
+		for (let i = 0; i < 15; i++) {
+			try {
+				join = await api.rest.get(`/worlds/${realm.id}/join`);
+				break;
+			} catch (e) {
+				lastError = e;
+				await sleep(2500);
+			}
+		}
+		if (!join) throw new Error(`Realm への join に失敗: ${(lastError as Error)?.message}`);
+
+		this.client = bedrockx.createClient({
+			// NOTE: index.d.ts は 'protocol' と宣言しているが、実装が読むのは 'transport'
+			transport: join.networkProtocol,
+			networkId: join.address,
+			profilesFolder,
+			authTitle: Titles.MinecraftIOS,
+			deviceType: "iOS",
+			flow: "sisu",
+			protocolVersion: 2169,
+			authflow,
+			skinData: {},
+		});
+
+		this.wirePackets();
+
+		// spawn 確定まで待つ（BedrockX は spawn イベントを emit しないので自前で待つ）
+		await new Promise<void>((resolve, reject) => {
+			const timer = setTimeout(() => reject(new Error("spawn タイムアウト(90秒)")), 90_000);
+			const check = setInterval(() => {
+				if (this.spawned) {
+					clearTimeout(timer);
+					clearInterval(check);
+					resolve();
+				}
+			}, 200);
+		});
+	}
+
+	private wirePackets(): void {
+		const c = this.client;
+
+		c.on("start_game", (p: any) => {
+			this.runtimeEntityId = p.runtime_entity_id;
+			this.uniqueEntityId = String(p.entity_id);
+			this.position = { x: p.player_position.x, y: p.player_position.y, z: p.player_position.z };
+			// rotation は {x: pitch, z: yaw}
+			this.yaw = p.rotation?.z ?? 0;
+			this.dimension = p.dimension ?? "overworld";
+			this.rainLevel = p.rain_level ?? 0;
+
+			// チャンクを受け取るには半径を要求する必要がある
+			c.write("request_chunk_radius", { chunk_radius: 8, max_radius: 8 });
+		});
+
+		c.on("play_status", (p: any) => {
+			if (p.status === "player_spawn" && !this.spawned) {
+				// これを送らないとサーバー側がプレイヤーを操作可能とみなさない
+				c.write("set_local_player_as_initialized", { runtime_entity_id: this.runtimeEntityId });
+				this.spawned = true;
+			}
+		});
+
+		// アイテム名の対応表。インベントリは network_id しか持たないため必須。
+		c.on("item_registry", (p: any) => {
+			for (const s of p.itemstates ?? []) {
+				this.itemNames.set(s.runtime_id, stripNamespace(s.name));
+			}
+		});
+
+		c.on("update_attributes", (p: any) => {
+			if (String(p.runtime_entity_id) !== String(this.runtimeEntityId)) return;
+			for (const a of p.attributes ?? []) {
+				if (a.name === "minecraft:health") this.health = a.current;
+				if (a.name === "minecraft:player.hunger") this.food = a.current;
+			}
+		});
+		c.on("set_health", (p: any) => {
+			this.health = p.health;
+		});
+
+		c.on("inventory_content", (p: any) => {
+			if (p.window_id !== "inventory") return;
+			this.slots = (p.input ?? []).map((s: any) => ({
+				network_id: s.network_id,
+				count: s.count,
+			}));
+		});
+		c.on("inventory_slot", (p: any) => {
+			if (p.window_id !== "inventory") return;
+			const idx = p.slot;
+			if (typeof idx === "number" && p.item) {
+				this.slots[idx] = { network_id: p.item.network_id, count: p.item.count };
+			}
+		});
+
+		c.on("player_list", (p: any) => {
+			for (const r of p.records ?? []) {
+				if (r.type !== "add") continue;
+				// 自分自身の表示名を拾う
+				if (this.uniqueEntityId && String(r.entity_unique_id) === this.uniqueEntityId) {
+					this.username = r.username;
+				}
+			}
+		});
+
+		c.on("add_entity", (p: any) => {
+			const id = String(p.runtime_id);
+			this.entities.set(id, {
+				id: Number(p.runtime_id),
+				name: stripNamespace(p.entity_type ?? "unknown"),
+				kind: "mob",
+				position: { x: p.position.x, y: p.position.y, z: p.position.z },
+			});
+		});
+		c.on("add_player", (p: any) => {
+			const id = String(p.runtime_id);
+			this.entities.set(id, {
+				id: Number(p.runtime_id),
+				name: p.username ?? "player",
+				kind: "player",
+				position: { x: p.position.x, y: p.position.y, z: p.position.z },
+				username: p.username,
+			});
+		});
+		c.on("remove_entity", (p: any) => {
+			// remove_entity は unique_id で来るため、一致するものを消す
+			const target = String(p.entity_id_self ?? p.unique_id ?? "");
+			for (const [k, v] of this.entities) {
+				if (k === target || String(v.id) === target) this.entities.delete(k);
+			}
+		});
+		c.on("move_entity", (p: any) => {
+			const e = this.entities.get(String(p.runtime_entity_id));
+			if (e && p.position) e.position = { x: p.position.x, y: p.position.y, z: p.position.z };
+		});
+
+		// 統合版の時刻は総経過tick。timeOfDay は 24000 の剰余で得る。
+		c.on("sync_world_clocks", (p: any) => {
+			const s = p.sync_states?.[0];
+			if (s && typeof s.time === "number") this.worldTicks = s.time;
+		});
+		c.on("set_time", (p: any) => {
+			if (typeof p.time === "number") this.worldTicks = p.time;
+		});
+	}
+
+	async disconnect(): Promise<void> {
+		try {
+			this.client?.close();
+		} catch {}
+		this.spawned = false;
+	}
+
+	// ================= 読み取り =================
+
+	getState(): BotState {
+		return {
+			username: this.username,
+			position: { ...this.position },
+			yaw: this.yaw,
+			health: this.health,
+			food: this.food,
+			timeOfDay: ((this.worldTicks % 24000) + 24000) % 24000,
+			isRaining: this.rainLevel > 0,
+			dimension: this.dimension,
+			isReady: this.spawned,
+		};
+	}
+
+	nearbyEntities(maxDistance: number): EntityInfo[] {
+		const o = this.position;
+		return [...this.entities.values()].filter((e) => {
+			const d = Math.hypot(e.position.x - o.x, e.position.y - o.y, e.position.z - o.z);
+			return d < maxDistance;
+		});
+	}
+
+	async chat(message: string): Promise<void> {
+		this.client.write("text", {
+			type: "chat",
+			needs_translation: false,
+			source_name: this.username,
+			xuid: "",
+			platform_chat_id: "",
+			filtered_message: "",
+			message,
+		});
+	}
+
+	// ================= 未実装 =================
+	// 移動は player_auth_input を毎tick送るクライアント権限型の実装が必要。
+	// 採掘・設置・クラフトはブロックパレットとチャンク解析が前提になる。
+
+	goto(_signal: AbortSignal, _goal: MoveGoal): Promise<void> {
+		return notImplemented("goto");
+	}
+	stopMoving(): void {
+		notImplemented("stopMoving");
+	}
+	setControlState(): Promise<void> {
+		return notImplemented("setControlState");
+	}
+	clearControlStates(): void {
+		notImplemented("clearControlStates");
+	}
+	lookAt(_position: Position): Promise<void> {
+		return notImplemented("lookAt");
+	}
+	dig(_signal: AbortSignal, _position: Position): Promise<void> {
+		return notImplemented("dig");
+	}
+	placeBlock(_signal: AbortSignal, _reference: Position, _face: Position): Promise<void> {
+		return notImplemented("placeBlock");
+	}
+	activateBlock(_position: Position): Promise<void> {
+		return notImplemented("activateBlock");
+	}
+	attack(_signal: AbortSignal, _entityId: number): Promise<void> {
+		return notImplemented("attack");
+	}
+	equip(): Promise<void> {
+		return notImplemented("equip");
+	}
+	equipBestTool(_position: Position): Promise<void> {
+		return notImplemented("equipBestTool");
+	}
+	pickupNearbyItems(_signal: AbortSignal): Promise<void> {
+		return notImplemented("pickupNearbyItems");
+	}
+	craft(): Promise<void> {
+		return notImplemented("craft");
+	}
+	canCraft(): boolean {
+		return notImplemented("canCraft");
+	}
+	canSmelt(): boolean {
+		return notImplemented("canSmelt");
+	}
+	smelt(): Promise<void> {
+		return notImplemented("smelt");
+	}
+	takeAllFromContainer(): Promise<number> {
+		return notImplemented("takeAllFromContainer");
+	}
+
+	// ================= イベント =================
+
+	on(event: string, listener: (...args: any[]) => void): void {
+		this.client?.on(event, listener);
+	}
+	off(event: string, listener: (...args: any[]) => void): void {
+		this.client?.off(event, listener);
+	}
+
+	/** 生のパケットを扱いたい場合のエスケープハッチ（デバッグ用） */
+	get raw(): any {
+		return this.client;
+	}
+
+	/** BlockInfo を返す口を持たせておく（world 実装時に使う） */
+	protected toBlockInfo(): BlockInfo | null {
+		return null;
+	}
+}
