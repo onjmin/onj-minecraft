@@ -70,13 +70,36 @@ async function main() {
 	const ents = driver.nearbyEntities(64);
 	console.log(`  ${ents.length}件`, JSON.stringify(ents.slice(0, 5)));
 
+	console.log("--- 移動 ---");
+	const before = { ...driver.getState().position };
+	// 現在地から水平に8ブロック先を目標にする（Yは据え置き）
+	const target = { x: before.x + 8, y: before.y, z: before.z };
+	console.log(`  出発 (${before.x.toFixed(1)}, ${before.y.toFixed(1)}, ${before.z.toFixed(1)})`);
+	let moveError = "";
+	try {
+		await driver.goto(new AbortController().signal, {
+			kind: "xz",
+			x: target.x,
+			z: target.z,
+			distance: 1.5,
+		});
+	} catch (e) {
+		moveError = e instanceof Error ? e.message : String(e);
+	}
+	const after = driver.getState().position;
+	const travelled = Math.hypot(after.x - before.x, after.z - before.z);
+	console.log(`  到達 (${after.x.toFixed(1)}, ${after.y.toFixed(1)}, ${after.z.toFixed(1)})`);
+	console.log(`  移動距離: ${travelled.toFixed(2)}m`);
+	console.log(
+		`  サーバー補正: ${driver.corrections.count}回 (直近 ${driver.corrections.lastDistance.toFixed(2)}m)`,
+	);
+	if (moveError) console.log(`  goto の結果: ${moveError}`);
+	check("実際に移動した(1m以上)", travelled > 1, `${travelled.toFixed(2)}m`);
+	check("接続が維持されている", driver.getState().isReady);
+
 	console.log("\n--- 未実装が明示的に落ちるか ---");
 	for (const [label, fn] of [
 		["world.blockAt", () => driver.world.blockAt({ x: 0, y: 0, z: 0 })],
-		[
-			"goto",
-			() => driver.goto(new AbortController().signal, { kind: "block", position: s.position }),
-		],
 		["dig", () => driver.dig(new AbortController().signal, s.position)],
 	] as [string, () => unknown][]) {
 		try {

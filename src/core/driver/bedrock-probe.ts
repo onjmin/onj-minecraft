@@ -153,6 +153,19 @@ async function main() {
 		client.on(name, (p: any) => onAny(name, p));
 	}
 
+	// 移動の権限モードを確認する（実装方針がこれで変わる）
+	client.on("start_game", (p: any) => {
+		console.log("=== 移動まわりの設定 ===");
+		for (const k of Object.keys(p)) {
+			if (/authorit|movement|tick|rewind|prediction|block_network/i.test(k)) {
+				console.log(`  ${k} =`, JSON.stringify(p[k]));
+			}
+		}
+	});
+	client.on("correct_player_move_prediction", (p: any) =>
+		console.log("[probe] 位置補正:", JSON.stringify(shrink(p))?.slice(0, 300)),
+	);
+
 	client.on("disconnect", (p: any) =>
 		console.log("[probe] disconnect", JSON.stringify(p)?.slice(0, 200)),
 	);

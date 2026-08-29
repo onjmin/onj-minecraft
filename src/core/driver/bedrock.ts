@@ -7,7 +7,8 @@
  *
  * 実装状況:
  *   実装済み : getState / nearbyEntities / inventory / registry / chat
- *   未実装   : world.*（チャンク解析が必要）/ goto / dig / craft / placeBlock など
+ *              goto / setControlState / lookAt（直進+ジャンプ。経路探索は無し）
+ *   未実装   : world.*（チャンク解析が必要）/ dig / craft / placeBlock など
  *
  * 未実装のものは黙って失敗させず、必ず例外を投げる。
  * skillcheck がそれをクラッシュとして拾うので、未対応箇所が一覧で出る。
@@ -81,6 +82,22 @@ export class BedrockDriver implements BotDriver {
 	private itemNames = new Map<number, string>();
 	/** インベントリのスロット内容（window_id が "inventory" のもの） */
 	private slots: { network_id: number; count: number }[] = [];
+
+	// --- 移動 ---
+	private pitch = 0;
+	private tick = 0n;
+	private controls: Record<ControlState, boolean> = {
+		forward: false,
+		back: false,
+		left: false,
+		right: false,
+		jump: false,
+		sprint: false,
+		sneak: false,
+	};
+	private inputTimer: NodeJS.Timeout | null = null;
+	/** サーバーから位置補正を受けた回数と、直近の補正量。移動が妥当かの目安になる。 */
+	public corrections = { count: 0, lastDistance: 0 };
 
 	constructor(options: BedrockDriverOptions) {
 		this.options = options;
@@ -205,6 +222,7 @@ export class BedrockDriver implements BotDriver {
 				// これを送らないとサーバー側がプレイヤーを操作可能とみなさない
 				c.write("set_local_player_as_initialized", { runtime_entity_id: this.runtimeEntityId });
 				this.spawned = true;
+				this.startInputLoop();
 			}
 		});
 
@@ -282,6 +300,28 @@ export class BedrockDriver implements BotDriver {
 			if (e && p.position) e.position = { x: p.position.x, y: p.position.y, z: p.position.z };
 		});
 
+		// サーバーは rewind 方式でこちらの予測位置を補正してくる。
+		// 素直に従わないと蹴られるので、来たら必ず反映する。
+		c.on("correct_player_move_prediction", (p: any) => {
+			if (!p.position) return;
+			const d = Math.hypot(
+				p.position.x - this.position.x,
+				p.position.y - this.position.y,
+				p.position.z - this.position.z,
+			);
+			this.corrections.count++;
+			this.corrections.lastDistance = d;
+			this.position = { x: p.position.x, y: p.position.y, z: p.position.z };
+		});
+
+		// テレポートなどでサーバーから位置を指示されることもある
+		c.on("move_player", (p: any) => {
+			if (String(p.runtime_entity_id) !== String(this.runtimeEntityId)) return;
+			if (p.position) {
+				this.position = { x: p.position.x, y: p.position.y, z: p.position.z };
+			}
+		});
+
 		// 統合版の時刻は総経過tick。timeOfDay は 24000 の剰余で得る。
 		c.on("sync_world_clocks", (p: any) => {
 			const s = p.sync_states?.[0];
@@ -293,6 +333,7 @@ export class BedrockDriver implements BotDriver {
 	}
 
 	async disconnect(): Promise<void> {
+		this.stopInputLoop();
 		try {
 			this.client?.close();
 		} catch {}
@@ -335,25 +376,214 @@ export class BedrockDriver implements BotDriver {
 		});
 	}
 
+	// ================= 移動 =================
+	//
+	// 統合版はサーバー権限型(rewind方式)で、クライアントが player_auth_input に
+	// 予測位置を載せて毎tick送り、ズレたらサーバーが correct_player_move_prediction で
+	// 引き戻す。ここではワールドを読めない前提で「向いた方向へ直進、詰まったら跳ぶ」
+	// までを実装し、地形との整合はサーバー補正に委ねている。
+
+	/** 歩行速度(ブロック/tick)。全力疾走で約 0.28。 */
+	private static readonly WALK_SPEED = 0.11;
+	private static readonly SPRINT_SPEED = 0.15;
+	private static readonly TICK_MS = 50;
+
+	private startInputLoop(): void {
+		if (this.inputTimer) return;
+		this.inputTimer = setInterval(() => {
+			try {
+				this.sendInput();
+			} catch {
+				// 送信失敗でループごと止めない
+			}
+		}, BedrockDriver.TICK_MS);
+	}
+
+	private stopInputLoop(): void {
+		if (this.inputTimer) clearInterval(this.inputTimer);
+		this.inputTimer = null;
+	}
+
+	/** 現在の操作状態から入力フラグを組み立てる。 */
+	private buildInputFlags(): string[] {
+		const f: string[] = [];
+		const c = this.controls;
+		if (c.forward) f.push("up");
+		if (c.back) f.push("down");
+		if (c.left) f.push("left");
+		if (c.right) f.push("right");
+		if (c.jump) f.push("jumping", "start_jumping", "jump_pressed_raw", "jump_current_raw");
+		if (c.sprint) f.push("sprinting", "sprint_down");
+		if (c.sneak) f.push("sneaking", "sneak_down");
+		return f;
+	}
+
+	/** 1tick分、位置を進める（衝突判定なし。地形との整合はサーバー補正に任せる）。 */
+	private advancePosition(): { x: number; z: number } {
+		const c = this.controls;
+		const fwd = (c.forward ? 1 : 0) - (c.back ? 1 : 0);
+		const strafe = (c.right ? 1 : 0) - (c.left ? 1 : 0);
+		if (fwd === 0 && strafe === 0) return { x: 0, z: 0 };
+
+		const len = Math.hypot(fwd, strafe);
+		const speed = c.sprint ? BedrockDriver.SPRINT_SPEED : BedrockDriver.WALK_SPEED;
+		// yaw は度。統合版は +Z を yaw=0 とし、時計回りに増える。
+		const rad = (this.yaw * Math.PI) / 180;
+		const sin = Math.sin(rad);
+		const cos = Math.cos(rad);
+		const nf = (fwd / len) * speed;
+		const ns = (strafe / len) * speed;
+
+		const dx = -nf * sin + ns * cos;
+		const dz = nf * cos + ns * sin;
+		this.position = { x: this.position.x + dx, y: this.position.y, z: this.position.z + dz };
+		return { x: ns / speed, z: nf / speed };
+	}
+
+	private sendInput(): void {
+		if (!this.spawned || !this.client) return;
+		const move = this.advancePosition();
+		const flags = this.buildInputFlags();
+		this.tick += 1n;
+
+		this.client.write("player_auth_input", {
+			pitch: this.pitch,
+			yaw: this.yaw,
+			position: this.position,
+			move_vector: { x: move.x, z: move.z },
+			head_yaw: this.yaw,
+			input_data: flags,
+			input_mode: "mouse",
+			play_mode: "normal",
+			interaction_model: "crosshair",
+			interact_rotation: { x: this.pitch, z: this.yaw },
+			tick: this.tick,
+			delta: { x: 0, y: 0, z: 0 },
+			transaction_presence: false,
+			item_stack_request_presence: false,
+			block_action_presence: false,
+			vehicle_rotation_presence: false,
+			predicted_vehicle_presence: false,
+			analogue_move_vector: { x: move.x, z: move.z },
+			camera_orientation: { x: 0, y: 0, z: 0 },
+			raw_move_vector: { x: move.x, z: move.z },
+		});
+	}
+
+	async setControlState(
+		signal: AbortSignal,
+		state: ControlState,
+		value: boolean,
+		durationMs?: number,
+	): Promise<void> {
+		if (signal.aborted) throw new Error("Aborted");
+		this.controls[state] = value;
+		if (durationMs !== undefined && value) {
+			await sleep(durationMs);
+			this.controls[state] = false;
+		}
+	}
+
+	clearControlStates(): void {
+		for (const k of Object.keys(this.controls) as ControlState[]) this.controls[k] = false;
+	}
+
+	stopMoving(): void {
+		this.clearControlStates();
+	}
+
+	async lookAt(position: Position): Promise<void> {
+		const dx = position.x - this.position.x;
+		const dy = position.y - (this.position.y + 1.62); // 目の高さ
+		const dz = position.z - this.position.z;
+		// 統合版の yaw は +Z が 0 度で時計回り
+		this.yaw = (Math.atan2(-dx, dz) * 180) / Math.PI;
+		this.pitch = (-Math.atan2(dy, Math.hypot(dx, dz)) * 180) / Math.PI;
+	}
+
+	/** MoveGoal を「目標座標と許容距離」に落とす。 */
+	private resolveGoal(goal: MoveGoal): { target: Position; tolerance: number; ignoreY: boolean } {
+		switch (goal.kind) {
+			case "near":
+				return { target: goal.position, tolerance: goal.distance, ignoreY: false };
+			case "block":
+				return { target: goal.position, tolerance: 0.6, ignoreY: false };
+			case "getToBlock":
+			case "lookAtBlock":
+				return { target: goal.position, tolerance: 1.8, ignoreY: false };
+			case "xz":
+				return {
+					target: { x: goal.x, y: this.position.y, z: goal.z },
+					tolerance: goal.distance,
+					ignoreY: true,
+				};
+			case "follow": {
+				const e = this.entities.get(String(goal.entityId));
+				if (!e) throw new Error(`Entity ${goal.entityId} not found`);
+				return { target: e.position, tolerance: goal.distance, ignoreY: false };
+			}
+		}
+	}
+
+	private distanceTo(t: Position, ignoreY: boolean): number {
+		const dx = t.x - this.position.x;
+		const dz = t.z - this.position.z;
+		const dy = ignoreY ? 0 : t.y - this.position.y;
+		return Math.hypot(dx, dy, dz);
+	}
+
+	async goto(signal: AbortSignal, goal: MoveGoal): Promise<void> {
+		const { target, tolerance, ignoreY } = this.resolveGoal(goal);
+
+		const TIMEOUT_MS = 30_000;
+		const started = Date.now();
+		let lastPos = { ...this.position };
+		let stuckTicks = 0;
+
+		this.clearControlStates();
+		try {
+			while (true) {
+				if (signal.aborted) throw new Error("Aborted");
+				if (Date.now() - started > TIMEOUT_MS) {
+					throw new Error(
+						`goto がタイムアウトしました（残り ${this.distanceTo(target, ignoreY).toFixed(1)}m）`,
+					);
+				}
+
+				// follow は相手が動くので毎回取り直す
+				const t = goal.kind === "follow" ? this.resolveGoal(goal).target : target;
+				if (this.distanceTo(t, ignoreY) <= tolerance) return;
+
+				await this.lookAt(t);
+				this.controls.forward = true;
+				this.controls.sprint = true;
+
+				await sleep(BedrockDriver.TICK_MS * 4);
+
+				// 進んでいなければ詰まっているとみなして跳ぶ
+				const moved = Math.hypot(this.position.x - lastPos.x, this.position.z - lastPos.z);
+				if (moved < 0.05) {
+					stuckTicks++;
+					this.controls.jump = true;
+					await sleep(BedrockDriver.TICK_MS * 4);
+					this.controls.jump = false;
+					if (stuckTicks > 25) {
+						throw new Error("goto: 進めなくなりました（経路探索は未実装）");
+					}
+				} else {
+					stuckTicks = 0;
+				}
+				lastPos = { ...this.position };
+			}
+		} finally {
+			this.clearControlStates();
+		}
+	}
+
 	// ================= 未実装 =================
 	// 移動は player_auth_input を毎tick送るクライアント権限型の実装が必要。
 	// 採掘・設置・クラフトはブロックパレットとチャンク解析が前提になる。
 
-	goto(_signal: AbortSignal, _goal: MoveGoal): Promise<void> {
-		return notImplemented("goto");
-	}
-	stopMoving(): void {
-		notImplemented("stopMoving");
-	}
-	setControlState(): Promise<void> {
-		return notImplemented("setControlState");
-	}
-	clearControlStates(): void {
-		notImplemented("clearControlStates");
-	}
-	lookAt(_position: Position): Promise<void> {
-		return notImplemented("lookAt");
-	}
 	dig(_signal: AbortSignal, _position: Position): Promise<void> {
 		return notImplemented("dig");
 	}
