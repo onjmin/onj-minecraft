@@ -534,7 +534,11 @@ export class MinecraftAgent {
 			(this.bot as any).pvp?.stop();
 		} catch {}
 
-		this.bot.clearControlStates();
+		// spawn 前に切断されると bot がまだ初期化されておらず
+		// clearControlStates が存在しない。他の停止処理と同様に握りつぶす。
+		try {
+			this.bot.clearControlStates();
+		} catch {}
 	}
 
 	private handleEnvironmentCheck() {
