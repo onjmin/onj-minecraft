@@ -425,6 +425,11 @@ export class BedrockDriver implements BotDriver {
 		// チャットは text パケットで届く。Java版の bot.on("chat", username, message) と
 		// 同じ形に正規化して、上位（エージェント）が同じコードで扱えるようにする。
 		c.on("text", (p: any) => {
+			// BEDROCK_LOG_TEXT=1 で、フィルタを通す前の生の内容を出す。
+			// 「発言が届いていない」のか「こちらで落としている」のかを切り分けるため。
+			if (process.env.BEDROCK_LOG_TEXT === "1") {
+				console.log(`[text] ${JSON.stringify(p)}`);
+			}
 			if (!p?.message) return;
 			// 自分の発言や、翻訳待ちのシステムメッセージは流さない
 			const from = p.source_name ?? "";
@@ -477,14 +482,22 @@ export class BedrockDriver implements BotDriver {
 	}
 
 	async chat(message: string): Promise<void> {
+		// フィールドの欠落があるとサーバーに
+		//   {"violation_type":"malformed","packet_id":9,"reason":"Invalid enum value"}
+		// と判定されて即切断される。スキーマ順に漏れなく埋めること。
+		//   needs_translation -> category -> type -> (type による分岐) ->
+		//   xuid -> platform_chat_id -> has_filtered_message -> filtered_message
 		this.client.write("text", {
-			type: "chat",
 			needs_translation: false,
+			// プレイヤーが書いた発言なので authored
+			category: "authored",
+			type: "chat",
 			source_name: this.username,
+			message,
 			xuid: "",
 			platform_chat_id: "",
+			has_filtered_message: false,
 			filtered_message: "",
-			message,
 		});
 	}
 

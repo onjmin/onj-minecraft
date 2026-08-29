@@ -885,6 +885,7 @@ export class MinecraftAgent {
 				bases: [],
 				skills: skillsContext,
 				chatHistory: [chatLogContext],
+				awaitingReply: this.wasSpokenToRecently(),
 				lastDamageCause: this.lastDamageCause,
 				memorySummary: historyText,
 			};
@@ -943,6 +944,7 @@ export class MinecraftAgent {
 			),
 			skills: skillsContext,
 			chatHistory: [chatLogContext],
+			awaitingReply: this.wasSpokenToRecently(),
 			lastDamageCause: this.lastDamageCause,
 			memorySummary: historyText,
 		};

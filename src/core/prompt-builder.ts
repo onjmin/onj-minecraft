@@ -38,6 +38,8 @@ export interface ThinkingState {
 	}[];
 
 	chatHistory?: string[];
+	/** 直近に他プレイヤーから話しかけられているか。返答を優先させる判断に使う。 */
+	awaitingReply?: boolean;
 
 	lastDamageCause?: DamageInfo;
 
@@ -168,10 +170,21 @@ ${state.memorySummary}
 function buildChatSection(state: ThinkingState): string {
 	if (!state.chatHistory || state.chatHistory.length === 0) return "";
 
-	return `
-=== RECENT CHAT ===
-${state.chatHistory.join("\n")}
-`.trim();
+	const lines = ["=== RECENT CHAT ===", state.chatHistory.join("\n")];
+
+	// これは本来「次に何をするか」を決めるためのプロンプトなので、
+	// 明示しないと話しかけられていても行動計画を喋り続けてしまう。
+	if (state.awaitingReply) {
+		lines.push(
+			"",
+			"A player is talking to YOU right now.",
+			"Answer them directly in the Chat field. Reply to what they actually said.",
+			"Do NOT narrate your current task instead of replying.",
+			"If they asked for something you cannot do, say so plainly.",
+		);
+	}
+
+	return lines.join("\n").trim();
 }
 
 function buildOutputFormatSection(state: ThinkingState): string {
