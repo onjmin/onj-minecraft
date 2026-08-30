@@ -59,6 +59,10 @@ func proxyOne(ctx context.Context, client *minecraft.Conn, upstream string) {
 	server, err := (&minecraft.Dialer{
 		ClientData:   client.ClientData(),
 		IdentityData: client.IdentityData(),
+		// 中継役なので、知らないパケットや解釈できないパケットで
+		// 接続を落とさせない。既定のままだと "Unexpected packet" で切れる。
+		DisconnectOnUnknownPackets: false,
+		DisconnectOnInvalidPackets: false,
 	}).DialContext(ctx, "raknet", upstream)
 	if err != nil {
 		emit(event{Event: "error", Error: fmt.Sprintf("上流への接続に失敗: %v", err)})
@@ -92,31 +96,83 @@ func proxyOne(ctx context.Context, client *minecraft.Conn, upstream string) {
 		"name": client.IdentityData().DisplayName,
 	}})
 
-	// クライアント → サーバー
+	// 上流へ送った直近のパケット。切断されたとき、何が引き金かを見るため。
+	var recentMu sync.Mutex
+	recent := make([]uint32, 0, 16)
+	noteSent := func(id uint32) {
+		recentMu.Lock()
+		recent = append(recent, id)
+		if len(recent) > 16 {
+			recent = recent[1:]
+		}
+		recentMu.Unlock()
+	}
+	dumpRecent := func() []uint32 {
+		recentMu.Lock()
+		defer recentMu.Unlock()
+		out := make([]uint32, len(recent))
+		copy(out, recent)
+		return out
+	}
+
+	// どちらかの向きが止まったら理由を出す。黙って閉じると原因が追えない。
 	go func() {
 		defer server.Close()
 		for {
 			pk, err := client.ReadPacket()
 			if err != nil {
+				emit(event{Event: "proxy_closed", Data: map[string]any{
+					"side": "クライアントからの受信", "reason": err.Error(),
+				}})
 				return
 			}
 			inspect(pk)
+			if skipToServer(pk) {
+				// 手順の重複はサーバーに "Unexpected packet" と判断される。
+				continue
+			}
+			noteSent(pk.ID())
 			if err := server.WritePacket(pk); err != nil {
+				emit(event{Event: "proxy_closed", Data: map[string]any{
+					"side": "上流への送信", "reason": err.Error(),
+					"直近に送ったID": dumpRecent(),
+				}})
 				return
 			}
 		}
 	}()
 
-	// サーバー → クライアント
 	for {
 		pk, err := server.ReadPacket()
 		if err != nil {
+			emit(event{Event: "proxy_closed", Data: map[string]any{
+				"side": "上流からの受信", "reason": err.Error(),
+				"直近に送ったID": dumpRecent(),
+			}})
 			return
 		}
 		if err := client.WritePacket(pk); err != nil {
+			emit(event{Event: "proxy_closed", Data: map[string]any{
+				"side": "クライアントへの送信", "reason": err.Error(),
+			}})
 			return
 		}
 	}
+}
+
+// skipToServer は上流へ流してはいけないパケットかを見る。
+//
+// プロキシは自分でログインとスポーンを済ませている。クライアントが送る同じ
+// 手順のパケットをそのまま転送すると、サーバーは二度目を受け取ることになり
+// "Unexpected packet" で接続を切る。
+func skipToServer(pk packet.Packet) bool {
+	switch pk.(type) {
+	case *packet.RequestNetworkSettings, *packet.Login, *packet.ClientToServerHandshake,
+		*packet.ResourcePackClientResponse, *packet.ClientCacheStatus,
+		*packet.RequestChunkRadius, *packet.SetLocalPlayerAsInitialised:
+		return true
+	}
+	return false
 }
 
 // inspect は見たいパケットだけを詳しく出す。全部出すと読めない。

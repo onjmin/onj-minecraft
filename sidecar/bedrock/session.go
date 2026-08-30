@@ -163,6 +163,9 @@ type session struct {
 	// リクエストIDは -1, -3, -5 ... と負の奇数を減らしていく決まり。
 	craftReqID  int32
 	craftWaiter map[int32]int
+	// クラフトの結果は ItemStackResponse で返り、InventorySlot では来ない。
+	// 何を作って何を消したかを覚えておき、成功したら持ち物の写しに反映する。
+	craftEffect map[int32]craftOutcome
 
 	done chan struct{}
 	once sync.Once
@@ -198,6 +201,7 @@ func newSession(conn *minecraft.Conn, game minecraft.GameData) *session {
 		recipes:     map[string][]craftRecipe{},
 		craftReqID:  1, // 最初の -2 で -1 になる
 		craftWaiter: map[int32]int{},
+		craftEffect: map[int32]craftOutcome{},
 		done:        make(chan struct{}),
 	}
 }
@@ -532,6 +536,12 @@ func (s *session) handle(pk packet.Packet) {
 				continue
 			}
 			if r.Status == protocol.ItemStackResponseStatusOK {
+				s.mu.Lock()
+				if eff, ok := s.craftEffect[r.RequestID]; ok {
+					s.applyCraftLocked(eff)
+					delete(s.craftEffect, r.RequestID)
+				}
+				s.mu.Unlock()
 				s.reply(id, true, "", nil)
 			} else {
 				s.reply(id, false, fmt.Sprintf("クラフトが拒否されました(status=%d)", r.Status), nil)
@@ -1220,6 +1230,11 @@ func (s *session) dispatch(c command) {
 			return
 		}
 		s.craftWaiter[req.RequestID] = c.ID
+		s.craftEffect[req.RequestID] = craftOutcome{
+			Output:      chosen.Output,
+			OutputCount: chosen.OutputCount,
+			Inputs:      chosen.Inputs,
+		}
 		s.mu.Unlock()
 
 		// クラフト枠は「持ち物の画面を開いている」状態でしか使えない。
@@ -1805,4 +1820,60 @@ func (s *session) holdPlaceableLocked() bool {
 		return true
 	}
 	return false
+}
+
+// craftOutcome はクラフト1回ぶんの結果。持ち物の写しを直すのに使う。
+type craftOutcome struct {
+	Output      string
+	OutputCount int
+	Inputs      []craftInput
+}
+
+// applyCraftLocked はクラフトの結果を持ち物の写しに反映する。
+// サーバーは ItemStackResponse で伝えてくるが、そこにアイテムの種類は
+// 入っていない。何を作ったかはこちらが知っているので自前で当てる。
+// 呼び出し側が mu を持つこと。
+func (s *session) applyCraftLocked(eff craftOutcome) {
+	// 素材を減らす。
+	for _, in := range eff.Inputs {
+		remaining := in.Count
+		for i := range s.slots {
+			if remaining <= 0 {
+				break
+			}
+			if s.slots[i].Name != in.Name {
+				continue
+			}
+			take := s.slots[i].Count
+			if take > remaining {
+				take = remaining
+			}
+			s.slots[i].Count -= take
+			remaining -= take
+		}
+	}
+	kept := s.slots[:0]
+	for _, it := range s.slots {
+		if it.Count > 0 {
+			kept = append(kept, it)
+		} else {
+			delete(s.rawSlots, it.Slot)
+		}
+	}
+	s.slots = kept
+
+	// 出来上がりを足す。同じ物があればまとめる。
+	for i := range s.slots {
+		if s.slots[i].Name == eff.Output {
+			s.slots[i].Count += eff.OutputCount
+			return
+		}
+	}
+	slot := 0
+	for ; slot < 36; slot++ {
+		if _, used := s.rawSlots[slot]; !used {
+			break
+		}
+	}
+	s.slots = append(s.slots, invSlot{Slot: slot, Name: eff.Output, Count: eff.OutputCount})
 }
