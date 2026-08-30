@@ -140,3 +140,6 @@ vite.config.ts.timestamp-*
 
 # 統合版の認証トークンキャッシュ
 .bedrock-auth/
+
+# サイドカーのビルド成果物（20MB超・scripts/build-sidecar.sh で再生成する）
+sidecar/bedrock/bin/

@@ -7,24 +7,26 @@
  * Java版(src/workflow/index.ts)との違いは、mineflayer のボットを作らず
  * BedrockDriver を注入する点だけ。LLM層・プロフィール・スキルは共通のものを使う。
  *
- * 統合版はまだ world / dig / craft / placeBlock が未実装なため、
- * 到達できるのは移動・探索・会話まで。未実装のスキルは実行時に
- * 明示的なエラーを返して失敗として記録される。
+ * 接続とプロトコルは Go サイドカーが持つ。移動・状態・持ち物・エンティティ・
+ * 発言までは通るが、ワールド(ブロック)の読み取りは未実装なので、それに依存する
+ * スキルはまだ動かせない。
  */
 import { MinecraftAgent } from "../core/agent";
 import { BedrockDriver } from "../core/driver/bedrock";
 import { kusabot } from "../profiles/kusabot";
+import { gotoCoordsSkill } from "../skills/goto/coords";
+import { gotoPlayerSkill } from "../skills/goto/player";
 
-// 統合版で現在動かせるスキルは無い。
+// 統合版で動かせるのは移動系だけ。
 //
-// - 移動系: player_auth_input のスキーマがサーバーの版に追いついておらず、
-//   送ると malformed 判定で切断される。BedrockDriver 側で明示的に落とす。
-// - world 依存(探索/採掘/建築/クラフト): チャンク解析が未実装。
+// - goto 系: サイドカーが player_auth_input を正しく送れるようになったので通る。
+// - world 依存(探索/採掘/建築/クラフト): チャンク解析が未実装で、
+//   BedrockDriver 側が明示的に例外を投げる。有効にすると失敗が積み上がるだけ。
+// - hunting: equip / attack / pickupNearbyItems が未実装。
 //
-// 接続・状態読み取り・会話は送信に依存しないため問題なく動く。
-// いまの統合版エージェントは「その場から動かないが会話はできる」状態。
-// 上流のスキーマが更新されたら移動系から戻す。
-const bedrockSkills: unknown[] = [];
+// チャットは送信自体は成立するが、他プレイヤーの画面に表示されない問題が未解決。
+// 受信は動くので、人間の指示を聞き取ることはできる。
+const bedrockSkills = [gotoCoordsSkill, gotoPlayerSkill];
 
 async function main() {
 	const invite = process.env.REALM_INVITE;
