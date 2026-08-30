@@ -34,12 +34,12 @@ services:
       DIFFICULTY: "easy"
       # 検証の下準備にコマンドを使いたいので有効にする（本番 Realm は無効）。
       ALLOW_CHEATS: "true"
-      # 平地にする。起伏や木に引っかかると移動速度の測定にならないし、
-      # 採掘・設置の検証も足場が一定な方が読みやすい。
-      LEVEL_TYPE: "FLAT"
+      # 既定は平地。起伏や木があると移動速度の素の値が測れず、採掘・設置の
+      # 検証も足場が一定な方が読みやすい。経路探索を試すときだけ DEFAULT にする。
+      LEVEL_TYPE: "${BEDROCK_LEVEL_TYPE:-FLAT}"
       # 毎回同じ地形にして、掘る/置くの検証を再現可能にする。
       LEVEL_SEED: "12345"
-      LEVEL_NAME: "onj-flat"
+      LEVEL_NAME: "${BEDROCK_LEVEL_NAME:-onj-flat2}"
       # ボット1体しか繋がないので広くする必要はない。
       MAX_PLAYERS: "4"
       VIEW_DISTANCE: "8"

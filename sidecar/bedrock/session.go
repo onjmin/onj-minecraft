@@ -50,6 +50,11 @@ type command struct {
 	Face int32 `json:"face"`
 }
 
+// 統合版のプレイヤー座標は「足元 + 目線の高さ」で送られてくる。
+// ブロックを引くときは必ず引き算すること。これを忘れると足場判定が2ブロック
+// ずれ、経路探索も採掘対象も全部おかしくなる。
+const eyeHeight = float32(1.62)
+
 // 1tick あたりの移動量。バニラの歩行 4.317 ブロック/秒、走行 5.612 ブロック/秒。
 const (
 	walkSpeed   = float32(0.2159)
@@ -84,6 +89,10 @@ type target struct {
 	// 進んでいないことを検出して自動ジャンプするための記録
 	lastPos      mgl32.Vec3
 	stalledTicks int
+	// 経路。空なら真っ直ぐ向かう(近距離や、道が見つからなかったとき)。
+	path []blockPos
+	// 経路を引き直した時刻。地形の読み込みが進むと道が見つかることがある。
+	lastPlan time.Time
 }
 
 type session struct {
@@ -95,6 +104,10 @@ type session struct {
 	yaw      float32
 	pitch    float32
 	onGround bool
+	// 跳躍中の縦速度。予測に入れないと、跳んだつもりでも位置が上がらず、
+	// 1段の段差すら登れない(掘った穴から出られない)。
+	vy       float32
+	airborne bool
 	health   float32
 	food     float32
 	controls map[string]bool
@@ -193,9 +206,12 @@ func (s *session) serve(ctx context.Context) {
 	// 移動がまともに進まないので、実位置が来るまで待つ。
 	s.waitForRealPosition(10 * time.Second)
 
+	s.mu.Lock()
+	feet := s.feetLocked()
+	s.mu.Unlock()
 	emit(event{Event: "ready_to_act", Data: map[string]any{
 		"entityRuntimeID": s.game.EntityRuntimeID,
-		"position":        vec(s.readPos()),
+		"position":        vec(feet),
 	}})
 
 	select {
@@ -206,6 +222,12 @@ func (s *session) serve(ctx context.Context) {
 }
 
 func vec(v mgl32.Vec3) []float32 { return []float32{v[0], v[1], v[2]} }
+
+// feetLocked は足元の座標。ブロック空間の計算はすべてこちらを使う。
+// 呼び出し側が mu を持つこと。
+func (s *session) feetLocked() mgl32.Vec3 {
+	return mgl32.Vec3{s.pos[0], s.pos[1] - eyeHeight, s.pos[2]}
+}
 
 func (s *session) readPos() mgl32.Vec3 {
 	s.mu.Lock()
@@ -271,6 +293,10 @@ func (s *session) handle(pk packet.Packet) {
 		}
 		s.corrections++
 		s.onGround = v.OnGround
+		if v.OnGround {
+			s.airborne = false
+			s.vy = 0
+		}
 		s.mu.Unlock()
 
 	case *packet.MovePlayer:
@@ -310,7 +336,8 @@ func (s *session) handle(pk packet.Packet) {
 			Name:      v.Username,
 			Type:      "player",
 			IsPlayer:  true,
-			Pos:       mgl32.Vec3{v.Position[0], v.Position[1], v.Position[2]},
+			// 他プレイヤーの座標も「足元+目線」で届く。揃えて足元にする。
+			Pos: mgl32.Vec3{v.Position[0], v.Position[1] - eyeHeight, v.Position[2]},
 		}
 		s.unique[v.AbilityData.EntityUniqueID] = v.EntityRuntimeID
 		s.mu.Unlock()
@@ -536,6 +563,24 @@ func (s *session) buildInput(n uint64) *packet.PlayerAuthInput {
 		flags.Set(packet.InputFlagSprinting)
 	}
 
+	// 跳躍の縦移動。バニラは初速 0.42、重力 0.08、空気抵抗 0.98。
+	// 正確な再現ではないが、サーバーが受理する程度には合っている。
+	if s.controls["jump"] && s.onGround && !s.airborne {
+		s.vy = 0.42
+		s.airborne = true
+		flags.Set(packet.InputFlagJumping)
+		flags.Set(packet.InputFlagStartJumping)
+	}
+	if s.airborne {
+		s.pos[1] += s.vy
+		s.vy = (s.vy - 0.08) * 0.98
+		// 落ち切ったら着地とみなす。実際の着地はサーバーの補正で確定する。
+		if s.vy < -0.5 {
+			s.airborne = false
+			s.vy = 0
+		}
+	}
+
 	// サーバー権限型では、クライアントが自分で動いた先を予測して送る。
 	// 補正だけに任せると補正の刻みぶんしか進まず、歩行が極端に遅くなる。
 	// 壁にぶつかれば CorrectPlayerMovePrediction が正しい位置へ引き戻すので、
@@ -601,38 +646,71 @@ func (s *session) buildInput(n uint64) *packet.PlayerAuthInput {
 }
 
 // steerLocked は目標があれば向きと前進を設定する。呼び出し側が mu を持つこと。
+//
+// 経路が引けていればその通過点を順に追い、引けていなければ目標へ真っ直ぐ向かう。
+// 真っ直ぐ向かうのは、目の前に道がある短距離と、道が見つからなかったときの
+// 最後の手段。障害物があれば進まないので deadline で打ち切られる。
 func (s *session) steerLocked(n uint64) {
 	g := s.goal
 	if g == nil {
 		return
 	}
 
-	dx := g.x - s.pos[0]
-	dz := g.z - s.pos[2]
-	dist := float32(math.Hypot(float64(dx), float64(dz)))
-
+	dist := horizontalDist(s.feetLocked(), g.x, g.z)
 	if dist <= g.tolerance {
-		s.controls["forward"] = false
-		s.controls["jump"] = false
-		s.goal = nil
-		emit(event{Event: "result", Data: map[string]any{
-			"id": g.id, "ok": true, "position": vec(s.pos),
-		}})
+		s.finishGoalLocked(true, "")
 		return
 	}
 	if time.Now().After(g.deadline) {
-		s.controls["forward"] = false
-		s.controls["jump"] = false
-		s.goal = nil
-		emit(event{Event: "result", Data: map[string]any{
-			"id": g.id, "ok": false,
-			"error":    fmt.Sprintf("目標に届かなかった（残り %.1f ブロック）", dist),
-			"position": vec(s.pos),
-		}})
+		s.finishGoalLocked(false, fmt.Sprintf("目標に届かなかった（残り %.1f ブロック）", dist))
 		return
 	}
 
+	// 経路が尽きた、または一定時間ごとに引き直す。歩くうちに新しい地形が
+	// 読み込まれ、さっきは見つからなかった道が見つかることがある。
+	//
+	// 探索は tick ループの中で走るので、重いと送信間隔が乱れてサーバーに
+	// 位置を補正され続ける（実測で 87% → 4% まで落ちた）。上限を低く保ち、
+	// 遠い目標は手前の中間地点に切り詰めて、探索が成功しやすい形にする。
+	if len(g.path) == 0 && time.Since(g.lastPlan) > planInterval {
+		g.lastPlan = time.Now()
+		feet := s.feetLocked()
+		from := blockPos{
+			int32(math.Floor(float64(feet[0]))),
+			int32(math.Floor(float64(feet[1]))),
+			int32(math.Floor(float64(feet[2]))),
+		}
+		gx, gz := clampToward(s.feetLocked(), g.x, g.z, planReach)
+		to := blockPos{int32(math.Floor(float64(gx))), from.Y, int32(math.Floor(float64(gz)))}
+		tol := float64(g.tolerance)
+		if dist > planReach {
+			// 中間地点なので、そこにぴったり着く必要はない。
+			tol = 1
+		}
+		g.path = s.world.findPath(from, to, tol, planMaxNodes)
+	}
+
+	// 次の通過点。着いたら捨てて次へ。
+	var tx, tz float32
+	var stepUp bool
+	if len(g.path) > 0 {
+		wp := g.path[0]
+		tx, tz = float32(wp.X)+0.5, float32(wp.Z)+0.5
+		if horizontalDist(s.feetLocked(), tx, tz) < 0.4 {
+			g.path = g.path[1:]
+			if len(g.path) > 0 {
+				wp = g.path[0]
+				tx, tz = float32(wp.X)+0.5, float32(wp.Z)+0.5
+			}
+		}
+		stepUp = float32(wp.Y) > s.feetLocked()[1]+0.5
+	}
+	if len(g.path) == 0 {
+		tx, tz = g.x, g.z
+	}
+
 	// Minecraft の yaw は南(+Z)が0で、西(-X)へ向かって増える。
+	dx, dz := tx-s.pos[0], tz-s.pos[2]
 	s.yaw = float32(math.Atan2(float64(-dx), float64(dz)) * 180 / math.Pi)
 	s.controls["forward"] = true
 
@@ -647,7 +725,46 @@ func (s *session) steerLocked(n uint64) {
 		}
 		g.lastPos = s.pos
 	}
-	s.controls["jump"] = g.stalledTicks >= 2
+	s.controls["jump"] = stepUp || g.stalledTicks >= 2
+}
+
+func (s *session) finishGoalLocked(ok bool, errMsg string) {
+	g := s.goal
+	if g == nil {
+		return
+	}
+	s.controls["forward"] = false
+	s.controls["jump"] = false
+	s.goal = nil
+	d := map[string]any{"id": g.id, "ok": ok, "position": vec(s.feetLocked())}
+	if errMsg != "" {
+		d["error"] = errMsg
+	}
+	emit(event{Event: "result", Data: d})
+}
+
+const (
+	// 一度の探索で見る節点の上限。tick ループの中で走るので低く抑える。
+	planMaxNodes = 800
+	// 引き直す間隔。
+	planInterval = 2 * time.Second
+	// 一度に狙う距離。読み込み済みの範囲(周囲3チャンク)に収まる値にする。
+	planReach float32 = 32
+)
+
+// clampToward は遠すぎる目標を、その方向の手前の点に切り詰める。
+// 読み込んでいない場所へは道を引けないので、探せる範囲に区切って進む。
+func clampToward(from mgl32.Vec3, x, z, reach float32) (float32, float32) {
+	dx, dz := x-from[0], z-from[2]
+	d := float32(math.Hypot(float64(dx), float64(dz)))
+	if d <= reach || d == 0 {
+		return x, z
+	}
+	return from[0] + dx/d*reach, from[2] + dz/d*reach
+}
+
+func horizontalDist(p mgl32.Vec3, x, z float32) float32 {
+	return float32(math.Hypot(float64(x-p[0]), float64(z-p[2])))
 }
 
 // --- コマンド ---
@@ -790,7 +907,8 @@ func (s *session) dispatch(c command) {
 		s.mu.Lock()
 		d := map[string]any{
 			"username": s.conn.IdentityData().DisplayName,
-			"position": vec(s.pos),
+			// 外に出すのは足元。ブロック座標と揃えないと skills/ が扱えない。
+			"position": vec(s.feetLocked()),
 			"yaw":      s.yaw,
 			"pitch":    s.pitch,
 			"onGround": s.onGround,
@@ -800,9 +918,22 @@ func (s *session) dispatch(c command) {
 			"corrections": s.corrections,
 			"driftTotal":  s.driftTotal,
 			"ticksSent":   s.ticksSent,
-			"histHits":    s.histHits,
-			"histMisses":  s.histMisses,
-			"maxDrift":    s.maxDrift,
+			"pathLen": func() int {
+				if s.goal == nil {
+					return -1
+				}
+				return len(s.goal.path)
+			}(),
+			"waypoint": func() any {
+				if s.goal == nil || len(s.goal.path) == 0 {
+					return nil
+				}
+				w := s.goal.path[0]
+				return []int32{w.X, w.Y, w.Z}
+			}(),
+			"histHits":   s.histHits,
+			"histMisses": s.histMisses,
+			"maxDrift":   s.maxDrift,
 		}
 		s.mu.Unlock()
 		s.reply(c.ID, true, "", d)
@@ -811,7 +942,7 @@ func (s *session) dispatch(c command) {
 		s.mu.Lock()
 		list := make([]map[string]any, 0, len(s.entities))
 		for _, e := range s.entities {
-			d := s.pos.Sub(e.Pos).Len()
+			d := s.feetLocked().Sub(e.Pos).Len()
 			if c.Range > 0 && d > c.Range {
 				continue
 			}
@@ -1003,9 +1134,10 @@ func (s *session) requestNearby() {
 		s.mu.Unlock()
 		return
 	}
-	px := floorDiv16(int32(math.Floor(float64(s.pos[0]))))
-	pz := floorDiv16(int32(math.Floor(float64(s.pos[2]))))
-	center := floorDiv16(int32(math.Floor(float64(s.pos[1]))))
+	feet := s.feetLocked()
+	px := floorDiv16(int32(math.Floor(float64(feet[0]))))
+	pz := floorDiv16(int32(math.Floor(float64(feet[2]))))
+	center := floorDiv16(int32(math.Floor(float64(feet[1]))))
 
 	type req struct {
 		cx, cz, dim int32
@@ -1108,9 +1240,10 @@ func (s *session) findBlocksLocked(names []string, radius float32, count int) []
 		want[trimNamespace(n)] = true
 	}
 
-	ox := int32(math.Floor(float64(s.pos[0])))
-	oy := int32(math.Floor(float64(s.pos[1])))
-	oz := int32(math.Floor(float64(s.pos[2])))
+	feet := s.feetLocked()
+	ox := int32(math.Floor(float64(feet[0])))
+	oy := int32(math.Floor(float64(feet[1])))
+	oz := int32(math.Floor(float64(feet[2])))
 	r := int32(radius)
 
 	out := make([]map[string]any, 0, count)
@@ -1158,9 +1291,10 @@ func abs32(v int32) int32 {
 // 未取得のマスは名前を空文字にする。「空気」と答えると、向こう側が
 // 「そこには何も無い」と誤解して空中に足場を作ろうとする。
 func (s *session) snapshotLocked(r int32) map[string]any {
-	ox := int32(math.Floor(float64(s.pos[0]))) - r
-	oy := int32(math.Floor(float64(s.pos[1]))) - r
-	oz := int32(math.Floor(float64(s.pos[2]))) - r
+	feet := s.feetLocked()
+	ox := int32(math.Floor(float64(feet[0]))) - r
+	oy := int32(math.Floor(float64(feet[1]))) - r
+	oz := int32(math.Floor(float64(feet[2]))) - r
 	size := int(r*2 + 1)
 
 	palette := []string{""}
@@ -1199,7 +1333,8 @@ func (s *session) snapshotLocked(r int32) map[string]any {
 // lookAtLocked は指定座標へ視点を向ける。呼び出し側が mu を持つこと。
 // 目線の高さは足元から 1.62 上。
 func (s *session) lookAtLocked(x, y, z float32) {
-	dx, dy, dz := x-s.pos[0], y-(s.pos[1]+1.62), z-s.pos[2]
+	// s.pos[1] は既に目線の高さなので足さない。
+	dx, dy, dz := x-s.pos[0], y-s.pos[1], z-s.pos[2]
 	flat := math.Hypot(float64(dx), float64(dz))
 	s.yaw = float32(math.Atan2(float64(-dx), float64(dz)) * 180 / math.Pi)
 	s.pitch = float32(-math.Atan2(float64(dy), flat) * 180 / math.Pi)
@@ -1209,7 +1344,7 @@ func (s *session) lookAtLocked(x, y, z float32) {
 // 0=下 1=上 2=北(-Z) 3=南(+Z) 4=西(-X) 5=東(+X)
 func faceToward(from mgl32.Vec3, bx, by, bz int32) int32 {
 	dx := from[0] - (float32(bx) + 0.5)
-	dy := (from[1] + 1.62) - (float32(by) + 0.5)
+	dy := from[1] - (float32(by) + 0.5)
 	dz := from[2] - (float32(bz) + 0.5)
 	ax, ay, az := absf(dx), absf(dy), absf(dz)
 	switch {
