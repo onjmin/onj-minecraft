@@ -154,6 +154,13 @@ type session struct {
 	// 次の tick で送る設置。統合版の設置は player_auth_input に載せる。
 	pendingPlace *protocol.UseItemTransactionData
 
+	// レシピ。サーバーが接続時に全部送ってくる。出来上がる物の名前で引く。
+	recipes map[string][]craftRecipe
+	// 進行中のクラフト。応答は ItemStackResponse で返ってくる。
+	// リクエストIDは -1, -3, -5 ... と負の奇数を減らしていく決まり。
+	craftReqID  int32
+	craftWaiter map[int32]int
+
 	done chan struct{}
 	once sync.Once
 }
@@ -170,22 +177,25 @@ func newSession(conn *minecraft.Conn, game minecraft.GameData) *session {
 		names[int32(it.RuntimeID)] = strings.TrimPrefix(it.Name, "minecraft:")
 	}
 	return &session{
-		itemNames: names,
-		conn:      conn,
-		game:      game,
-		pos:       mgl32.Vec3{game.PlayerPosition[0], game.PlayerPosition[1], game.PlayerPosition[2]},
-		yaw:       game.Yaw,
-		pitch:     game.Pitch,
-		health:    20,
-		food:      20,
-		controls:  map[string]bool{},
-		entities:  map[uint64]*entityInfo{},
-		known:     map[[2]int32]int32{},
-		requested: map[[3]int32]bool{},
-		rawSlots:  map[int]protocol.ItemInstance{},
-		world:     newWorld(),
-		unique:    map[int64]uint64{},
-		done:      make(chan struct{}),
+		itemNames:   names,
+		conn:        conn,
+		game:        game,
+		pos:         mgl32.Vec3{game.PlayerPosition[0], game.PlayerPosition[1], game.PlayerPosition[2]},
+		yaw:         game.Yaw,
+		pitch:       game.Pitch,
+		health:      20,
+		food:        20,
+		controls:    map[string]bool{},
+		entities:    map[uint64]*entityInfo{},
+		known:       map[[2]int32]int32{},
+		requested:   map[[3]int32]bool{},
+		rawSlots:    map[int]protocol.ItemInstance{},
+		world:       newWorld(),
+		unique:      map[int64]uint64{},
+		recipes:     map[string][]craftRecipe{},
+		craftReqID:  1, // 最初の -2 で -1 になる
+		craftWaiter: map[int32]int{},
+		done:        make(chan struct{}),
 	}
 }
 
@@ -481,6 +491,49 @@ func (s *session) handle(pk packet.Packet) {
 			s.rawSlots[slot] = v.NewItem
 		}
 		s.mu.Unlock()
+
+	case *packet.CraftingData:
+		recipes := collectRecipes(v)
+		s.mu.Lock()
+		// 出来上がる物の名前はアイテム表で引く。レシピ側は実行時IDしか持たない。
+		named := map[string][]craftRecipe{}
+		for _, r := range recipes {
+			name, ok := s.itemNames[r.outputNetworkID]
+			if !ok {
+				continue
+			}
+			r.Output = name
+			named[name] = append(named[name], r)
+		}
+		s.recipes = named
+		s.mu.Unlock()
+		emit(event{Event: "recipes", Data: map[string]any{
+			"count":     len(named),
+			"raw":       len(recipes),
+			"shapeless": len(v.ShapelessRecipes),
+			"shaped":    len(v.ShapedRecipes),
+			// 拾えなかったもの。タグ指定のレシピと、作業台以外の設備のもの。
+			"skippedTagged": lastReject.NonDefault,
+			"skippedOther":  lastReject.OtherBlock,
+		}})
+
+	case *packet.ItemStackResponse:
+		for _, r := range v.Responses {
+			s.mu.Lock()
+			id, waiting := s.craftWaiter[r.RequestID]
+			if waiting {
+				delete(s.craftWaiter, r.RequestID)
+			}
+			s.mu.Unlock()
+			if !waiting {
+				continue
+			}
+			if r.Status == protocol.ItemStackResponseStatusOK {
+				s.reply(id, true, "", nil)
+			} else {
+				s.reply(id, false, fmt.Sprintf("クラフトが拒否されました(status=%d)", r.Status), nil)
+			}
+		}
 
 	case *packet.PacketViolationWarning:
 		// サーバーが「そのパケットは不正だ」と教えてくれている。
@@ -1116,6 +1169,88 @@ func (s *session) dispatch(c command) {
 		}
 		s.mu.Unlock()
 		s.reply(c.ID, true, "", nil)
+
+	case "craft":
+		want := ""
+		if len(c.Names) > 0 {
+			want = trimNamespace(c.Names[0])
+		}
+		if want == "" {
+			s.reply(c.ID, false, "作る物を指定してください", nil)
+			return
+		}
+		s.mu.Lock()
+		list := s.recipes[want]
+		if len(list) == 0 {
+			s.mu.Unlock()
+			s.reply(c.ID, false, fmt.Sprintf("%s のレシピが見つかりません", want), nil)
+			return
+		}
+		// 作業台が無いなら 2x2 で作れるものだけ。
+		var chosen *craftRecipe
+		var lastErr error
+		var req *protocol.ItemStackRequest
+		for i := range list {
+			if list[i].NeedsTable && !c.Value {
+				lastErr = fmt.Errorf("%s は作業台が要ります", want)
+				continue
+			}
+			// クライアントが出すリクエストIDは負の奇数を順に減らしていく。
+			// 正の値を出すと "expected a valid ItemStackRequestId" で弾かれる。
+			s.craftReqID -= 2
+			r, err := s.craftRequestLocked(list[i], s.craftReqID)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			chosen = &list[i]
+			req = r
+			break
+		}
+		if chosen == nil {
+			s.mu.Unlock()
+			msg := "作れません"
+			if lastErr != nil {
+				msg = lastErr.Error()
+			}
+			s.reply(c.ID, false, msg, nil)
+			return
+		}
+		s.craftWaiter[req.RequestID] = c.ID
+		s.mu.Unlock()
+
+		if err := s.conn.WritePacket(&packet.ItemStackRequest{
+			Requests: []protocol.ItemStackRequest{*req},
+		}); err != nil {
+			s.mu.Lock()
+			delete(s.craftWaiter, req.RequestID)
+			s.mu.Unlock()
+			s.reply(c.ID, false, fmt.Sprintf("クラフトの送信に失敗: %v", err), nil)
+		}
+		// 成功の返事は ItemStackResponse で返す。
+
+	case "recipeFor":
+		// そのアイテムが作れるかを調べる。skills/ の canCraft 用。
+		want := ""
+		if len(c.Names) > 0 {
+			want = trimNamespace(c.Names[0])
+		}
+		s.mu.Lock()
+		list := s.recipes[want]
+		found := make([]map[string]any, 0, len(list))
+		for _, r := range list {
+			inputs := make([]map[string]any, 0, len(r.Inputs))
+			for _, in := range r.Inputs {
+				inputs = append(inputs, map[string]any{"name": in.Name, "count": in.Count})
+			}
+			found = append(found, map[string]any{
+				"outputCount": r.OutputCount,
+				"needsTable":  r.NeedsTable,
+				"inputs":      inputs,
+			})
+		}
+		s.mu.Unlock()
+		s.reply(c.ID, true, "", map[string]any{"recipes": found})
 
 	case "snapshot":
 		// TypeScript 側の world.* は同期APIなので、都度問い合わせるわけにいかない。
