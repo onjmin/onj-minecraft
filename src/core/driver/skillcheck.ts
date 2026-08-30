@@ -5,8 +5,10 @@
  * 網羅性が担保できない。ここではボットを1体だけ繋ぎ、
  * DISABLE_AUTONOMY=1 でループを止めた上で各スキルを順に直接呼ぶ。
  *
- * 実行:
+ * 実行(Java版):
  *   DISABLE_AUTONOMY=1 npx tsx src/core/driver/skillcheck.ts
+ * 実行(統合版・ローカル開発サーバー):
+ *   DISABLE_AUTONOMY=1 BEDROCK_ADDRESS=127.0.0.1:19132 npx tsx src/core/driver/skillcheck.ts
  *
  * 判定について:
  *   スキルが「失敗」を返すこと自体は異常ではない（材料が無い等）。
@@ -32,6 +34,11 @@ import { gotoCoordsSkill } from "../../skills/goto/coords";
 import { gotoPlayerSkill } from "../../skills/goto/player";
 import { gotoSurfaceSkill } from "../../skills/goto/surface";
 import { MinecraftAgent } from "../agent";
+import { BedrockDriver } from "./bedrock";
+
+/** 指定すると統合版のローカルサーバーへ繋ぐ。無ければ Java 版。 */
+const BEDROCK_ADDRESS = process.env.BEDROCK_ADDRESS ?? "";
+const VIA_WSL = (process.env.BEDROCK_WSL ?? (process.platform === "win32" ? "1" : "0")) === "1";
 
 // 1スキルあたりの上限。設置系は tryPlaceBlock が候補ごとに待機を挟むため長めが要る。
 const PER_SKILL_TIMEOUT_MS = Number(process.env.SKILLCHECK_TIMEOUT_MS ?? 25_000);
@@ -59,20 +66,33 @@ function looksLikeDriverBug(message: string): boolean {
 
 async function main() {
 	const profile = Object.values(profiles)[0];
-	const agent = new MinecraftAgent(profile, []);
 
-	console.log(`[skillcheck] ${profile.minecraftName} で接続中...`);
-	await new Promise<void>((resolve, reject) => {
-		const t = setTimeout(() => reject(new Error("spawn タイムアウト(60秒)")), 60_000);
-		agent.bot.once("spawn", () => {
-			clearTimeout(t);
-			resolve();
+	let agent: MinecraftAgent;
+	if (BEDROCK_ADDRESS) {
+		// 統合版はドライバが接続を握るので、注入してから自分で繋ぐ。
+		const driver = new BedrockDriver({
+			address: BEDROCK_ADDRESS,
+			name: "skillcheck",
+			viaWsl: VIA_WSL,
 		});
-		agent.bot.once("error", (e) => {
-			clearTimeout(t);
-			reject(e);
+		agent = new MinecraftAgent(profile, [], driver);
+		console.log(`[skillcheck] 統合版 ${BEDROCK_ADDRESS} へ接続中...`);
+		await driver.connect();
+	} else {
+		agent = new MinecraftAgent(profile, []);
+		console.log(`[skillcheck] ${profile.minecraftName} で接続中...`);
+		await new Promise<void>((resolve, reject) => {
+			const t = setTimeout(() => reject(new Error("spawn タイムアウト(60秒)")), 60_000);
+			agent.bot.once("spawn", () => {
+				clearTimeout(t);
+				resolve();
+			});
+			agent.bot.once("error", (e) => {
+				clearTimeout(t);
+				reject(e);
+			});
 		});
-	});
+	}
 	// スポーン直後はチャンクが揃っていないので少し待つ。
 	// 外部から RCON で材料を配る場合はこの間に行うため、長めに指定できるようにしている。
 	const warmupMs = Number(process.env.SKILLCHECK_WARMUP_MS ?? 3000);
@@ -176,7 +196,12 @@ async function main() {
 		for (const c of crashes) console.log(`  ${c.name}: ${c.detail}`);
 	}
 
-	agent.bot.quit();
+	// 統合版は mineflayer のボットを持たないので、ドライバ側で切る。
+	if (BEDROCK_ADDRESS) {
+		await agent.driver.disconnect();
+	} else {
+		agent.bot.quit();
+	}
 	process.exit(crashes.length === 0 ? 0 : 1);
 }
 

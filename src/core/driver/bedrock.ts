@@ -50,7 +50,7 @@ export interface BedrockDriverOptions {
 }
 
 function notImplemented(what: string): never {
-	throw new Error(`統合版では${what}がまだ使えません（サイドカーのチャンク解析が未実装）`);
+	throw new Error(`統合版では${what}がまだ使えません`);
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -263,7 +263,7 @@ export class BedrockDriver implements BotDriver {
 		this.entities = (ents.entities ?? []).map((e: any) => ({
 			id: Number(e.id),
 			name: String(e.name),
-			kind: e.isPlayer ? "player" : "mob",
+			kind: e.isItem ? "item" : e.isPlayer ? "player" : "mob",
 			position: toPos(e.position),
 			username: e.isPlayer ? String(e.name) : undefined,
 		}));
@@ -491,8 +491,37 @@ export class BedrockDriver implements BotDriver {
 		if (candidates.length === 0) return;
 		await this.sidecar.send("hold", { count: candidates[0].slot });
 	}
-	async pickupNearbyItems(_signal: AbortSignal): Promise<void> {
-		notImplemented("落ちているアイテムの回収");
+	/**
+	 * 落ちているアイテムを拾う。
+	 * 統合版は近づけば勝手に拾うので、落ちている場所へ順に歩くだけでよい。
+	 */
+	async pickupNearbyItems(signal: AbortSignal): Promise<void> {
+		const deadline = Date.now() + 15_000;
+		// 一度に何個も追いかけると時間切れになるので、近いものから数個まで。
+		for (let i = 0; i < 6; i++) {
+			if (signal.aborted || Date.now() > deadline) return;
+			await this.refresh();
+			const here = this.state.position;
+			const items = this.entities
+				.filter((e) => e.kind === "item")
+				.sort((a, b) => distance(here, a.position) - distance(here, b.position));
+			const target = items[0];
+			if (!target || distance(here, target.position) > 24) return;
+
+			try {
+				await this.goto(signal, {
+					kind: "xz",
+					x: target.position.x,
+					z: target.position.z,
+					distance: 0.8,
+				});
+			} catch {
+				// 届かないものは諦めて次へ。溶岩の上などは取りに行けない。
+				return;
+			}
+			// 拾われるまで少し待つ。判定はサーバー側。
+			await sleep(500);
+		}
 	}
 	async craft(_itemName: string, _count: number, _craftingTable?: Position): Promise<void> {
 		notImplemented("クラフト");

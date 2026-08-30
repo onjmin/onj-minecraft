@@ -344,6 +344,24 @@ func (s *session) handle(pk packet.Packet) {
 		s.unique[v.AbilityData.EntityUniqueID] = v.EntityRuntimeID
 		s.mu.Unlock()
 
+	case *packet.AddItemActor:
+		// 落ちているアイテム。統合版は近づけば勝手に拾うので、
+		// 「どこに何が落ちているか」が分かれば回収できる。
+		name := "item"
+		s.mu.Lock()
+		if n, ok := s.itemNames[v.Item.Stack.ItemType.NetworkID]; ok {
+			name = n
+		}
+		s.entities[v.EntityRuntimeID] = &entityInfo{
+			RuntimeID: v.EntityRuntimeID,
+			UniqueID:  v.EntityUniqueID,
+			Name:      name,
+			Type:      "item",
+			Pos:       mgl32.Vec3{v.Position[0], v.Position[1], v.Position[2]},
+		}
+		s.unique[v.EntityUniqueID] = v.EntityRuntimeID
+		s.mu.Unlock()
+
 	case *packet.AddActor:
 		s.mu.Lock()
 		s.entities[v.EntityRuntimeID] = &entityInfo{
@@ -967,6 +985,7 @@ func (s *session) dispatch(c command) {
 				"name":     e.Name,
 				"type":     e.Type,
 				"isPlayer": e.IsPlayer,
+				"isItem":   e.Type == "item",
 				"position": vec(e.Pos),
 				"distance": d,
 			})
