@@ -8,25 +8,49 @@
  * BedrockDriver を注入する点だけ。LLM層・プロフィール・スキルは共通のものを使う。
  *
  * 接続とプロトコルは Go サイドカーが持つ。移動・状態・持ち物・エンティティ・
- * 発言までは通るが、ワールド(ブロック)の読み取りは未実装なので、それに依存する
- * スキルはまだ動かせない。
+ * 発言・ワールド読み取り・採掘・設置・クラフト・攻撃まで通っている。
  */
 import { MinecraftAgent } from "../core/agent";
 import { BedrockDriver } from "../core/driver/bedrock";
 import { kusabot } from "../profiles/kusabot";
+import { buildingBaseSkill } from "../skills/building/base";
+import { collectDirtSkill } from "../skills/collecting/dirt";
+import { huntAnimalsSkill } from "../skills/collecting/hunting";
+import { mineOresSkill } from "../skills/collecting/mining";
+import { collectStoneSkill } from "../skills/collecting/stone";
+import { collectWoodSkill } from "../skills/collecting/wood";
+import { craftSmeltingSkill } from "../skills/crafting/smelting";
+import { craftToolSkill } from "../skills/crafting/tool";
+import { craftTorchSkill } from "../skills/crafting/torch";
+import { craftWeaponSkill } from "../skills/crafting/weapon";
+import { exploreLandSkill } from "../skills/exploring/land";
+import { gotoBaseSkill } from "../skills/goto/base";
 import { gotoCoordsSkill } from "../skills/goto/coords";
 import { gotoPlayerSkill } from "../skills/goto/player";
+import { gotoSurfaceSkill } from "../skills/goto/surface";
 
-// 統合版で動かせるのは移動系だけ。
+// 統合版でもスキルは一通り動く。Driver 層が Java 版との差を吸収しているので
+// skills/ 側は共通のものをそのまま使う。
 //
-// - goto 系: サイドカーが player_auth_input を正しく送れるようになったので通る。
-// - world 依存(探索/採掘/建築/クラフト): チャンク解析が未実装で、
-//   BedrockDriver 側が明示的に例外を投げる。有効にすると失敗が積み上がるだけ。
-// - hunting: equip / attack / pickupNearbyItems が未実装。
-//
-// チャットは送信自体は成立するが、他プレイヤーの画面に表示されない問題が未解決。
-// 受信は動くので、人間の指示を聞き取ることはできる。
-const bedrockSkills = [gotoCoordsSkill, gotoPlayerSkill];
+// collecting.stealing だけ外している。中身を漁るのは他プレイヤーのチェストで、
+// 本番の Realm では壊してよいものの範囲外だから。破壊や設置は許可されている。
+const bedrockSkills = [
+	exploreLandSkill,
+	gotoSurfaceSkill,
+	gotoCoordsSkill,
+	gotoPlayerSkill,
+	gotoBaseSkill,
+	collectWoodSkill,
+	collectStoneSkill,
+	collectDirtSkill,
+	mineOresSkill,
+	huntAnimalsSkill,
+	craftToolSkill,
+	craftWeaponSkill,
+	craftTorchSkill,
+	craftSmeltingSkill,
+	buildingBaseSkill,
+];
 
 async function main() {
 	const invite = process.env.REALM_INVITE;
