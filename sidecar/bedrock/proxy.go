@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/sandertv/gophertunnel/minecraft"
 	"github.com/sandertv/gophertunnel/minecraft/protocol"
@@ -65,12 +66,26 @@ func proxyOne(ctx context.Context, client *minecraft.Conn, upstream string) {
 	}
 	defer server.Close()
 
-	if err := client.StartGame(server.GameData()); err != nil {
-		emit(event{Event: "error", Error: fmt.Sprintf("クライアントへの開始通知に失敗: %v", err)})
+	// クライアントへの開始通知と上流でのスポーンは同時に進める。
+	// 順番にやると互いの手順が噛み合わず、クライアントが数秒で切断される。
+	var wg sync.WaitGroup
+	wg.Add(2)
+	var startErr, spawnErr error
+	go func() {
+		defer wg.Done()
+		startErr = client.StartGame(server.GameData())
+	}()
+	go func() {
+		defer wg.Done()
+		spawnErr = server.DoSpawn()
+	}()
+	wg.Wait()
+	if startErr != nil {
+		emit(event{Event: "error", Error: fmt.Sprintf("クライアントへの開始通知に失敗: %v", startErr)})
 		return
 	}
-	if err := server.DoSpawn(); err != nil {
-		emit(event{Event: "error", Error: fmt.Sprintf("上流でのスポーンに失敗: %v", err)})
+	if spawnErr != nil {
+		emit(event{Event: "error", Error: fmt.Sprintf("上流でのスポーンに失敗: %v", spawnErr)})
 		return
 	}
 	emit(event{Event: "proxy_connected", Data: map[string]any{

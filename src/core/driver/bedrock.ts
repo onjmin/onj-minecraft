@@ -92,6 +92,8 @@ export class BedrockDriver implements BotDriver {
 	private blocks = new BlockView();
 	/** 最後にスナップショットを取った位置。動いたら取り直す。 */
 	private lastSnapshotAt: Position | null = null;
+	/** 作れる物の名前。canCraft が同期なので接続時に取っておく。 */
+	private craftable = new Set<string>();
 
 	private chatListeners: ((username: string, message: string) => void)[] = [];
 	private endListeners: ((reason: string) => void)[] = [];
@@ -209,6 +211,13 @@ export class BedrockDriver implements BotDriver {
 
 		const st = await this.sidecar.send("state");
 		this.username = String(st.username ?? this.username);
+
+		try {
+			const r = await this.sidecar.send("recipeNames", {}, 20_000);
+			for (const n of (r.names ?? []) as string[]) this.craftable.add(n);
+		} catch {
+			// 取れなくても craft を試せば分かる。canCraft が false 寄りになるだけ。
+		}
 
 		// サブチャンクは要求してから届くので、スポーン直後は周りが見えていない。
 		// ここで待たないと、最初のスキルが「何も無い世界」を見て動くことになる。
@@ -520,6 +529,8 @@ export class BedrockDriver implements BotDriver {
 	 */
 	async pickupNearbyItems(signal: AbortSignal): Promise<void> {
 		const deadline = Date.now() + 15_000;
+		// 掘った直後はまだ落下物が現れていない。少し待ってから探す。
+		await sleep(700);
 		// 一度に何個も追いかけると時間切れになるので、近いものから数個まで。
 		for (let i = 0; i < 6; i++) {
 			if (signal.aborted || Date.now() > deadline) return;
@@ -529,7 +540,14 @@ export class BedrockDriver implements BotDriver {
 				.filter((e) => e.kind === "item")
 				.sort((a, b) => distance(here, a.position) - distance(here, b.position));
 			const target = items[0];
-			if (!target || distance(here, target.position) > 24) return;
+			if (!target || distance(here, target.position) > 24) {
+				// 最初の数回は現れるのを待つ。すぐ諦めると掘った物を取り逃す。
+				if (i < 3) {
+					await sleep(800);
+					continue;
+				}
+				return;
+			}
 
 			try {
 				await this.goto(signal, {
@@ -546,11 +564,22 @@ export class BedrockDriver implements BotDriver {
 			await sleep(500);
 		}
 	}
-	async craft(_itemName: string, _count: number, _craftingTable?: Position): Promise<void> {
-		notImplemented("クラフト");
+	async craft(itemName: string, count: number, craftingTable?: Position): Promise<void> {
+		const want = stripNamespace(itemName);
+		// サイドカーは1回ぶんずつ作る。必要な回数だけ繰り返す。
+		for (let i = 0; i < Math.max(1, count); i++) {
+			await this.sidecar.send("craft", { names: [want], value: Boolean(craftingTable) }, 20_000);
+			await sleep(250);
+		}
+		await this.refresh();
 	}
-	canCraft(_itemName: string, _craftingTable?: Position): boolean {
-		return false;
+
+	/**
+	 * レシピが存在するかだけを見る。素材が足りるかは craft を試すまで分からない。
+	 * 同期APIなので、接続時に取った名前一覧で答えている。
+	 */
+	canCraft(itemName: string, _craftingTable?: Position): boolean {
+		return this.craftable.has(stripNamespace(itemName));
 	}
 	canSmelt(_itemName: string): boolean {
 		return false;

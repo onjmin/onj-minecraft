@@ -1222,6 +1222,17 @@ func (s *session) dispatch(c command) {
 		s.craftWaiter[req.RequestID] = c.ID
 		s.mu.Unlock()
 
+		// クラフト枠は「持ち物の画面を開いている」状態でしか使えない。
+		// 実クライアントは開いたときにこれを送る。送らないとサーバーは
+		// 置き先を不正と判断する(FailedToValidateDstSlot)。
+		if err := s.conn.WritePacket(&packet.Interact{
+			ActionType:            packet.InteractActionOpenInventory,
+			TargetEntityRuntimeID: s.game.EntityRuntimeID,
+		}); err != nil {
+			s.reply(c.ID, false, fmt.Sprintf("持ち物を開けません: %v", err), nil)
+			return
+		}
+
 		if err := s.conn.WritePacket(&packet.ItemStackRequest{
 			Requests: []protocol.ItemStackRequest{*req},
 		}); err != nil {
@@ -1231,6 +1242,17 @@ func (s *session) dispatch(c command) {
 			s.reply(c.ID, false, fmt.Sprintf("クラフトの送信に失敗: %v", err), nil)
 		}
 		// 成功の返事は ItemStackResponse で返す。
+
+	case "recipeNames":
+		// 作れる物の名前一覧。TypeScript 側の canCraft は同期APIなので、
+		// 接続時に一度取って持っておく。
+		s.mu.Lock()
+		names := make([]string, 0, len(s.recipes))
+		for name := range s.recipes {
+			names = append(names, name)
+		}
+		s.mu.Unlock()
+		s.reply(c.ID, true, "", map[string]any{"names": names})
 
 	case "recipeFor":
 		// そのアイテムが作れるかを調べる。skills/ の canCraft 用。

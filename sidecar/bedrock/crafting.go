@@ -7,19 +7,42 @@ package main
 // CraftingData で全部送ってくるので、それを出来上がる物の名前で引けるようにする。
 //
 // 作業台が無いときは 2x2 の枠しか使えない。3x3 のレシピは弾く。
+//
+// **まだ通っていない。** vanilla 1.26.45 に対して試した組み合わせと、返ってきた
+// 拒否理由は以下の通り。同じ道を二度辿らないために残す。
+//
+//	CraftRecipe + 枠へ置かない            -> 7  InvalidCraftRequest
+//	CraftRecipe + 枠(28..31)へ Place      -> 49 FailedToValidateSrcSlot
+//	AutoCraft   + 画面を開かない          -> 7  InvalidCraftRequest
+//	AutoCraft   + 画面を開く + Take のみ  -> 19 ExpectedAnywhereItemNotFullyConsumed
+//	  ↑ ここでクラフト自体は処理されている。消費の申告が要ると分かる。
+//	+ Consume(ホットバー/インベントリ)    -> 27 ConsumedItemNotAllowed
+//	+ Consume(まとめた ID)                -> 49 FailedToValidateSrcSlot
+//	+ Consume(全部 ContainerInventory)    -> 65 CannotRemoveItem
+//	+ Consume(クラフト枠)                 -> 49 FailedToValidateSrcSlot
+//	枠の番号は 0 起点の方が先へ進む(28 起点だと 49 で止まる)。
+//
+// 「持ち物の画面を開いた」ことを Interact で伝えるのは必須。伝えないと
+// 置き先が不正と判断される(50 FailedToValidateDstSlot)。
+//
+// 次は実クライアントの ItemStackRequest をプロキシで観測するのが確実。
+// プロキシは sidecar/bedrock/proxy.go にあるが、クライアントを繋いだ状態を
+// 維持できていない。
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/sandertv/gophertunnel/minecraft/protocol"
 	"github.com/sandertv/gophertunnel/minecraft/protocol/packet"
 )
 
-// クラフト枠の先頭番号。手持ちの 2x2 は 28 から、作業台の 3x3 は 32 から。
+// クラフト枠の先頭番号。
+// 28/32 でも通る実装があるが、vanilla は 0 起点を要求する。
 const (
-	craftingInputBase2x2 byte = 28
-	craftingInputBase3x3 byte = 32
+	craftingInputBase2x2 byte = 0
+	craftingInputBase3x3 byte = 0
 )
 
 // craftInput は素材1種。
@@ -158,17 +181,49 @@ func buildRecipe(id uint32, block string, input []protocol.ItemDescriptorCount, 
 // 手順は「レシピを指定 → 素材を消費 → 出来上がり枠から手持ちへ移す」。
 // 素材の消費では、そのスロットの StackNetworkID を正しく載せないと弾かれる。
 func (s *session) craftRequestLocked(rec craftRecipe, requestID int32) (*protocol.ItemStackRequest, error) {
-	// 手でクラフトするときと同じ順序で組む。
-	//   素材を枠へ移す → 作る → 出来上がりを取る
-	// サーバーは枠に素材が入っている前提で読むので、枠を素通りして
-	// レシピだけ指定すると InvalidCraftRequest(status=7) で拒否される。
-	// (dragonfly の handleCraft で確認。クラフト枠の番号は 32 から)
-	var actions []protocol.StackRequestAction
-
-	gridSlot := craftingInputBase2x2
-	if rec.NeedsTable {
-		gridSlot = craftingInputBase3x3
+	// レシピブックから作る形。素材はサーバーが手持ちから自動で集める。
+	// 枠へ自分で移す形も試したが、置く段階で拒否される(CannotPlaceItem)。
+	ingredients := make([]protocol.ItemDescriptorCount, 0, len(rec.Inputs))
+	for _, in := range rec.Inputs {
+		ingredients = append(ingredients, protocol.ItemDescriptorCount{
+			Descriptor: &protocol.DefaultItemDescriptor{Name: "minecraft:" + in.Name},
+			Count:      int32(in.Count),
+		})
 	}
+
+	// 素材が足りるかはこちらでも見る。足りないまま送ると理由が分からない。
+	for _, in := range rec.Inputs {
+		have := 0
+		for _, item := range s.rawSlots {
+			if name, ok := s.itemNames[item.Stack.ItemType.NetworkID]; ok && name == in.Name {
+				have += int(item.Stack.Count)
+			}
+		}
+		if have < in.Count {
+			return nil, fmt.Errorf("%s が %d 個足りません", in.Name, in.Count-have)
+		}
+	}
+
+	actions := []protocol.StackRequestAction{
+		&protocol.AutoCraftRecipeStackRequestAction{
+			RecipeNetworkID: rec.NetworkID,
+			NumberOfCrafts:  1,
+			Ingredients:     ingredients,
+		},
+		&protocol.CraftResultsDeprecatedStackRequestAction{
+			ResultItems: []protocol.StackRequestItem{{
+				Identifier: "minecraft:" + rec.Output,
+				Count:      uint16(rec.OutputCount),
+			}},
+			TimesCrafted: 1,
+		},
+	}
+
+	// 素材を実際に減らす申告。これが無いと
+	// ExpectedAnywhereItemNotFullyConsumed(19) で拒否される。
+	// サーバーが自動で集めてくれるのは「どこから取るか」の話で、
+	// 減らす分の申告はこちらの責任。
+	// 消費の申告。これが無いと ExpectedAnywhereItemNotFullyConsumed(19) になる。
 	for _, in := range rec.Inputs {
 		remaining := in.Count
 		for slot, item := range s.rawSlots {
@@ -183,40 +238,24 @@ func (s *session) craftRequestLocked(rec craftRecipe, requestID int32) (*protoco
 			if use > remaining {
 				use = remaining
 			}
-			place := &protocol.PlaceStackRequestAction{}
-			place.Count = byte(use)
-			place.Source = protocol.StackRequestSlotInfo{
-				Container:      protocol.FullContainerName{ContainerID: protocol.ContainerCombinedHotBarAndInventory},
-				Slot:           byte(slot),
-				StackNetworkID: item.StackNetworkID,
-			}
-			place.Destination = protocol.StackRequestSlotInfo{
-				Container:      protocol.FullContainerName{ContainerID: protocol.ContainerCraftingInput},
-				Slot:           gridSlot,
-				StackNetworkID: 0,
-			}
-			actions = append(actions, place)
-			gridSlot++
+			actions = append(actions, &protocol.ConsumeStackRequestAction{
+				DestroyStackRequestAction: protocol.DestroyStackRequestAction{
+					Count: byte(use),
+					Source: protocol.StackRequestSlotInfo{
+						Container:      protocol.FullContainerName{ContainerID: inventoryContainerFor(slot)},
+						Slot:           byte(slot),
+						StackNetworkID: item.StackNetworkID,
+					},
+				},
+			})
 			remaining -= use
-		}
-		if remaining > 0 {
-			return nil, fmt.Errorf("%s が %d 個足りません", in.Name, remaining)
 		}
 	}
 
-	actions = append(actions,
-		&protocol.CraftRecipeStackRequestAction{
-			RecipeNetworkID: rec.NetworkID,
-			NumberOfCrafts:  1,
-		},
-		&protocol.CraftResultsDeprecatedStackRequestAction{
-			ResultItems: []protocol.StackRequestItem{{
-				Identifier: "minecraft:" + rec.Output,
-				Count:      uint16(rec.OutputCount),
-			}},
-			TimesCrafted: 1,
-		},
-	)
+	// 切り分け用。取り出しを外すと、作る部分だけの可否が分かる。
+	if os.Getenv("BEDROCK_CRAFT_NO_TAKE") == "1" {
+		return &protocol.ItemStackRequest{RequestID: requestID, Actions: actions}, nil
+	}
 
 	dest, ok := s.freeSlotLocked()
 	if !ok {
@@ -232,13 +271,23 @@ func (s *session) craftRequestLocked(rec craftRecipe, requestID int32) (*protoco
 		StackNetworkID: 0,
 	}
 	take.Destination = protocol.StackRequestSlotInfo{
-		Container:      protocol.FullContainerName{ContainerID: protocol.ContainerCombinedHotBarAndInventory},
+		Container:      protocol.FullContainerName{ContainerID: inventoryContainerFor(dest)},
 		Slot:           byte(dest),
 		StackNetworkID: 0,
 	}
 	actions = append(actions, take)
 
 	return &protocol.ItemStackRequest{RequestID: requestID, Actions: actions}, nil
+}
+
+// inventoryContainerFor は持ち物のスロット番号に対応するコンテナIDを返す。
+// 0..8 はホットバー、9..35 が本体。まとめて扱う ID もあるが、
+// サーバーによっては区別を要求する。
+func inventoryContainerFor(slot int) byte {
+	if slot >= 0 && slot <= 8 {
+		return protocol.ContainerHotBar
+	}
+	return protocol.ContainerInventory
 }
 
 // freeSlotLocked は出来上がりを入れる空きスロットを探す。

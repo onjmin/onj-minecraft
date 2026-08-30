@@ -47,7 +47,8 @@ services:
       # 夜や敵に邪魔されると検証が安定しないため。
       DEFAULT_PLAYER_PERMISSION_LEVEL: "operator"
     ports:
-      - "19132:19132/udp"
+      # Windows で直接サーバーを動かすときと併存できるよう、外側は差し替え可能。
+      - "${BEDROCK_PORT:-19132}:19132/udp"
     volumes:
       - bedrock-dev-data:/data
     stdin_open: true
