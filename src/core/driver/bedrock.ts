@@ -376,8 +376,16 @@ export class BedrockDriver implements BotDriver {
 	 */
 	private resolveGoal(goal: MoveGoal): { x: number; z: number; distance: number } | null {
 		switch (goal.kind) {
-			case "near":
+			case "near": {
+				// 目標が固いブロックなら、その中心には立てない。隣の立てる場所を狙う。
+				// 木の幹を距離1で指定されるような場合、そのままでは永久に届かない。
+				const at = this.blocks.blockAt(goal.position);
+				if (at?.solid) {
+					const spot = this.standableNear(goal.position);
+					return { x: spot.x, z: spot.z, distance: Math.max(goal.distance, 1.2) };
+				}
 				return { x: goal.position.x, z: goal.position.z, distance: goal.distance };
+			}
 			case "block":
 				return { x: goal.position.x, z: goal.position.z, distance: 0.7 };
 			case "xz":
@@ -387,9 +395,53 @@ export class BedrockDriver implements BotDriver {
 				if (!e) throw new Error(`追従対象のエンティティ(${goal.entityId})が見つかりません`);
 				return { x: e.position.x, z: e.position.z, distance: goal.distance };
 			}
+			case "getToBlock":
+			case "lookAtBlock": {
+				// そのブロックを操作できる位置まで行く。ブロックの上には立てないので、
+				// 隣で立てる場所を探す。見つからなければブロックの真横を狙う。
+				const spot = this.standableNear(goal.position);
+				return { x: spot.x, z: spot.z, distance: 1.2 };
+			}
 			default:
 				return null;
 		}
+	}
+
+	/**
+	 * そのブロックの隣で立てる場所を探す。
+	 * ブロックそのものを目標にすると、上に乗ろうとして届かないことがある。
+	 */
+	private standableNear(target: Position): Position {
+		// 真横だけでなく下も見る。木の幹のように縦に伸びる物は、
+		// 隣に立てる場所が無くても真下や斜め下からなら届く。
+		const around: Position[] = [];
+		for (const dy of [0, -1, -2, 1]) {
+			for (const [dx, dz] of [
+				[1, 0],
+				[-1, 0],
+				[0, 1],
+				[0, -1],
+				[0, 0],
+			] as const) {
+				if (dy === 0 && dx === 0 && dz === 0) continue;
+				around.push({ x: dx, y: dy, z: dz });
+			}
+		}
+		for (const off of around) {
+			const foot = {
+				x: Math.floor(target.x) + off.x,
+				y: Math.floor(target.y) + off.y,
+				z: Math.floor(target.z) + off.z,
+			};
+			const at = this.blocks.blockAt(foot);
+			const head = this.blocks.blockAt({ ...foot, y: foot.y + 1 });
+			const below = this.blocks.blockAt({ ...foot, y: foot.y - 1 });
+			if (at && head && below && !at.solid && !head.solid && below.solid) {
+				return { x: foot.x + 0.5, y: foot.y, z: foot.z + 0.5 };
+			}
+		}
+		// 立てる場所が分からなければ、せめて隣を狙う。
+		return { x: target.x + 1, y: target.y, z: target.z };
 	}
 
 	stopMoving(): void {

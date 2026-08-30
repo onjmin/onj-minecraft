@@ -58,6 +58,9 @@ const eyeHeight = float32(1.62)
 // 攻撃が届く距離。バニラのプレイヤーは3ブロックほど。
 const attackReach = float32(3.5)
 
+// 採掘が届く距離。サバイバルは概ね5ブロック。少し余裕を持たせる。
+const digReach = float32(6)
+
 // 1tick あたりの移動量。バニラの歩行 4.317 ブロック/秒、走行 5.612 ブロック/秒。
 const (
 	walkSpeed   = float32(0.2159)
@@ -1104,6 +1107,14 @@ func (s *session) dispatch(c command) {
 		if name == "air" {
 			s.mu.Unlock()
 			s.reply(c.ID, true, "", map[string]any{"name": name, "alreadyAir": true})
+			return
+		}
+		// 届かない距離を掘ろうとしても、サーバーは黙って無視する。
+		// 待つだけ無駄なので先に弾く。
+		reach := s.pos.Sub(mgl32.Vec3{float32(bx) + 0.5, float32(by) + 0.5, float32(bz) + 0.5}).Len()
+		if reach > digReach {
+			s.mu.Unlock()
+			s.reply(c.ID, false, fmt.Sprintf("遠すぎて掘れません（%.1f ブロック）", reach), nil)
 			return
 		}
 		if s.digging != nil {
