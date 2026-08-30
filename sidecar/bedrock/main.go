@@ -268,6 +268,18 @@ func main() {
 				chunkMu.Lock()
 				chunkSeen[[2]int32{v.Position.X(), v.Position.Z()}] = true
 				chunkMu.Unlock()
+			case *packet.MovePlayer:
+				// コマンドが実際に実行されたかは、/tp で自分が飛ばされるかで分かる。
+				// CommandOutput は返らないことがあるが、これは効果そのものを見る。
+				if v.EntityRuntimeID == id.EntityRuntimeID {
+					posMu.Lock()
+					pos = mgl32.Vec3{v.Position[0], v.Position[1], v.Position[2]}
+					posMu.Unlock()
+					emit(event{Event: "moved_by_server", Data: map[string]any{
+						"position": []float32{v.Position[0], v.Position[1], v.Position[2]},
+						"mode":     v.Mode,
+					}})
+				}
 			case *packet.CorrectPlayerMovePrediction:
 				posMu.Lock()
 				pos = mgl32.Vec3{v.Position[0], v.Position[1], v.Position[2]}
@@ -289,11 +301,17 @@ func main() {
 				}})
 			}
 			if t, ok := pk.(*packet.Text); ok {
+				// 実クライアントが何を埋めているかを見るため全フィールドを出す。
+				// こちらの送信との差分がチャットが表示されない原因の手掛かりになる。
 				emit(event{Event: "text", Data: map[string]any{
-					"type":    t.TextType,
-					"source":  t.SourceName,
-					"message": t.Message,
-					"xuid":    t.XUID,
+					"type":             t.TextType,
+					"source":           t.SourceName,
+					"message":          t.Message,
+					"xuid":             t.XUID,
+					"needsTranslation": t.NeedsTranslation,
+					"parameters":       t.Parameters,
+					"platformChatID":   t.PlatformChatID,
+					"filteredMessage":  optString(t.FilteredMessage),
 				}})
 			}
 		}
@@ -367,10 +385,10 @@ func main() {
 		// チャンクの読み込みなどが落ち着いてから送る
 		time.Sleep(3 * time.Second)
 		if err := conn.WritePacket(&packet.Text{
-			TextType:   packet.TextTypeChat,
-			SourceName: conn.IdentityData().DisplayName,
-			Message:    *say,
-			XUID:       conn.IdentityData().XUID,
+			TextType:        packet.TextTypeChat,
+			SourceName:      conn.IdentityData().DisplayName,
+			Message:         *say,
+			XUID:            conn.IdentityData().XUID,
 		}); err != nil {
 			emit(event{Event: "error", Error: fmt.Sprintf("発言の送信に失敗: %v", err)})
 		} else {
@@ -399,4 +417,12 @@ func main() {
 
 	time.Sleep(*hold)
 	emit(event{Event: "done"})
+}
+
+// Optional なフィールドをログに出すための小道具。未設定は null になる。
+func optString(o protocol.Optional[string]) any {
+	if v, ok := o.Value(); ok {
+		return v
+	}
+	return nil
 }
