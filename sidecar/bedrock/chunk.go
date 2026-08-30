@@ -247,3 +247,67 @@ func (w *world) blockAt(x, y, z int32) (string, bool) {
 
 // loadedColumns は取得済みの列の数。どれだけ見えているかの目安。
 func (w *world) loadedColumns() int { return len(w.columns) }
+
+// setBlock は1マスだけ差し替える。掘った/置いた結果を反映するのに使う。
+// パレットに無い名前なら末尾に足す。
+func (w *world) setBlock(x, y, z int32, name string) {
+	col, ok := w.columns[[2]int32{floorDiv16(x), floorDiv16(z)}]
+	if !ok {
+		return
+	}
+	sc, ok := col[int8(floorDiv16(y))]
+	if !ok || len(sc.Storages) == 0 {
+		return
+	}
+	st := &sc.Storages[0]
+
+	// 名前で持つ側に寄せる。実行時IDのパレットしか無い場合は名前側へ作り直す。
+	if len(st.PaletteNames) == 0 {
+		st.PaletteNames = make([]string, len(st.Palette))
+		for i, id := range st.Palette {
+			if n, ok := blockNameFor(id); ok {
+				st.PaletteNames[i] = n
+			}
+		}
+		st.Palette = nil
+	}
+
+	idx := -1
+	for i, n := range st.PaletteNames {
+		if n == name {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		if len(st.PaletteNames) >= 1<<16 {
+			return
+		}
+		st.PaletteNames = append(st.PaletteNames, name)
+		idx = len(st.PaletteNames) - 1
+	}
+	st.Indices[(int(x&15)<<8)|(int(z&15)<<4)|int(y&15)] = uint16(idx)
+}
+
+// runtimeIDAt は絶対座標のブロックの実行時IDを返す。
+// 設置の transaction はクリック先のIDを要求するため、名前とは別に引けるようにする。
+// setBlock で名前側に寄せた区画では引けないので、その場合は名前から引き直す。
+func (w *world) runtimeIDAt(x, y, z int32) (int32, bool) {
+	col, ok := w.columns[[2]int32{floorDiv16(x), floorDiv16(z)}]
+	if !ok {
+		return 0, false
+	}
+	sc, ok := col[int8(floorDiv16(y))]
+	if !ok || len(sc.Storages) == 0 {
+		return 0, false
+	}
+	st := &sc.Storages[0]
+	idx := int(st.indexAt(int(x&15), int(y&15), int(z&15)))
+	if len(st.Palette) > idx {
+		return st.Palette[idx], true
+	}
+	if len(st.PaletteNames) > idx {
+		return blockIDFor(st.PaletteNames[idx])
+	}
+	return 0, false
+}

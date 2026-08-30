@@ -46,6 +46,8 @@ type command struct {
 	// ブロック探索用
 	Names []string `json:"names"`
 	Count int      `json:"count"`
+	// 設置する面。-1 ならプレイヤー側の面を自動で選ぶ。
+	Face int32 `json:"face"`
 }
 
 // 1tick あたりの移動量。バニラの歩行 4.317 ブロック/秒、走行 5.612 ブロック/秒。
@@ -61,6 +63,16 @@ type entityInfo struct {
 	Type      string
 	IsPlayer  bool
 	Pos       mgl32.Vec3
+}
+
+// digTask は進行中の採掘。統合版の採掘はサーバー権限型で、
+// 「開始 → 毎tick継続」を送り続け、壊れたかどうかはサーバーの UpdateBlock で知る。
+type digTask struct {
+	id       int
+	pos      protocol.BlockPos
+	face     int32
+	started  bool
+	deadline time.Time
 }
 
 // 到達目標。tick ループが毎回参照して進路を決める。
@@ -109,6 +121,10 @@ type session struct {
 	// アイテム表で名前に戻す。
 	itemNames map[int32]string
 	slots     []invSlot
+	// 設置に使うため、スロットの生データも持つ。手に持つアイテムは
+	// UseItemTransactionData にそのまま載せる必要がある。
+	rawSlots map[int]protocol.ItemInstance
+	heldSlot int32
 
 	// チャンクの中身は最初の1回だけ報告する。毎チャンク出すと読めない。
 	chunkReported bool
@@ -118,6 +134,10 @@ type session struct {
 	requested map[[3]int32]bool
 	// 受け取ったブロック。ワールド読み取りの土台。
 	world *world
+	// 進行中の採掘。tick ループが毎回 BlockActions を積む。
+	digging *digTask
+	// 次の tick で送る設置。統合版の設置は player_auth_input に載せる。
+	pendingPlace *protocol.UseItemTransactionData
 
 	done chan struct{}
 	once sync.Once
@@ -147,6 +167,7 @@ func newSession(conn *minecraft.Conn, game minecraft.GameData) *session {
 		entities:  map[uint64]*entityInfo{},
 		known:     map[[2]int32]int32{},
 		requested: map[[3]int32]bool{},
+		rawSlots:  map[int]protocol.ItemInstance{},
 		world:     newWorld(),
 		unique:    map[int64]uint64{},
 		done:      make(chan struct{}),
@@ -362,6 +383,20 @@ func (s *session) handle(pk packet.Packet) {
 			s.storeChunk(cx, cz, 1, payload)
 		}
 
+	case *packet.UpdateBlock:
+		// 掘った/置いた結果はここで返ってくる。取り込まないと完了を判定できず、
+		// スナップショットも古いままになる。レイヤー0(通常のブロック)だけ見る。
+		if v.Layer != 0 {
+			return
+		}
+		name, ok := blockNameFor(int32(v.NewBlockRuntimeID))
+		if !ok {
+			return
+		}
+		s.mu.Lock()
+		s.world.setBlock(int32(v.Position[0]), int32(v.Position[1]), int32(v.Position[2]), name)
+		s.mu.Unlock()
+
 	case *packet.InventoryContent:
 		// WindowID 0 がプレイヤー自身の持ち物。
 		if v.WindowID != 0 {
@@ -369,10 +404,12 @@ func (s *session) handle(pk packet.Packet) {
 		}
 		s.mu.Lock()
 		s.slots = s.slots[:0]
+		clear(s.rawSlots)
 		for i, item := range v.Content {
 			if it, ok := s.itemLocked(item); ok {
 				it.Slot = i
 				s.slots = append(s.slots, it)
+				s.rawSlots[i] = item
 			}
 		}
 		s.mu.Unlock()
@@ -390,11 +427,23 @@ func (s *session) handle(pk packet.Packet) {
 			}
 		}
 		s.slots = kept
+		delete(s.rawSlots, slot)
 		if it, ok := s.itemLocked(v.NewItem); ok {
 			it.Slot = slot
 			s.slots = append(s.slots, it)
+			s.rawSlots[slot] = v.NewItem
 		}
 		s.mu.Unlock()
+
+	case *packet.PacketViolationWarning:
+		// サーバーが「そのパケットは不正だ」と教えてくれている。
+		// 握り潰すと、切断理由が "context canceled" としか分からなくなる。
+		emit(event{Event: "violation", Data: map[string]any{
+			"packetID": v.PacketID,
+			"type":     v.Type,
+			"severity": v.Severity,
+			"context":  v.ViolationContext,
+		}})
 
 	case *packet.Disconnect:
 		s.close(fmt.Sprintf("サーバーから切断: %s", v.Message))
@@ -438,6 +487,7 @@ func (s *session) tick() {
 		case <-t.C:
 		}
 		n++
+		s.checkDig()
 		if err := s.conn.WritePacket(s.buildInput(n)); err != nil {
 			s.close(fmt.Sprintf("入力の送信に失敗: %v", err))
 			return
@@ -451,6 +501,7 @@ func (s *session) buildInput(n uint64) *packet.PlayerAuthInput {
 
 	// 入力フラグはゼロ値だとフィールドごと送られない。空集合とは別物なので
 	// 必ず NewInputFlags を通す。
+	pk := &packet.PlayerAuthInput{}
 	flags := protocol.NewInputFlags(packet.InputFlagCount)
 	move := mgl32.Vec2{}
 	delta := mgl32.Vec3{}
@@ -506,26 +557,47 @@ func (s *session) buildInput(n uint64) *packet.PlayerAuthInput {
 		}
 	}
 
+	// 採掘中は毎tick「継続」を送り続ける。送るのをやめると中断扱いになる。
+	if d := s.digging; d != nil {
+		action := int32(protocol.PlayerActionCrackBreak)
+		if !d.started {
+			action = protocol.PlayerActionStartBreak
+			d.started = true
+		}
+		flags.Set(packet.InputFlagPerformBlockActions)
+		pk.BlockActions = protocol.Option([]protocol.PlayerBlockAction{{
+			Action:   action,
+			BlockPos: d.pos,
+			Face:     d.face,
+		}})
+	}
+
+	// 設置は1tickぶんだけ載せる。載せっぱなしにすると毎tick置き続ける。
+	if p := s.pendingPlace; p != nil {
+		flags.Set(packet.InputFlagPerformItemInteraction)
+		pk.ItemInteractionData = protocol.Option(*p)
+		s.pendingPlace = nil
+	}
+
 	slot := n % uint64(len(s.history))
 	s.history[slot] = s.pos
 	s.historyTick[slot] = n
 	s.ticksSent = n
 
-	return &packet.PlayerAuthInput{
-		Pitch:            s.pitch,
-		Yaw:              s.yaw,
-		HeadYaw:          s.yaw,
-		Position:         s.pos,
-		MoveVector:       move,
-		InputData:        flags,
-		InputMode:        packet.InputModeMouse,
-		PlayMode:         packet.PlayModeNormal,
-		InteractionModel: packet.InteractionModelCrosshair,
-		Tick:             n,
-		// サーバーは移動量の妥当性を Delta でも見る。空のまま位置だけ進めると
-		// 「動いていないのに位置が変わった」と判定されて補正で引き戻される。
-		Delta: delta,
-	}
+	pk.Pitch = s.pitch
+	pk.Yaw = s.yaw
+	pk.HeadYaw = s.yaw
+	pk.Position = s.pos
+	pk.MoveVector = move
+	pk.InputData = flags
+	pk.InputMode = packet.InputModeMouse
+	pk.PlayMode = packet.PlayModeNormal
+	pk.InteractionModel = packet.InteractionModelCrosshair
+	pk.Tick = n
+	// サーバーは移動量の妥当性を Delta でも見る。空のまま位置だけ進めると
+	// 「動いていないのに位置が変わった」と判定されて補正で引き戻される。
+	pk.Delta = delta
+	return pk
 }
 
 // steerLocked は目標があれば向きと前進を設定する。呼び出し側が mu を持つこと。
@@ -665,10 +737,7 @@ func (s *session) dispatch(c command) {
 
 	case "lookAt":
 		s.mu.Lock()
-		dx, dy, dz := c.X-s.pos[0], c.Y-(s.pos[1]+1.62), c.Z-s.pos[2]
-		flat := math.Hypot(float64(dx), float64(dz))
-		s.yaw = float32(math.Atan2(float64(-dx), float64(dz)) * 180 / math.Pi)
-		s.pitch = float32(-math.Atan2(float64(dy), flat) * 180 / math.Pi)
+		s.lookAtLocked(c.X, c.Y, c.Z)
 		s.mu.Unlock()
 		s.reply(c.ID, true, "", nil)
 
@@ -686,14 +755,30 @@ func (s *session) dispatch(c command) {
 		}
 
 	case "command":
-		err := s.conn.WritePacket(&packet.CommandRequest{
-			CommandLine: c.Message,
-			CommandOrigin: protocol.CommandOrigin{
-				Origin:         protocol.CommandOriginPlayer,
-				UUID:           uuid.New(),
-				PlayerUniqueID: s.game.EntityUniqueID,
-			},
-			Version: "52",
+		// 送ると接続が切れるので、既定では送らない。
+		//
+		// CommandRequest を公式スキーマ(protocol 2169)通りに組み直しても
+		// サーバーは "Command exceeds maximum size of 512 characters." という
+		// PacketViolationWarning を返して切断する。gophertunnel の実装は
+		// Version を文字列、origin の Type を "player" という文字列で書いており
+		// そこは直したが、それでも通らない。原因は未特定。
+		//
+		// 本番の Realm はチートOFFでコマンドが使えないため実害が無く、
+		// 追う価値も低いと判断して保留にしている。検証でアイテムを配るなら
+		// サーバーのコンソールから行う:
+		//   docker exec onj-bedrock-dev send-command give <名前> dirt 8
+		if os.Getenv("BEDROCK_ALLOW_COMMAND") != "1" {
+			s.reply(c.ID, false,
+				"コマンド送信は無効です（サーバーに拒否され接続が切れるため）。"+
+					"試すなら BEDROCK_ALLOW_COMMAND=1 を立ててください", nil)
+			return
+		}
+		err := s.conn.WritePacket(&commandRequest{
+			CommandLine:    c.Message,
+			OriginType:     commandOriginPlayer,
+			UUID:           uuid.New(),
+			PlayerUniqueID: s.game.EntityUniqueID,
+			Version:        commandVersionLatest,
 		})
 		if err != nil {
 			s.reply(c.ID, false, fmt.Sprintf("コマンドの送信に失敗: %v", err), nil)
@@ -771,6 +856,100 @@ func (s *session) dispatch(c command) {
 		found := s.findBlocksLocked(c.Names, c.Range, max(1, c.Count))
 		s.mu.Unlock()
 		s.reply(c.ID, true, "", map[string]any{"blocks": found})
+
+	case "dig":
+		bx := int32(math.Floor(float64(c.X)))
+		by := int32(math.Floor(float64(c.Y)))
+		bz := int32(math.Floor(float64(c.Z)))
+
+		s.mu.Lock()
+		name, known := s.world.blockAt(bx, by, bz)
+		if !known {
+			s.mu.Unlock()
+			s.reply(c.ID, false, "その座標はまだ読み込まれていません", nil)
+			return
+		}
+		if name == "air" {
+			s.mu.Unlock()
+			s.reply(c.ID, true, "", map[string]any{"name": name, "alreadyAir": true})
+			return
+		}
+		if s.digging != nil {
+			emit(event{Event: "result", Data: map[string]any{
+				"id": s.digging.id, "ok": false, "error": "新しい採掘で置き換えられた",
+			}})
+		}
+		timeout := c.Timeout
+		if timeout <= 0 {
+			timeout = 20000
+		}
+		// 掘る面はプレイヤー側を向いた面にする。裏側を指定すると届かない。
+		s.digging = &digTask{
+			id:       c.ID,
+			pos:      protocol.BlockPos{bx, by, bz},
+			face:     faceToward(s.pos, bx, by, bz),
+			deadline: time.Now().Add(time.Duration(timeout) * time.Millisecond),
+		}
+		// 見ていない方向は掘れないサーバーがあるので視点も向ける。
+		s.lookAtLocked(float32(bx)+0.5, float32(by)+0.5, float32(bz)+0.5)
+		s.mu.Unlock()
+		// 結果は壊れたときか時間切れのときに返す。
+
+	case "hold":
+		// ホットバーの選択スロットを変える。設置や採掘は手に持っているもので決まる。
+		slot := int32(c.Count)
+		if slot < 0 || slot > 8 {
+			s.reply(c.ID, false, "ホットバーは 0..8 です", nil)
+			return
+		}
+		s.mu.Lock()
+		item := s.rawSlots[int(slot)]
+		s.heldSlot = slot
+		s.mu.Unlock()
+		if err := s.conn.WritePacket(&packet.MobEquipment{
+			EntityRuntimeID: s.game.EntityRuntimeID,
+			NewItem:         item,
+			InventorySlot:   byte(slot),
+			HotBarSlot:      byte(slot),
+		}); err != nil {
+			s.reply(c.ID, false, fmt.Sprintf("持ち替えに失敗: %v", err), nil)
+			return
+		}
+		s.reply(c.ID, true, "", nil)
+
+	case "place":
+		bx := int32(math.Floor(float64(c.X)))
+		by := int32(math.Floor(float64(c.Y)))
+		bz := int32(math.Floor(float64(c.Z)))
+		s.mu.Lock()
+		held, ok := s.rawSlots[int(s.heldSlot)]
+		if !ok || held.Stack.Count == 0 {
+			s.mu.Unlock()
+			s.reply(c.ID, false, "手に何も持っていません", nil)
+			return
+		}
+		// 面を指定されていなければ、プレイヤー側の面に置く。
+		face := c.Face
+		if face < 0 {
+			face = faceToward(s.pos, bx, by, bz)
+		}
+		s.lookAtLocked(float32(bx)+0.5, float32(by)+0.5, float32(bz)+0.5)
+		// クリック先のブロックIDを渡さないとサーバーが設置を捨てる。
+		clicked, _ := s.world.runtimeIDAt(bx, by, bz)
+		s.pendingPlace = &protocol.UseItemTransactionData{
+			ActionType:       protocol.UseItemActionClickBlock,
+			TriggerType:      protocol.TriggerTypePlayerInput,
+			BlockPosition:    protocol.BlockPos{bx, by, bz},
+			BlockFace:        face,
+			HotBarSlot:       s.heldSlot,
+			HeldItem:         held,
+			Position:         s.pos,
+			ClickedPosition:  clickOffset(face),
+			BlockRuntimeID:   uint32(clicked),
+			ClientPrediction: protocol.ClientPredictionSuccess,
+		}
+		s.mu.Unlock()
+		s.reply(c.ID, true, "", nil)
 
 	case "snapshot":
 		// TypeScript 側の world.* は同期APIなので、都度問い合わせるわけにいかない。
@@ -1014,5 +1193,94 @@ func (s *session) snapshotLocked(r int32) map[string]any {
 		"palette": palette,
 		// 並びは x を外、次に y、最後に z。向こう側の展開もこの順で行う。
 		"data": base64.StdEncoding.EncodeToString(data),
+	}
+}
+
+// lookAtLocked は指定座標へ視点を向ける。呼び出し側が mu を持つこと。
+// 目線の高さは足元から 1.62 上。
+func (s *session) lookAtLocked(x, y, z float32) {
+	dx, dy, dz := x-s.pos[0], y-(s.pos[1]+1.62), z-s.pos[2]
+	flat := math.Hypot(float64(dx), float64(dz))
+	s.yaw = float32(math.Atan2(float64(-dx), float64(dz)) * 180 / math.Pi)
+	s.pitch = float32(-math.Atan2(float64(dy), flat) * 180 / math.Pi)
+}
+
+// faceToward はプレイヤーから見て手前になる面を返す。
+// 0=下 1=上 2=北(-Z) 3=南(+Z) 4=西(-X) 5=東(+X)
+func faceToward(from mgl32.Vec3, bx, by, bz int32) int32 {
+	dx := from[0] - (float32(bx) + 0.5)
+	dy := (from[1] + 1.62) - (float32(by) + 0.5)
+	dz := from[2] - (float32(bz) + 0.5)
+	ax, ay, az := absf(dx), absf(dy), absf(dz)
+	switch {
+	case ay >= ax && ay >= az:
+		if dy > 0 {
+			return 1
+		}
+		return 0
+	case ax >= az:
+		if dx > 0 {
+			return 5
+		}
+		return 4
+	default:
+		if dz > 0 {
+			return 3
+		}
+		return 2
+	}
+}
+
+func absf(v float32) float32 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+// checkDig は採掘が終わったかを見る。tick ごとに呼ぶ。
+// 完了の判定はサーバーの UpdateBlock で空気になったかどうか。自前で
+// 破壊時間を数えると、道具や効果の違いで簡単にずれる。
+func (s *session) checkDig() {
+	s.mu.Lock()
+	d := s.digging
+	if d == nil {
+		s.mu.Unlock()
+		return
+	}
+	name, known := s.world.blockAt(d.pos[0], d.pos[1], d.pos[2])
+	done := known && name == "air"
+	expired := time.Now().After(d.deadline)
+	if done || expired {
+		s.digging = nil
+	}
+	s.mu.Unlock()
+
+	if done {
+		emit(event{Event: "result", Data: map[string]any{"id": d.id, "ok": true}})
+	} else if expired {
+		emit(event{Event: "result", Data: map[string]any{
+			"id": d.id, "ok": false,
+			"error": fmt.Sprintf("掘り切れなかった（%s のまま）", name),
+		}})
+	}
+}
+
+// clickOffset は面の中心を指すブロック内の相対座標を返す。
+// 面の外側を指すとサーバーが設置先を別のブロックだと解釈する。
+func clickOffset(face int32) mgl32.Vec3 {
+	switch face {
+	case 0: // 下
+		return mgl32.Vec3{0.5, 0, 0.5}
+	case 1: // 上
+		return mgl32.Vec3{0.5, 1, 0.5}
+	case 2: // 北(-Z)
+		return mgl32.Vec3{0.5, 0.5, 0}
+	case 3: // 南(+Z)
+		return mgl32.Vec3{0.5, 0.5, 1}
+	case 4: // 西(-X)
+		return mgl32.Vec3{0, 0.5, 0.5}
+	default: // 東(+X)
+		return mgl32.Vec3{1, 0.5, 0.5}
 	}
 }

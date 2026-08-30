@@ -14,11 +14,13 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"time"
@@ -31,6 +33,7 @@ import (
 	"github.com/sandertv/gophertunnel/minecraft/p2p"
 	"github.com/sandertv/gophertunnel/minecraft/protocol"
 	"github.com/sandertv/gophertunnel/minecraft/protocol/login"
+	"github.com/sandertv/gophertunnel/minecraft/protocol/packet"
 	"github.com/sandertv/gophertunnel/minecraft/realms"
 	"github.com/sandertv/gophertunnel/minecraft/service"
 	"golang.org/x/oauth2"
@@ -107,7 +110,23 @@ func main() {
 	// 自前で立てた統合版サーバーは RakNet なので、認証もシグナリングも要らない。
 	// online-mode=false で動かす前提。
 	if *address != "" {
-		d := &minecraft.Dialer{}
+		// 開発用。gophertunnel が内部で握り潰すエラーを見えるようにする。
+		// これが無いと切断理由が "context canceled" としか分からない。
+		d := &minecraft.Dialer{
+			ErrorLog: slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+				Level: slog.LevelDebug,
+			})),
+		}
+		if os.Getenv("BEDROCK_TRACE") == "1" {
+			// 切断の直前に何が来ていたかを見るための覗き窓。
+			d.PacketFunc = func(h packet.Header, payload []byte, src, dst net.Addr) {
+				if h.PacketID == packet.IDCommandRequest {
+					fmt.Fprintln(os.Stderr, "cmdreq bytes:", hex.EncodeToString(payload))
+					return
+				}
+				fmt.Fprintln(os.Stderr, "pkt id=", h.PacketID, "len=", len(payload), "from=", src)
+			}
+		}
 		if *name != "" {
 			// オフライン接続の表示名は IdentityData 側。ClientData ではサーバーに
 			// 反映されず Steve のままになる。

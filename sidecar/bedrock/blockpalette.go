@@ -47,9 +47,14 @@ type blockState struct {
 // blockNames は実行時ID(ハッシュ)から "minecraft:" を外したブロック名を引く。
 var blockNames map[int32]string
 
+// blockIDs は名前から実行時IDを引く。設置の transaction がクリック先のIDを
+// 要求するため必要。状態違いは最初に現れたものを使う。
+var blockIDs map[string]int32
+
 func init() {
 	dec := nbt.NewDecoder(bytes.NewBuffer(blockStateData))
 	blockNames = make(map[int32]string, 20000)
+	blockIDs = make(map[string]int32, 1500)
 	for {
 		var s blockState
 		if err := dec.Decode(&s); err != nil {
@@ -57,7 +62,11 @@ func init() {
 		}
 		h := networkBlockHash(s.Name, s.Properties)
 		// 同じ名前で状態違いのものは同じ名前に潰す。skills/ は名前しか見ない。
-		blockNames[int32(h)] = trimNamespace(s.Name)
+		short := trimNamespace(s.Name)
+		blockNames[int32(h)] = short
+		if _, seen := blockIDs[short]; !seen {
+			blockIDs[short] = int32(h)
+		}
 	}
 }
 
@@ -72,6 +81,13 @@ func trimNamespace(name string) string {
 func blockNameFor(runtimeID int32) (string, bool) {
 	n, ok := blockNames[runtimeID]
 	return n, ok
+}
+
+// blockIDFor は名前から実行時IDを引く。状態を区別しないので、
+// 「そのブロックの代表的な状態」のIDになる。
+func blockIDFor(name string) (int32, bool) {
+	id, ok := blockIDs[trimNamespace(name)]
+	return id, ok
 }
 
 // networkBlockHash は (名前, 状態) から統合版の実行時IDを求める。

@@ -154,13 +154,38 @@ async function main() {
 	const solids = driver.world.findBlocksMatching((n) => n !== "air", 8, 5);
 	check("ブロックを探索できる", solids.length > 0, solids.map((b) => b.name).join(", "));
 
+	// 採掘。足元の地面を掘って空気になるかを見る。
+	// DIG=0 を渡せば飛ばせる（世界を壊したくないとき用）。
+	if (process.env.DIG !== "0") {
+		const target = driver.world.findBlocksMatching(
+			(n) => n === "grass_block" || n === "dirt" || n === "stone",
+			6,
+			1,
+		)[0];
+		if (!target) {
+			check("掘る対象が見つかる", false);
+		} else {
+			try {
+				await driver.dig(new AbortController().signal, target.position);
+				const after = driver.world.blockAt(target.position);
+				check(
+					`${target.name} を掘れる`,
+					after?.name === "air",
+					`掘ったあと: ${after?.name ?? "不明"}`,
+				);
+			} catch (e) {
+				check(`${target.name} を掘れる`, false, String(e));
+			}
+		}
+	}
+
 	// 未実装のものが黙って成功しないことを確かめる。
 	// ここが通ってしまうと skills/ が静かに失敗し続ける。
 	try {
-		await driver.dig(new AbortController().signal, foot);
-		check("未実装の採掘が例外になる", false, "例外が飛ばなかった");
+		await driver.craft("stick", 1);
+		check("未実装のクラフトが例外になる", false, "例外が飛ばなかった");
 	} catch {
-		check("未実装の採掘が例外になる", true);
+		check("未実装のクラフトが例外になる", true);
 	}
 
 	await driver.disconnect();

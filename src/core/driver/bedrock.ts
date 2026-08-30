@@ -276,7 +276,7 @@ export class BedrockDriver implements BotDriver {
 	 * 33立方ぶんで70KB近くになるので毎回は取らない。動いたときと、
 	 * 動かなくても他人が地形を変えている可能性を考えて数秒ごとに取る。
 	 */
-	private async refreshBlocks(): Promise<void> {
+	private async refreshBlocks(force = false): Promise<void> {
 		const here = this.state.position;
 		const last = this.lastSnapshotAt;
 		const moved = last ? distance(here, last) : Number.POSITIVE_INFINITY;
@@ -284,7 +284,7 @@ export class BedrockDriver implements BotDriver {
 		// 接続直後はサブチャンクがまだ届いておらず、取っても空になる。
 		// 空のまま待つと world.* が延々 null を返すので、埋まるまで毎周期取り直す。
 		const empty = this.blocks.knownCount === 0;
-		if (!empty && moved < 4 && !stale) return;
+		if (!force && !empty && moved < 4 && !stale) return;
 
 		try {
 			const snap = await this.sidecar.send("snapshot", { range: SNAPSHOT_RADIUS }, 20_000);
@@ -423,11 +423,32 @@ export class BedrockDriver implements BotDriver {
 
 	// --- ワールド操作（未実装） ---
 
-	async dig(_signal: AbortSignal, _position: Position): Promise<void> {
-		notImplemented("採掘");
+	async dig(signal: AbortSignal, position: Position): Promise<void> {
+		const onAbort = () => this.sidecar.fire_and_forget("stop");
+		signal.addEventListener("abort", onAbort, { once: true });
+		try {
+			await this.sidecar.send(
+				"dig",
+				{ x: position.x, y: position.y, z: position.z, timeoutMs: 25_000 },
+				30_000,
+			);
+		} finally {
+			signal.removeEventListener("abort", onAbort);
+		}
+		// 掘った結果を写しに反映させる。次の判断が古い地形を見ないように。
+		await this.refreshBlocks(true);
 	}
-	async placeBlock(_signal: AbortSignal, _reference: Position, _face: Position): Promise<void> {
-		notImplemented("ブロックの設置");
+
+	async placeBlock(_signal: AbortSignal, reference: Position, face: Position): Promise<void> {
+		await this.sidecar.send("place", {
+			x: reference.x,
+			y: reference.y,
+			z: reference.z,
+			face: faceIndex(face),
+		});
+		// サーバーが置いた結果が返るのを少し待ってから写しを取り直す。
+		await sleep(400);
+		await this.refreshBlocks(true);
 	}
 	async activateBlock(_position: Position): Promise<void> {
 		notImplemented("ブロックの操作");
@@ -435,11 +456,40 @@ export class BedrockDriver implements BotDriver {
 	async attack(_signal: AbortSignal, _entityId: number): Promise<void> {
 		notImplemented("攻撃");
 	}
-	async equip(_itemName: string, _destination: string): Promise<void> {
-		notImplemented("装備の変更");
+	async equip(itemName: string, destination: string): Promise<void> {
+		if (destination !== "hand") {
+			notImplemented(`${destination} への装備`);
+		}
+		const want = stripNamespace(itemName);
+		// ホットバー(スロット0-8)にあるものしか持てない。
+		const slot = this.items.find((i) => i.name === want && i.slot >= 0 && i.slot <= 8);
+		if (!slot) {
+			throw new Error(`${itemName} がホットバーにありません`);
+		}
+		await this.sidecar.send("hold", { count: slot.slot });
 	}
-	async equipBestTool(_position: Position): Promise<void> {
-		notImplemented("道具の持ち替え");
+
+	/**
+	 * そのブロックに向いた道具を持つ。
+	 * mineflayer-tool のような採掘速度の計算はしておらず、素材の等級で選ぶだけ。
+	 * 「ダイヤを斧で叩く」ような取り違えを防ぐのが目的。
+	 */
+	async equipBestTool(position: Position): Promise<void> {
+		const block = this.blocks.blockAt(position);
+		if (!block) return;
+		const kind = toolKindFor(block.name);
+		if (!kind) return;
+
+		const ranked = ["netherite", "diamond", "iron", "stone", "golden", "wooden"];
+		const candidates = this.items
+			.filter((i) => i.slot >= 0 && i.slot <= 8 && i.name.endsWith(`_${kind}`))
+			.sort((a, b) => {
+				const ra = ranked.findIndex((m) => a.name.startsWith(m));
+				const rb = ranked.findIndex((m) => b.name.startsWith(m));
+				return (ra < 0 ? 99 : ra) - (rb < 0 ? 99 : rb);
+			});
+		if (candidates.length === 0) return;
+		await this.sidecar.send("hold", { count: candidates[0].slot });
 	}
 	async pickupNearbyItems(_signal: AbortSignal): Promise<void> {
 		notImplemented("落ちているアイテムの回収");
@@ -464,6 +514,38 @@ export class BedrockDriver implements BotDriver {
 function toPos(v: any): Position {
 	if (Array.isArray(v)) return { x: Number(v[0]), y: Number(v[1]), z: Number(v[2]) };
 	return { x: 0, y: 0, z: 0 };
+}
+
+/** 面の向きベクトルを統合版の面番号に直す。 */
+function faceIndex(face: Position): number {
+	if (face.y < 0) return 0;
+	if (face.y > 0) return 1;
+	if (face.z < 0) return 2;
+	if (face.z > 0) return 3;
+	if (face.x < 0) return 4;
+	if (face.x > 0) return 5;
+	// 向きが無い指定は上面として扱う。置けないよりは自然な既定。
+	return 1;
+}
+
+/** そのブロックを掘るのに向いた道具の種類。分からなければ null。 */
+function toolKindFor(blockName: string): string | null {
+	if (
+		/_ore$|^stone|^cobblestone|^deepslate|^andesite|^diorite|^granite|^obsidian|^furnace|^netherrack|^blackstone|^basalt|^tuff/.test(
+			blockName,
+		)
+	) {
+		return "pickaxe";
+	}
+	if (/_log$|_wood$|^planks$|_planks$|^crafting_table$|^chest$|^barrel$/.test(blockName)) {
+		return "axe";
+	}
+	if (
+		/^dirt$|^grass_block$|^sand$|^gravel$|^clay$|^soul_sand$|^podzol$|^mycelium$/.test(blockName)
+	) {
+		return "shovel";
+	}
+	return null;
 }
 
 function distance(a: Position, b: Position): number {
