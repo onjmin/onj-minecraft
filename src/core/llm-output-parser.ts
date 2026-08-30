@@ -78,12 +78,21 @@ export function parseSkillField(rawSkill: string) {
 	// 1行目を取得して処理
 	const line = rawSkill.split("\n")[0].trim();
 
+	// 「skillName(a: 1, b: 2)」の関数呼び出し形。ローカルモデルが最もよく出す形で、
+	// カンマで頭と尾に割ると最初の引数が head 側に埋もれて丸ごと落ちる。
+	// 括弧の中身をまとめて引数として扱う。
+	const callForm = line.match(/^([a-zA-Z0-9._-]+)\s*\(([\s\S]*)\)\s*$/);
+
 	// 「skillName, json...」のパターンを検出
 	const firstComma = line.indexOf(",");
 	const head = firstComma === -1 ? line : line.slice(0, firstComma).trim();
-	const tail = firstComma === -1 ? "" : line.slice(firstComma + 1).trim();
+	const tail = callForm
+		? callForm[2].trim()
+		: firstComma === -1
+			? ""
+			: line.slice(firstComma + 1).trim();
 
-	const skillNameMatch = head.match(/^([a-zA-Z0-9._-]+)/);
+	const skillNameMatch = (callForm ? callForm[1] : head).match(/^([a-zA-Z0-9._-]+)/);
 	const name = skillNameMatch ? skillNameMatch[1] : null;
 	let args: Record<string, any> = {};
 
@@ -111,7 +120,9 @@ export function parseSkillField(rawSkill: string) {
 function parseKeyValueArgs(argStr: string) {
 	const parsed: Record<string, any> = {};
 	// key: "value" か key: 'value' か key: value のいずれかにマッチ
-	const kvRegex = /(\w+)\s*[:=]\s*(?:"([^"]*)"|'([^']*)'|([^\s,]+))/g;
+	// 括弧やカンマは値に含めない。含めると "-926)" のような値ができ、
+	// 数値判定にも Number() にも通らないまま座標として使われる。
+	const kvRegex = /(\w+)\s*[:=]\s*(?:"([^"]*)"|'([^']*)'|([^\s,()]+))/g;
 	let m: RegExpExecArray | null;
 
 	while (true) {
@@ -123,7 +134,9 @@ function parseKeyValueArgs(argStr: string) {
 
 		let val: unknown = rawVal;
 
-		if (/^\d+$/.test(rawVal)) {
+		// 負数と小数も数値として扱う。座標は普通に負になるので、
+		// ここで弾くと文字列のまま渡って検証に落ちる。
+		if (/^[+-]?\d+(?:\.\d+)?$/.test(rawVal)) {
 			val = Number(rawVal);
 		} else if (/^(true|false)$/i.test(rawVal)) {
 			val = rawVal.toLowerCase() === "true";
