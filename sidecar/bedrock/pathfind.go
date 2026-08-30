@@ -2,8 +2,9 @@ package main
 
 // ブロックを見ながらの経路探索。
 //
-// これが無いと、目標へ真っ直ぐ向かって起伏や木で止まる。実測でも平地では
-// バニラ歩行の87%出るのに、起伏のある地形では28%まで落ちていた。
+// 歩ける道だけを探すと、壁に囲まれた場所や谷の向こうへは永久に辿り着けない。
+// 1歩ごとに「歩く / 跳ぶ / 落ちる / 掘って抜ける / 足場を置いて渡る」のどれかを
+// 選べるようにして、泥臭い手段も経路の一部として扱う。
 //
 // 探索は立ち位置(足元の座標)を節点とする A*。移動できるかは
 //   足元が通れる / 頭上が通れる / その下が固い
@@ -16,6 +17,33 @@ import (
 )
 
 type blockPos struct{ X, Y, Z int32 }
+
+// 1歩の種類。実行側はこれを見て、歩く前に掘る/置くを挟む。
+const (
+	stepWalk   = iota // そのまま歩く
+	stepJump          // 1段上がる
+	stepFall          // 落ちる
+	stepDig           // 塞いでいるブロックを壊してから進む
+	stepBridge        // 足場が無いので置いてから進む
+)
+
+type step struct {
+	// Pos は移動後の立ち位置(足元)。
+	Pos    blockPos
+	Action int
+	// Dig は進む前に壊すブロック。stepDig でのみ埋まる。
+	Dig []blockPos
+	// Fill は進む前に埋めるブロック。stepBridge でのみ埋まる。
+	Fill blockPos
+}
+
+// caps はボットにできること。手持ちや道具で経路の選択肢が変わる。
+type caps struct {
+	// CanDig が false なら掘る手は使わない。
+	CanDig bool
+	// Blocks は足場に使えるブロックの数。0 なら橋は架けない。
+	Blocks int
+}
 
 // 通り抜けられるブロック。TypeScript 側の blockview.ts と揃えてある。
 var passableBlocks = map[string]bool{
@@ -34,6 +62,13 @@ var hazardBlocks = map[string]bool{
 	"magma": true, "cactus": true, "sweet_berry_bush": true,
 }
 
+// 壊せないもの。掘る手を選ぶ前に除く。
+var undiggableBlocks = map[string]bool{
+	"bedrock": true, "barrier": true, "command_block": true,
+	"structure_block": true, "end_portal_frame": true, "obsidian": true,
+	"water": true, "flowing_water": true, "lava": true, "flowing_lava": true,
+}
+
 func (w *world) passable(p blockPos) bool {
 	name, ok := w.blockAt(p.X, p.Y, p.Z)
 	if !ok {
@@ -43,16 +78,30 @@ func (w *world) passable(p blockPos) bool {
 	return passableBlocks[name]
 }
 
+// diggable は壊して通れるようにできるか。未取得は触らない。
+func (w *world) diggable(p blockPos) bool {
+	name, ok := w.blockAt(p.X, p.Y, p.Z)
+	if !ok {
+		return false
+	}
+	return !passableBlocks[name] && !undiggableBlocks[name] && !hazardBlocks[name]
+}
+
+// solidFloor はそこに立ったときの足場として使えるか。
+func (w *world) solidFloor(p blockPos) bool {
+	name, ok := w.blockAt(p.X, p.Y, p.Z)
+	if !ok || hazardBlocks[name] {
+		return false
+	}
+	return !passableBlocks[name]
+}
+
 // standable はそこに立てるか。足元と頭上が空いていて、その下が足場であること。
 func (w *world) standable(p blockPos) bool {
 	if !w.passable(p) || !w.passable(blockPos{p.X, p.Y + 1, p.Z}) {
 		return false
 	}
-	below, ok := w.blockAt(p.X, p.Y-1, p.Z)
-	if !ok || hazardBlocks[below] {
-		return false
-	}
-	return !passableBlocks[below]
+	return w.solidFloor(blockPos{p.X, p.Y - 1, p.Z})
 }
 
 type pathNode struct {
@@ -72,9 +121,18 @@ func (q *nodeQueue) Pop() any          { old := *q; n := old[len(old)-1]; *q = o
 // 落ちてよい高さ。これを超える段差は経路に含めない。
 const maxDrop = 3
 
-// findPath は from から goal へ立って行ける道を返す。
-// 見つからなければ nil。maxNodes は tick を止めないための上限。
-func (w *world) findPath(from, goal blockPos, tolerance float64, maxNodes int) []blockPos {
+// 行動の重み。掘るのも置くのも時間がかかるので、歩ける道があればそちらを選ぶ。
+const (
+	costWalk   = 1.0
+	costJump   = 1.5
+	costFall   = 1.2
+	costDig    = 5.0 // 1ブロックあたり
+	costBridge = 4.0
+)
+
+// findPath は from から goal へ行ける手順を返す。見つからなければ nil。
+// maxNodes は tick を止めないための上限。
+func (w *world) findPath(from, goal blockPos, tolerance float64, maxNodes int, c caps) []step {
 	h := func(p blockPos) float64 {
 		dx := float64(p.X - goal.X)
 		dy := float64(p.Y - goal.Y)
@@ -87,11 +145,15 @@ func (w *world) findPath(from, goal blockPos, tolerance float64, maxNodes int) [
 		return math.Sqrt(dx*dx+dz*dz) <= tolerance
 	}
 
-	start := &pathNode{pos: from, g: 0, f: h(from)}
-	open := &nodeQueue{start}
+	open := &nodeQueue{{pos: from, g: 0, f: h(from)}}
 	heap.Init(open)
 	best := map[blockPos]float64{from: 0}
-	cameFrom := map[blockPos]blockPos{}
+	// その位置へ「どこから」「どの手順で」来たか。手順だけだと遡れない。
+	type origin struct {
+		prev blockPos
+		st   step
+	}
+	cameFrom := map[blockPos]origin{}
 
 	visited := 0
 	for open.Len() > 0 {
@@ -101,80 +163,143 @@ func (w *world) findPath(from, goal blockPos, tolerance float64, maxNodes int) [
 		visited++
 		cur := heap.Pop(open).(*pathNode)
 		if reached(cur.pos) {
-			return reconstruct(cameFrom, from, cur.pos)
+			var path []step
+			at := cur.pos
+			for at != from {
+				o, ok := cameFrom[at]
+				if !ok {
+					break
+				}
+				path = append(path, o.st)
+				at = o.prev
+			}
+			for i, j := 0, len(path)-1; i < j; i, j = i+1, j-1 {
+				path[i], path[j] = path[j], path[i]
+			}
+			return path
 		}
 		if cur.g > best[cur.pos] {
 			continue
 		}
-		for _, next := range w.neighbours(cur.pos) {
-			// 斜めは足さない。角抜けの判定が要るうえ、実際の歩行が安定しない。
-			cost := cur.g + 1
-			if next.Y != cur.pos.Y {
-				// 上り下りは少し高くつけて、平らな道を優先させる。
-				cost += 0.5
-			}
-			if old, seen := best[next]; seen && cost >= old {
+		for _, mv := range w.moves(cur.pos, c) {
+			cost := cur.g + mv.cost
+			if old, seen := best[mv.step.Pos]; seen && cost >= old {
 				continue
 			}
-			best[next] = cost
-			cameFrom[next] = cur.pos
-			heap.Push(open, &pathNode{pos: next, g: cost, f: cost + h(next)})
+			best[mv.step.Pos] = cost
+			cameFrom[mv.step.Pos] = origin{prev: cur.pos, st: mv.step}
+			heap.Push(open, &pathNode{pos: mv.step.Pos, g: cost, f: cost + h(mv.step.Pos)})
 		}
 	}
 	return nil
 }
 
-// neighbours は1歩で行ける立ち位置。水平4方向について、同じ高さ・1段上り・
-// 落下(maxDrop まで)を見る。
-func (w *world) neighbours(p blockPos) []blockPos {
+type move struct {
+	step step
+	cost float64
+}
+
+// moves は1歩で行ける先を、手段ごとに列挙する。
+// 斜めは扱わない。角抜けの判定が要るうえ、実際の歩行が安定しない。
+func (w *world) moves(p blockPos, c caps) []move {
 	dirs := [4][2]int32{{1, 0}, {-1, 0}, {0, 1}, {0, -1}}
-	out := make([]blockPos, 0, 8)
+	out := make([]move, 0, 12)
+
 	for _, d := range dirs {
 		x, z := p.X+d[0], p.Z+d[1]
+		foot := blockPos{x, p.Y, z}
+		head := blockPos{x, p.Y + 1, z}
 
-		// 同じ高さ
-		if w.standable(blockPos{x, p.Y, z}) {
-			out = append(out, blockPos{x, p.Y, z})
+		// そのまま歩ける
+		if w.standable(foot) {
+			out = append(out, move{step{Pos: foot, Action: stepWalk}, costWalk})
 			continue
 		}
-		// 1段上る。頭上2つぶんが空いていないと跳べない。
-		if w.passable(blockPos{p.X, p.Y + 2, p.Z}) && w.standable(blockPos{x, p.Y + 1, z}) {
-			out = append(out, blockPos{x, p.Y + 1, z})
+
+		// 1段上がる。頭上2つぶんが空いていないと跳べない。
+		up := blockPos{x, p.Y + 1, z}
+		if w.passable(blockPos{p.X, p.Y + 2, p.Z}) && w.standable(up) {
+			out = append(out, move{step{Pos: up, Action: stepJump}, costJump})
 			continue
 		}
+
 		// 落ちる
-		for dy := int32(1); dy <= maxDrop; dy++ {
-			cand := blockPos{x, p.Y - dy, z}
-			if w.standable(cand) {
-				out = append(out, cand)
-				break
+		if w.passable(foot) && w.passable(head) {
+			for dy := int32(1); dy <= maxDrop; dy++ {
+				cand := blockPos{x, p.Y - dy, z}
+				if w.standable(cand) {
+					out = append(out, move{step{Pos: cand, Action: stepFall}, costFall})
+					break
+				}
+				if !w.passable(cand) {
+					break
+				}
 			}
-			// 途中が塞がっていればそれ以上は落ちられない
-			if !w.passable(cand) {
-				break
+		}
+
+		// 掘って抜ける。足場があり、塞いでいるものが壊せるとき。
+		if c.CanDig && w.solidFloor(blockPos{x, p.Y - 1, z}) {
+			var dig []blockPos
+			ok := true
+			for _, b := range []blockPos{foot, head} {
+				if w.passable(b) {
+					continue
+				}
+				if !w.diggable(b) {
+					ok = false
+					break
+				}
+				dig = append(dig, b)
+			}
+			if ok && len(dig) > 0 {
+				out = append(out, move{
+					step{Pos: foot, Action: stepDig, Dig: dig},
+					costWalk + costDig*float64(len(dig)),
+				})
+				continue
+			}
+		}
+
+		// 足場を置いて渡る。空間は空いているが下が無いとき。
+		if c.Blocks > 0 && w.passable(foot) && w.passable(head) {
+			below := blockPos{x, p.Y - 1, z}
+			if w.passable(below) {
+				out = append(out, move{
+					step{Pos: foot, Action: stepBridge, Fill: below},
+					costWalk + costBridge,
+				})
 			}
 		}
 	}
+
+	// 真下を掘って降りる。縦穴を掘るときに要る。
+	if c.CanDig {
+		below := blockPos{p.X, p.Y - 1, p.Z}
+		if w.diggable(below) && w.solidFloor(blockPos{p.X, p.Y - 2, p.Z}) {
+			out = append(out, move{
+				step{Pos: below, Action: stepDig, Dig: []blockPos{below}},
+				costFall + costDig,
+			})
+		}
+	}
+
 	return out
 }
 
-func reconstruct(cameFrom map[blockPos]blockPos, from, to blockPos) []blockPos {
-	path := []blockPos{to}
-	cur := to
-	for cur != from {
-		prev, ok := cameFrom[cur]
-		if !ok {
-			break
-		}
-		cur = prev
-		path = append(path, cur)
+// stepName は手順の種類を人が読める名前にする。診断用。
+func stepName(action int) string {
+	switch action {
+	case stepWalk:
+		return "walk"
+	case stepJump:
+		return "jump"
+	case stepFall:
+		return "fall"
+	case stepDig:
+		return "dig"
+	case stepBridge:
+		return "bridge"
+	default:
+		return "unknown"
 	}
-	// 逆順に積んだので反転する。先頭は今いる場所なので落とす。
-	for i, j := 0, len(path)-1; i < j; i, j = i+1, j-1 {
-		path[i], path[j] = path[j], path[i]
-	}
-	if len(path) > 0 {
-		path = path[1:]
-	}
-	return path
 }

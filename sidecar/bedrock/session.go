@@ -90,7 +90,9 @@ type target struct {
 	lastPos      mgl32.Vec3
 	stalledTicks int
 	// 経路。空なら真っ直ぐ向かう(近距離や、道が見つからなかったとき)。
-	path []blockPos
+	path []step
+	// 今の1歩で待っている下ごしらえ(掘る/置く)。終わるまで前進しない。
+	waiting bool
 	// 経路を引き直した時刻。地形の読み込みが進むと道が見つかることがある。
 	lastPlan time.Time
 }
@@ -687,23 +689,34 @@ func (s *session) steerLocked(n uint64) {
 			// 中間地点なので、そこにぴったり着く必要はない。
 			tol = 1
 		}
-		g.path = s.world.findPath(from, to, tol, planMaxNodes)
+		g.path = s.world.findPath(from, to, tol, planMaxNodes, s.capsLocked())
 	}
 
 	// 次の通過点。着いたら捨てて次へ。
 	var tx, tz float32
 	var stepUp bool
 	if len(g.path) > 0 {
-		wp := g.path[0]
-		tx, tz = float32(wp.X)+0.5, float32(wp.Z)+0.5
-		if horizontalDist(s.feetLocked(), tx, tz) < 0.4 {
+		st := g.path[0]
+		if horizontalDist(s.feetLocked(), float32(st.Pos.X)+0.5, float32(st.Pos.Z)+0.5) < 0.4 &&
+			!g.waiting {
 			g.path = g.path[1:]
-			if len(g.path) > 0 {
-				wp = g.path[0]
-				tx, tz = float32(wp.X)+0.5, float32(wp.Z)+0.5
+			if len(g.path) == 0 {
+				s.controls["forward"] = false
+				return
 			}
+			st = g.path[0]
 		}
-		stepUp = float32(wp.Y) > s.feetLocked()[1]+0.5
+		// 掘る/置くが要る歩は、それが済むまで前進しない。
+		// 進みながらやると、まだ空いていない穴に突っ込んで弾かれる。
+		if !s.prepareStepLocked(st) {
+			g.waiting = true
+			s.controls["forward"] = false
+			s.controls["jump"] = false
+			return
+		}
+		g.waiting = false
+		tx, tz = float32(st.Pos.X)+0.5, float32(st.Pos.Z)+0.5
+		stepUp = float32(st.Pos.Y) > s.feetLocked()[1]+0.5
 	}
 	if len(g.path) == 0 {
 		tx, tz = g.x, g.z
@@ -929,7 +942,10 @@ func (s *session) dispatch(c command) {
 					return nil
 				}
 				w := s.goal.path[0]
-				return []int32{w.X, w.Y, w.Z}
+				return map[string]any{
+					"pos":    []int32{w.Pos.X, w.Pos.Y, w.Pos.Z},
+					"action": stepName(w.Action),
+				}
 			}(),
 			"histHits":   s.histHits,
 			"histMisses": s.histMisses,
@@ -1391,6 +1407,10 @@ func (s *session) checkDig() {
 	}
 	s.mu.Unlock()
 
+	// id 0 は移動のための内部的な採掘。返す相手がいないので黙って終える。
+	if d.id == 0 {
+		return
+	}
 	if done {
 		emit(event{Event: "result", Data: map[string]any{"id": d.id, "ok": true}})
 	} else if expired {
@@ -1418,4 +1438,151 @@ func clickOffset(face int32) mgl32.Vec3 {
 	default: // 東(+X)
 		return mgl32.Vec3{1, 0.5, 0.5}
 	}
+}
+
+// capsLocked は今できることを返す。手持ちで経路の選択肢が変わる。
+// 呼び出し側が mu を持つこと。
+func (s *session) capsLocked() caps {
+	blocks := 0
+	for _, it := range s.slots {
+		// 置ける「ブロック」かどうかを名前だけで厳密に判定はできない。
+		// ホットバーにあるものを候補として数え、実際に置けるかは
+		// 置いてみて判断する。置けなければ経路を引き直すことになる。
+		if it.Slot >= 0 && it.Slot <= 8 && isPlaceableName(it.Name) {
+			blocks += it.Count
+		}
+	}
+	return caps{CanDig: true, Blocks: blocks}
+}
+
+// isPlaceableName は足場に使えそうな名前か。道具や食べ物を除くための粗い判定。
+func isPlaceableName(name string) bool {
+	for _, suffix := range []string{
+		"_pickaxe", "_axe", "_shovel", "_hoe", "_sword", "_helmet", "_chestplate",
+		"_leggings", "_boots", "bucket", "_seeds", "_ingot", "_nugget", "coal",
+		"stick", "string", "bone", "gunpowder", "arrow", "bread", "apple",
+	} {
+		if strings.HasSuffix(name, suffix) || name == suffix {
+			return false
+		}
+	}
+	return true
+}
+
+// prepareStepLocked はその歩に必要な下ごしらえを進める。
+// 済んでいれば true。まだなら false を返し、掘る/置くを仕掛ける。
+// 呼び出し側が mu を持つこと。
+func (s *session) prepareStepLocked(st step) bool {
+	switch st.Action {
+	case stepDig:
+		for _, b := range st.Dig {
+			if s.world.passable(b) {
+				continue
+			}
+			// 既に掘っている最中ならそのまま待つ。
+			if s.digging != nil && s.digging.pos == (protocol.BlockPos{b.X, b.Y, b.Z}) {
+				return false
+			}
+			if s.digging != nil {
+				return false
+			}
+			s.digging = &digTask{
+				// id 0 は移動のための内部的な採掘。結果を返す相手がいない。
+				id:       0,
+				pos:      protocol.BlockPos{b.X, b.Y, b.Z},
+				face:     faceToward(s.pos, b.X, b.Y, b.Z),
+				deadline: time.Now().Add(15 * time.Second),
+			}
+			s.lookAtLocked(float32(b.X)+0.5, float32(b.Y)+0.5, float32(b.Z)+0.5)
+			return false
+		}
+		return true
+
+	case stepBridge:
+		if s.world.solidFloor(st.Fill) {
+			return true
+		}
+		if s.pendingPlace != nil {
+			return false
+		}
+		// 置く先に接している既存のブロックを支えにする。
+		ref, face, ok := s.supportForLocked(st.Fill)
+		if !ok {
+			// 支えが無ければ置けない。経路を引き直させる。
+			s.goal.path = nil
+			return false
+		}
+		held, ok := s.rawSlots[int(s.heldSlot)]
+		if !ok || held.Stack.Count == 0 {
+			if !s.holdPlaceableLocked() {
+				s.goal.path = nil
+				return false
+			}
+			return false
+		}
+		clicked, _ := s.world.runtimeIDAt(ref.X, ref.Y, ref.Z)
+		s.lookAtLocked(float32(st.Fill.X)+0.5, float32(st.Fill.Y)+0.5, float32(st.Fill.Z)+0.5)
+		s.pendingPlace = &protocol.UseItemTransactionData{
+			ActionType:       protocol.UseItemActionClickBlock,
+			TriggerType:      protocol.TriggerTypePlayerInput,
+			BlockPosition:    protocol.BlockPos{ref.X, ref.Y, ref.Z},
+			BlockFace:        face,
+			HotBarSlot:       s.heldSlot,
+			HeldItem:         held,
+			Position:         s.pos,
+			ClickedPosition:  clickOffset(face),
+			BlockRuntimeID:   uint32(clicked),
+			ClientPrediction: protocol.ClientPredictionSuccess,
+		}
+		return false
+
+	default:
+		return true
+	}
+}
+
+// supportForLocked は fill の位置にブロックを置くための、接している既存ブロックと
+// その面を返す。統合版の設置は「既にあるブロックの面をクリックする」形なので、
+// 何も接していない空中には置けない。
+func (s *session) supportForLocked(fill blockPos) (blockPos, int32, bool) {
+	// 面番号: 0=下 1=上 2=北(-Z) 3=南(+Z) 4=西(-X) 5=東(+X)
+	cands := []struct {
+		off  blockPos
+		face int32
+	}{
+		{blockPos{fill.X, fill.Y - 1, fill.Z}, 1},
+		{blockPos{fill.X, fill.Y + 1, fill.Z}, 0},
+		{blockPos{fill.X, fill.Y, fill.Z - 1}, 3},
+		{blockPos{fill.X, fill.Y, fill.Z + 1}, 2},
+		{blockPos{fill.X - 1, fill.Y, fill.Z}, 5},
+		{blockPos{fill.X + 1, fill.Y, fill.Z}, 4},
+	}
+	for _, c := range cands {
+		if s.world.solidFloor(c.off) {
+			return c.off, c.face, true
+		}
+	}
+	return blockPos{}, 0, false
+}
+
+// holdPlaceableLocked は置けそうなものをホットバーから選んで持つ。
+// 持ち替えを仕掛けたら true。候補が無ければ false。
+func (s *session) holdPlaceableLocked() bool {
+	for _, it := range s.slots {
+		if it.Slot < 0 || it.Slot > 8 || !isPlaceableName(it.Name) {
+			continue
+		}
+		item := s.rawSlots[it.Slot]
+		s.heldSlot = int32(it.Slot)
+		go func(slot int32, i protocol.ItemInstance) {
+			_ = s.conn.WritePacket(&packet.MobEquipment{
+				EntityRuntimeID: s.game.EntityRuntimeID,
+				NewItem:         i,
+				InventorySlot:   byte(slot),
+				HotBarSlot:      byte(slot),
+			})
+		}(int32(it.Slot), item)
+		return true
+	}
+	return false
 }
