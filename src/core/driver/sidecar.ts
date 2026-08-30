@@ -57,6 +57,17 @@ function defaultBinary(viaWsl: boolean): string {
 	return path.resolve(process.cwd(), "sidecar", "bedrock", "bin", name);
 }
 
+/**
+ * 招待リンクから招待コードだけを取り出す。
+ *
+ * gophertunnel の realms クライアントはコードをそのまま URL に埋めるため、
+ * "https://realms.gg/xxxx" を丸ごと渡すと Realm の取得が 404 になる。
+ * 人間が受け取るのは共有される URL の方なので、こちら側で剥がす。
+ */
+function inviteCode(invite: string): string {
+	return invite.trim().replace(/^https?:\/\/(?:www\.)?realms\.gg\//i, "");
+}
+
 /** C:\foo\bar → /mnt/c/foo/bar。WSL に渡すパスの変換。 */
 function toWslPath(winPath: string): string {
 	const m = /^([A-Za-z]):[\\/](.*)$/.exec(winPath);
@@ -119,7 +130,7 @@ export class BedrockSidecar {
 		const bin = o.binaryPath ?? defaultBinary(viaWsl);
 		const args: string[] = [];
 		if (o.address) args.push("-address", o.address);
-		else args.push("-invite", o.realmInvite!);
+		else args.push("-invite", inviteCode(o.realmInvite!));
 		if (o.name) args.push("-name", o.name);
 		if (o.tokenCache) args.push("-token-cache", o.tokenCache);
 
