@@ -134,13 +134,33 @@ async function main() {
 		}
 	}
 
+	// ワールド読み取り。足元は必ず何かあるはず。
+	const foot = driver.getState().position;
+	const below = driver.world.blockAt({ x: foot.x, y: foot.y - 1, z: foot.z });
+	check(
+		"足元のブロックが読める",
+		below !== null,
+		below ? `${below.name} (solid=${below.solid})` : "",
+	);
+
+	const above = driver.world.blockAt({ x: foot.x, y: foot.y + 3, z: foot.z });
+	check("頭上のブロックが読める", above !== null, above ? above.name : "");
+
+	// 未取得の領域を「空気」と答えないこと。空気と答えると skills/ が
+	// そこに何も無いと解釈して空中に足場を作ろうとする。
+	const faraway = driver.world.blockAt({ x: foot.x + 5000, y: foot.y, z: foot.z });
+	check("未取得の領域は null を返す", faraway === null);
+
+	const solids = driver.world.findBlocksMatching((n) => n !== "air", 8, 5);
+	check("ブロックを探索できる", solids.length > 0, solids.map((b) => b.name).join(", "));
+
 	// 未実装のものが黙って成功しないことを確かめる。
 	// ここが通ってしまうと skills/ が静かに失敗し続ける。
 	try {
-		driver.world.blockAt({ x: 0, y: 0, z: 0 });
-		check("未実装のブロック参照が例外になる", false, "例外が飛ばなかった");
+		await driver.dig(new AbortController().signal, foot);
+		check("未実装の採掘が例外になる", false, "例外が飛ばなかった");
 	} catch {
-		check("未実装のブロック参照が例外になる", true);
+		check("未実装の採掘が例外になる", true);
 	}
 
 	await driver.disconnect();

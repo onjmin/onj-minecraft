@@ -12,6 +12,18 @@ set -e
 PROJ=$(cd "$(dirname "$0")/.." && pwd)
 SRC="$PROJ/sidecar/bedrock"
 
+# ブロックの実行時IDは「ブロック状態NBTのハッシュ」なので、名前に戻すには
+# 全ブロック状態の一覧が要る。dragonfly のものを使う。
+# コミットを固定しているのは、更新でハッシュがずれると解析結果が静かに壊れるため。
+DRAGONFLY_SHA=0c2c404540fc651873c24a020b0a48778bd56295
+STATES="$SRC/data/block_states.nbt"
+if [ ! -f "$STATES" ]; then
+  echo "ブロック状態表を取得します..."
+  mkdir -p "$SRC/data"
+  curl -fsSL -o "$STATES"     "https://raw.githubusercontent.com/df-mc/dragonfly/$DRAGONFLY_SHA/server/world/block_states.nbt"
+  echo "  $(wc -c < "$STATES") バイト"
+fi
+
 cat > /tmp/onj-sidecar-build.sh <<'INNER'
 set -e
 cd /w

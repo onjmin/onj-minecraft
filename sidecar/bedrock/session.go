@@ -11,6 +11,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -41,6 +43,9 @@ type command struct {
 	Value   bool    `json:"value"`
 	Message string  `json:"message"`
 	Timeout int     `json:"timeoutMs"`
+	// ブロック探索用
+	Names []string `json:"names"`
+	Count int      `json:"count"`
 }
 
 // 1tick あたりの移動量。バニラの歩行 4.317 ブロック/秒、走行 5.612 ブロック/秒。
@@ -105,6 +110,15 @@ type session struct {
 	itemNames map[int32]string
 	slots     []invSlot
 
+	// チャンクの中身は最初の1回だけ報告する。毎チャンク出すと読めない。
+	chunkReported bool
+	// サーバーから存在を知らされた列と、その次元。
+	known map[[2]int32]int32
+	// 要求済みの (列, 高さ区画) の組。移動で高さが変われば取り直す。
+	requested map[[3]int32]bool
+	// 受け取ったブロック。ワールド読み取りの土台。
+	world *world
+
 	done chan struct{}
 	once sync.Once
 }
@@ -131,6 +145,9 @@ func newSession(conn *minecraft.Conn, game minecraft.GameData) *session {
 		food:      20,
 		controls:  map[string]bool{},
 		entities:  map[uint64]*entityInfo{},
+		known:     map[[2]int32]int32{},
+		requested: map[[3]int32]bool{},
+		world:     newWorld(),
 		unique:    map[int64]uint64{},
 		done:      make(chan struct{}),
 	}
@@ -148,6 +165,7 @@ func (s *session) serve(ctx context.Context) {
 	go s.readPackets()
 	go s.tick()
 	go s.readCommands()
+	go s.requestLoop()
 
 	// StartGame の座標はチャンクが読み込まれるまでの仮値で、Y に 32768 付近の
 	// 番兵が入っていることがある。そのまま歩かせると落下中に動かすことになり
@@ -318,6 +336,31 @@ func (s *session) handle(pk packet.Packet) {
 			"xuid":    v.XUID,
 			"self":    self,
 		}})
+
+	case *packet.LevelChunk:
+		// この版のサーバーはチャンク本体を勝手に送らない。SubChunkCount が 0 なら
+		// 「要求モード」で、こちらが SubChunkRequest を出して初めて中身が届く。
+		if v.SubChunkCount == 0 {
+			// 座標が確定する前に要求すると、存在しない高さを取りに行くことになる。
+			// 列を覚えておいて、要求は別のループに任せる。
+			s.mu.Lock()
+			s.known[[2]int32{v.Position.X(), v.Position.Z()}] = v.Dimension
+			s.mu.Unlock()
+			return
+		}
+		s.storeChunk(v.Position.X(), v.Position.Z(), int(v.SubChunkCount), v.RawPayload)
+
+	case *packet.SubChunk:
+		for _, e := range v.SubChunkEntries {
+			payload, ok := e.RawPayload.Value()
+			if !ok || len(payload) == 0 {
+				continue
+			}
+			// SubChunk の Position は要求の中心。実際の列は Offset を足した先。
+			cx := v.Position.X() + int32(e.Offset[0])
+			cz := v.Position.Z() + int32(e.Offset[2])
+			s.storeChunk(cx, cz, 1, payload)
+		}
 
 	case *packet.InventoryContent:
 		// WindowID 0 がプレイヤー自身の持ち物。
@@ -710,11 +753,266 @@ func (s *session) dispatch(c command) {
 		s.mu.Unlock()
 		s.reply(c.ID, true, "", map[string]any{"items": list})
 
+	case "blockAt":
+		s.mu.Lock()
+		name, ok := s.world.blockAt(int32(math.Floor(float64(c.X))),
+			int32(math.Floor(float64(c.Y))), int32(math.Floor(float64(c.Z))))
+		s.mu.Unlock()
+		if !ok {
+			// 未取得の領域を「空気」と答えると、skills/ が空中に足場を作ろうとする。
+			// 分からないことは分からないと返す。
+			s.reply(c.ID, false, "その座標はまだ読み込まれていません", nil)
+			return
+		}
+		s.reply(c.ID, true, "", map[string]any{"name": name})
+
+	case "findBlock":
+		s.mu.Lock()
+		found := s.findBlocksLocked(c.Names, c.Range, max(1, c.Count))
+		s.mu.Unlock()
+		s.reply(c.ID, true, "", map[string]any{"blocks": found})
+
+	case "snapshot":
+		// TypeScript 側の world.* は同期APIなので、都度問い合わせるわけにいかない。
+		// 周辺のブロックをまとめて渡し、向こうで展開して答えてもらう。
+		// パレット＋添字にすることで、33^3 でも 70KB 程度に収まる。
+		r := int32(c.Range)
+		if r <= 0 {
+			r = 16
+		}
+		if r > 32 {
+			r = 32
+		}
+		s.mu.Lock()
+		snap := s.snapshotLocked(r)
+		s.mu.Unlock()
+		s.reply(c.ID, true, "", snap)
+
 	case "quit":
 		s.reply(c.ID, true, "", nil)
 		s.close("終了を指示された")
 
 	default:
 		s.reply(c.ID, false, fmt.Sprintf("未対応のコマンド: %s", c.Cmd), nil)
+	}
+}
+
+// requestLoop は自分の周りの列を継続して要求する。
+// 要求モードのサーバーはこれを出さないとブロックを一切送ってこない。
+// 移動すると必要な列も高さも変わるので、定期的に見直す。
+func (s *session) requestLoop() {
+	t := time.NewTicker(500 * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-t.C:
+		}
+		s.requestNearby()
+	}
+}
+
+// requestRadius は要求する水平方向の広さ(チャンク単位)。
+// 広げるほど探索範囲は伸びるが、要求と保持のコストも増える。
+const requestRadius = 3
+
+func (s *session) requestNearby() {
+	s.mu.Lock()
+	if s.pos[1] > 1000 {
+		// まだ仮座標。要求しても存在しない高さを取りに行くだけ。
+		s.mu.Unlock()
+		return
+	}
+	px := floorDiv16(int32(math.Floor(float64(s.pos[0]))))
+	pz := floorDiv16(int32(math.Floor(float64(s.pos[2]))))
+	center := floorDiv16(int32(math.Floor(float64(s.pos[1]))))
+
+	type req struct {
+		cx, cz, dim int32
+	}
+	var todo []req
+	for cx := px - requestRadius; cx <= px+requestRadius; cx++ {
+		for cz := pz - requestRadius; cz <= pz+requestRadius; cz++ {
+			dim, ok := s.known[[2]int32{cx, cz}]
+			if !ok {
+				continue
+			}
+			key := [3]int32{cx, cz, center}
+			if s.requested[key] {
+				continue
+			}
+			s.requested[key] = true
+			todo = append(todo, req{cx, cz, dim})
+		}
+	}
+	s.mu.Unlock()
+
+	// 足元と頭上が分かれば移動には足りる。上下2区画ぶん。
+	offsets := make([]protocol.SubChunkOffset, 0, 5)
+	for dy := int8(-2); dy <= 2; dy++ {
+		offsets = append(offsets, protocol.SubChunkOffset{0, dy, 0})
+	}
+	for _, r := range todo {
+		if err := s.conn.WritePacket(&packet.SubChunkRequest{
+			Dimension: r.dim,
+			Position:  protocol.SubChunkPos{r.cx, center, r.cz},
+			Offsets:   offsets,
+		}); err != nil {
+			emit(event{Event: "error", Error: fmt.Sprintf("サブチャンクの要求に失敗: %v", err)})
+			return
+		}
+	}
+}
+
+// storeChunk は届いたサブチャンクを解いて保持する。
+// 最初の1つだけ、何が届いたかを報告する（毎チャンク出すと読めないため）。
+func (s *session) storeChunk(cx, cz int32, count int, payload []byte) {
+	subs, err := decodeSubChunks(payload, count)
+	if err != nil {
+		emit(event{Event: "error", Error: fmt.Sprintf("チャンクの解析に失敗(%d,%d): %v", cx, cz, err)})
+	}
+
+	s.mu.Lock()
+	for _, sc := range subs {
+		s.world.put(cx, cz, sc)
+	}
+	first := !s.chunkReported && len(subs) > 0
+	if first {
+		s.chunkReported = true
+	}
+	loaded := s.world.loadedColumns()
+	s.mu.Unlock()
+
+	if !first {
+		return
+	}
+	st := subs[0].Storages
+	d := map[string]any{
+		"chunk":   []int32{cx, cz},
+		"index":   subs[0].Index,
+		"columns": loaded,
+	}
+	if len(st) > 0 {
+		d["bitsPerBlock"] = st[0].BitsPerBlock
+		d["isRuntime"] = st[0].IsRuntime
+		d["paletteSize"] = len(st[0].Palette) + len(st[0].PaletteNames)
+		// 名前に戻せているかを一目で分かるようにする。
+		names := make([]string, 0, 5)
+		for _, id := range st[0].Palette {
+			if n, ok := blockNameFor(id); ok {
+				names = append(names, n)
+			} else {
+				names = append(names, fmt.Sprintf("不明(%d)", id))
+			}
+			if len(names) == 5 {
+				break
+			}
+		}
+		names = append(names, st[0].PaletteNames...)
+		d["palette"] = names
+	}
+	emit(event{Event: "chunk_info", Data: d})
+}
+
+// findBlocksLocked は自分を中心に、名前が一致するブロックを近い順に探す。
+// 呼び出し側が mu を持つこと。
+//
+// 走査は「Y を外側、水平を内側」ではなく距離順の立方体シェルで回す。単純な
+// 全走査だと半径32でも26万マスあり、tick を止めてしまう。
+func (s *session) findBlocksLocked(names []string, radius float32, count int) []map[string]any {
+	if radius <= 0 {
+		radius = 16
+	}
+	want := make(map[string]bool, len(names))
+	for _, n := range names {
+		want[trimNamespace(n)] = true
+	}
+
+	ox := int32(math.Floor(float64(s.pos[0])))
+	oy := int32(math.Floor(float64(s.pos[1])))
+	oz := int32(math.Floor(float64(s.pos[2])))
+	r := int32(radius)
+
+	out := make([]map[string]any, 0, count)
+	for d := int32(0); d <= r; d++ {
+		for dx := -d; dx <= d; dx++ {
+			for dy := -d; dy <= d; dy++ {
+				for dz := -d; dz <= d; dz++ {
+					// シェルの表面だけを見る。内側は前の d で見終わっている。
+					if maxAbs(dx, dy, dz) != d {
+						continue
+					}
+					x, y, z := ox+dx, oy+dy, oz+dz
+					name, ok := s.world.blockAt(x, y, z)
+					if !ok || !want[name] {
+						continue
+					}
+					out = append(out, map[string]any{
+						"name":     name,
+						"position": []int32{x, y, z},
+					})
+					if len(out) >= count {
+						return out
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
+func maxAbs(a, b, c int32) int32 {
+	return max(abs32(a), max(abs32(b), abs32(c)))
+}
+
+func abs32(v int32) int32 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+// snapshotLocked は自分を中心とした立方体のブロックをパレット形式で書き出す。
+// 呼び出し側が mu を持つこと。
+//
+// 未取得のマスは名前を空文字にする。「空気」と答えると、向こう側が
+// 「そこには何も無い」と誤解して空中に足場を作ろうとする。
+func (s *session) snapshotLocked(r int32) map[string]any {
+	ox := int32(math.Floor(float64(s.pos[0]))) - r
+	oy := int32(math.Floor(float64(s.pos[1]))) - r
+	oz := int32(math.Floor(float64(s.pos[2]))) - r
+	size := int(r*2 + 1)
+
+	palette := []string{""}
+	index := map[string]uint16{"": 0}
+	data := make([]byte, 0, size*size*size*2)
+
+	var buf [2]byte
+	for dx := 0; dx < size; dx++ {
+		for dy := 0; dy < size; dy++ {
+			for dz := 0; dz < size; dz++ {
+				name, ok := s.world.blockAt(ox+int32(dx), oy+int32(dy), oz+int32(dz))
+				if !ok {
+					name = ""
+				}
+				id, seen := index[name]
+				if !seen {
+					id = uint16(len(palette))
+					palette = append(palette, name)
+					index[name] = id
+				}
+				binary.LittleEndian.PutUint16(buf[:], id)
+				data = append(data, buf[0], buf[1])
+			}
+		}
+	}
+
+	return map[string]any{
+		"origin":  []int32{ox, oy, oz},
+		"size":    size,
+		"palette": palette,
+		// 並びは x を外、次に y、最後に z。向こう側の展開もこの順で行う。
+		"data": base64.StdEncoding.EncodeToString(data),
 	}
 }

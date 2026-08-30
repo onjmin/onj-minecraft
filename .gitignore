@@ -143,3 +143,6 @@ vite.config.ts.timestamp-*
 
 # サイドカーのビルド成果物（20MB超・scripts/build-sidecar.sh で再生成する）
 sidecar/bedrock/bin/
+
+# ブロック状態表（2.4MB・scripts/build-sidecar.sh が取得する）
+sidecar/bedrock/data/block_states.nbt

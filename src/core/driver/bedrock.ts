@@ -11,6 +11,7 @@
  * それに依存する採掘・設置・クラフトも同様に未実装。
  * 未実装のものは黙って何もせず成功を装うのではなく、必ず例外にする。
  */
+import { BlockView } from "./blockview";
 import { BedrockSidecar } from "./sidecar";
 import type {
 	BlockInfo,
@@ -54,6 +55,18 @@ function notImplemented(what: string): never {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * 周辺ブロックを受け取る半径。33立方で約36000マス、base64 で約95KB。
+ * サイドカーが要求しているサブチャンクは上下2区画(±32ブロック)なので、
+ * これ以上広げても縦方向は埋まらない。
+ */
+const SNAPSHOT_RADIUS = 16;
+
+/** "minecraft:stone" のような名前空間付きでも引けるようにする。 */
+function stripNamespace(name: string): string {
+	return name.startsWith("minecraft:") ? name.slice("minecraft:".length) : name;
+}
+
 export class BedrockDriver implements BotDriver {
 	readonly world: WorldReader;
 	readonly inventory: InventoryReader;
@@ -75,6 +88,10 @@ export class BedrockDriver implements BotDriver {
 	private items: ItemInfo[] = [];
 	private entities: EntityInfo[] = [];
 	private pollTimer: NodeJS.Timeout | null = null;
+	/** 周辺ブロックの写し。world.* はここから答える。 */
+	private blocks = new BlockView();
+	/** 最後にスナップショットを取った位置。動いたら取り直す。 */
+	private lastSnapshotAt: Position | null = null;
 
 	private chatListeners: ((username: string, message: string) => void)[] = [];
 	private endListeners: ((reason: string) => void)[] = [];
@@ -93,13 +110,34 @@ export class BedrockDriver implements BotDriver {
 			wslDistro: options.wslDistro,
 		});
 
-		// ワールド読み取りはサイドカー側が未対応。近似で誤魔化すと skills/ が
-		// 存在しないブロックを掘ろうとして静かに失敗するので、明示的に落とす。
+		// ブロックはサイドカーから立方体でまとめて受け取り、こちらで展開して
+		// 同期的に答える。都度問い合わせると WorldReader の同期APIに合わない。
 		this.world = {
-			blockAt: () => notImplemented("ブロックの参照"),
-			findBlock: () => notImplemented("ブロックの探索"),
-			findBlocks: () => notImplemented("ブロックの探索"),
-			findBlocksMatching: () => notImplemented("ブロックの探索"),
+			blockAt: (p) => this.blocks.blockAt(p),
+			findBlock: (names, maxDistance) => {
+				const want = new Set(names.map(stripNamespace));
+				const found = this.blocks.findMatching(
+					this.state.position,
+					(n) => want.has(n),
+					maxDistance,
+					1,
+				);
+				return found[0] ?? null;
+			},
+			findBlocks: (names, maxDistance, count) => {
+				const want = new Set(names.map(stripNamespace));
+				return this.blocks.findMatching(
+					this.state.position,
+					(n) => want.has(n),
+					maxDistance,
+					count,
+				);
+			},
+			findBlocksMatching: (predicate, maxDistance, count) =>
+				this.blocks.findMatching(this.state.position, predicate, maxDistance, count),
+			// 統合版はバイオームもライトレベルもクライアントへ素直に送ってこない。
+			// 近似を返すと skills/ がそれを前提に判断してしまうため、
+			// 判断材料にならない値であることが分かる形で返す。
 			getBiome: () => "unknown",
 			getLightLevel: () => 15,
 		};
@@ -171,6 +209,24 @@ export class BedrockDriver implements BotDriver {
 
 		const st = await this.sidecar.send("state");
 		this.username = String(st.username ?? this.username);
+
+		// サブチャンクは要求してから届くので、スポーン直後は周りが見えていない。
+		// ここで待たないと、最初のスキルが「何も無い世界」を見て動くことになる。
+		await this.waitForBlocks();
+	}
+
+	/**
+	 * 周辺ブロックが届くまで待つ。
+	 * 届かなくても接続自体は使えるので、時間切れでも例外にはしない。
+	 */
+	private async waitForBlocks(limitMs = 15_000): Promise<void> {
+		const deadline = Date.now() + limitMs;
+		while (Date.now() < deadline) {
+			if (this.blocks.knownCount > 0) return;
+			await sleep(300);
+			await this.refreshBlocks();
+		}
+		console.error("[bedrock] 周辺ブロックが届きませんでした。world の参照は null を返します");
 	}
 
 	private stopPolling(): void {
@@ -211,6 +267,34 @@ export class BedrockDriver implements BotDriver {
 			position: toPos(e.position),
 			username: e.isPlayer ? String(e.name) : undefined,
 		}));
+
+		await this.refreshBlocks();
+	}
+
+	/**
+	 * 周辺ブロックの写しを取り直す。
+	 * 33立方ぶんで70KB近くになるので毎回は取らない。動いたときと、
+	 * 動かなくても他人が地形を変えている可能性を考えて数秒ごとに取る。
+	 */
+	private async refreshBlocks(): Promise<void> {
+		const here = this.state.position;
+		const last = this.lastSnapshotAt;
+		const moved = last ? distance(here, last) : Number.POSITIVE_INFINITY;
+		const stale = Date.now() - this.blocks.updatedAt > 5000;
+		// 接続直後はサブチャンクがまだ届いておらず、取っても空になる。
+		// 空のまま待つと world.* が延々 null を返すので、埋まるまで毎周期取り直す。
+		const empty = this.blocks.knownCount === 0;
+		if (!empty && moved < 4 && !stale) return;
+
+		try {
+			const snap = await this.sidecar.send("snapshot", { range: SNAPSHOT_RADIUS }, 20_000);
+			this.blocks.load(snap as any);
+			this.lastSnapshotAt = { ...here };
+		} catch (e) {
+			// 取れなくても致命的ではないが、黙らせると world.* が常に null を返す
+			// 状態に気づけない。次の周期で取り直す。
+			console.error(`[bedrock] 周辺ブロックの取得に失敗: ${e}`);
+		}
 	}
 
 	async disconnect(): Promise<void> {
