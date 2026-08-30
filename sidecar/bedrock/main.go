@@ -2,8 +2,12 @@
 //
 // JS 側のライブラリは player_auth_input の定義が実プロトコルと食い違っており
 // (公式スキーマでは圧縮ビットセットなのに可変長配列として扱っている)、
-// 送信系がほぼ全滅する。gophertunnel は Minecraft のリリースに追随しており
-// CurrentProtocol も一致するため、プロトコルの正しさをこちらに委譲する。
+// 送信系がほぼ全滅する。現行の統合版では player_auth_input は移動専用ではなく
+// 採掘・設置・使用・インベントリ操作を全て運ぶ統合チャネルなので、
+// これが壊れているとエージェントは何もできない。
+//
+// gophertunnel は Minecraft のリリースに追随しており protocol も一致するため、
+// プロトコルの正しさをこちらに委譲する。
 //
 // TypeScript 側とは標準入出力で改行区切りJSONをやり取りする。
 package main
@@ -11,36 +15,41 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
 
+	"github.com/df-mc/go-playfab/v2"
+	"github.com/df-mc/go-xsapi/v2"
+	"github.com/df-mc/go-xsapi/v2/xal/sisu"
+	"github.com/sandertv/gophertunnel/minecraft"
 	"github.com/sandertv/gophertunnel/minecraft/auth"
+	"github.com/sandertv/gophertunnel/minecraft/p2p"
 	"github.com/sandertv/gophertunnel/minecraft/protocol"
+	"github.com/sandertv/gophertunnel/minecraft/protocol/login"
 	"github.com/sandertv/gophertunnel/minecraft/realms"
+	"github.com/sandertv/gophertunnel/minecraft/service"
 	"golang.org/x/oauth2"
 )
 
 // 標準出力に出す1行。TypeScript 側はこれを改行区切りで読む。
 type event struct {
-	Event string `json:"event"`
-	// 進捗や結果の中身。イベント種別ごとに使うキーが違う。
-	Data map[string]any `json:"data,omitempty"`
-	// 失敗時のみ入る
-	Error string `json:"error,omitempty"`
+	Event string         `json:"event"`
+	Data  map[string]any `json:"data,omitempty"`
+	Error string         `json:"error,omitempty"`
 }
 
 func emit(e event) {
 	b, err := json.Marshal(e)
 	if err != nil {
-		// ここで失敗するのは実装バグなので握り潰さない
 		fmt.Fprintf(os.Stderr, "emit のシリアライズに失敗: %v\n", err)
 		return
 	}
 	fmt.Println(string(b))
-	os.Stdout.Sync()
 }
 
 func fail(format string, args ...any) {
@@ -48,25 +57,24 @@ func fail(format string, args ...any) {
 	os.Exit(1)
 }
 
-// トークンをファイルにキャッシュする。毎回デバイスコード認証を要求しないため。
-func tokenSource(cachePath string) (oauth2.TokenSource, error) {
+// MSA トークンをファイルにキャッシュする。毎回デバイスコード認証を要求しないため。
+func liveToken(cachePath string) (*oauth2.Token, error) {
 	if b, err := os.ReadFile(cachePath); err == nil {
 		var tok oauth2.Token
 		if err := json.Unmarshal(b, &tok); err == nil {
-			return auth.RefreshTokenSource(&tok), nil
+			return &tok, nil
 		}
 		// 壊れていたら取り直す
 	}
 
 	emit(event{Event: "auth_required", Data: map[string]any{
-		"message": "ブラウザでサインインしてください（コードは標準エラー出力に表示されます）",
+		"message": "ブラウザでサインインしてください（コードは標準エラー出力に出ます）",
 	}})
 
 	tok, err := auth.RequestLiveToken()
 	if err != nil {
 		return nil, fmt.Errorf("デバイスコード認証に失敗: %w", err)
 	}
-
 	if err := os.MkdirAll(filepath.Dir(cachePath), 0o700); err != nil {
 		return nil, fmt.Errorf("キャッシュ先を作成できない: %w", err)
 	}
@@ -77,12 +85,13 @@ func tokenSource(cachePath string) (oauth2.TokenSource, error) {
 	if err := os.WriteFile(cachePath, b, 0o600); err != nil {
 		return nil, fmt.Errorf("トークンを保存できない: %w", err)
 	}
-	return auth.RefreshTokenSource(tok), nil
+	return tok, nil
 }
 
 func main() {
 	invite := flag.String("invite", "", "Realm の招待コード（https://realms.gg/ は省略可）")
-	cache := flag.String("token-cache", ".bedrock-auth/gophertunnel.json", "トークンのキャッシュ先")
+	cache := flag.String("token-cache", ".bedrock-auth/gophertunnel.json", "MSAトークンのキャッシュ先")
+	hold := flag.Duration("hold", 60*time.Second, "接続を維持する時間")
 	flag.Parse()
 
 	emit(event{Event: "ready", Data: map[string]any{
@@ -94,27 +103,54 @@ func main() {
 		fail("-invite を指定してください")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	src, err := tokenSource(*cache)
+	// --- 認証 ---
+	tok, err := liveToken(*cache)
 	if err != nil {
 		fail("認証に失敗: %v", err)
 	}
+	msa := auth.AndroidConfig.TokenSource(ctx, tok)
 
-	client := realms.NewClient(src, nil)
+	xbl, err := xsapi.ClientConfig{RTAMode: xsapi.RTALazy}.New(ctx, auth.AndroidConfig.New(msa, nil))
+	if err != nil {
+		var acct *sisu.AccountCreationRequiredError
+		if errors.As(err, &acct) {
+			fail("Xbox Live アカウントの作成が必要です: %s", acct.SignupURL)
+		}
+		fail("Xbox Live へのログインに失敗: %v", err)
+	}
+	defer xbl.Close()
 
-	realm, err := client.Realm(ctx, *invite)
+	discovery, err := service.Default(ctx)
+	if err != nil {
+		fail("サービスディスカバリに失敗: %v", err)
+	}
+	env := new(service.AuthorizationEnvironment)
+	if err := discovery.Environment(env); err != nil {
+		fail("認証環境の解決に失敗: %v", err)
+	}
+
+	pf, err := playfab.LoginWithXbox(ctx, env.PlayFabTitleID, xbl, playfab.ClientConfig{CreateAccount: true})
+	if err != nil {
+		fail("PlayFab へのログインに失敗: %v", err)
+	}
+	defer pf.Close()
+
+	src := env.TokenSource(pf, service.TokenConfig{})
+	emit(event{Event: "authenticated"})
+
+	// --- Realm の接続情報 ---
+	rc := realms.NewClient(msa, nil)
+	realm, err := rc.Realm(ctx, *invite)
 	if err != nil {
 		fail("Realm の取得に失敗: %v", err)
 	}
 	emit(event{Event: "realm", Data: map[string]any{
-		"id":    realm.ID,
-		"name":  realm.Name,
-		"state": realm.State,
+		"id": realm.ID, "name": realm.Name, "state": realm.State,
 	}})
 
-	// Realm が停止していれば起動を待ってから address を返してくれる
 	addr, err := realm.Address(ctx)
 	if err != nil {
 		fail("接続先の取得に失敗: %v", err)
@@ -123,6 +159,64 @@ func main() {
 		"address":         addr.Address,
 		"networkProtocol": string(addr.NetworkProtocol),
 		"region":          addr.SessionRegionData.RegionName,
-		"pendingUpdate":   addr.PendingUpdate,
 	}})
+
+	if addr.NetworkProtocol != realms.NetworkProtocolNetherNetJSONRPC {
+		fail("未対応の接続方式です: %s", addr.NetworkProtocol)
+	}
+
+	// --- シグナリングと接続 ---
+	// フレンドのワールドと違いセッションが無いので、接続種別を直接指定する。
+	sig, err := p2p.DialClientSignaling(ctx, p2p.ConnectionTypeSignalingOverJSONRPC, src, p2p.ClientSignalingOptions{})
+	if err != nil {
+		fail("シグナリングの接続に失敗: %v", err)
+	}
+	defer func() { _ = sig.Close() }()
+	emit(event{Event: "signaling_connected"})
+
+	minecraft.RegisterNetwork("nethernet", func(l *slog.Logger) minecraft.Network {
+		return minecraft.NetherNet{Signaling: sig, Log: l}
+	})
+
+	dialer := minecraft.Dialer{
+		XBLClient:     xbl,
+		PlayFabClient: pf,
+		ClientData:    login.ClientData{},
+	}
+	// Dial は既定タイムアウトが短く、Realm の応答が間に合わないことがあるため
+	// 明示的にコンテキストを渡す。
+	dialCtx, dialCancel := context.WithTimeout(ctx, 90*time.Second)
+	defer dialCancel()
+	conn, err := dialer.DialContext(dialCtx, "nethernet", addr.Address)
+	if err != nil {
+		fail("Realm への接続に失敗: %v", err)
+	}
+	defer conn.Close()
+	emit(event{Event: "connected"})
+
+	if err := conn.DoSpawn(); err != nil {
+		fail("スポーンに失敗: %v", err)
+	}
+
+	id := conn.GameData()
+	emit(event{Event: "spawn", Data: map[string]any{
+		"entityRuntimeID": id.EntityRuntimeID,
+		"position":        []float32{id.PlayerPosition[0], id.PlayerPosition[1], id.PlayerPosition[2]},
+		"dimension":       id.Dimension,
+		"gameMode":        id.PlayerGameMode,
+	}})
+
+	// 受信を回しつつ指定時間だけ接続を維持する。
+	// 送信が本題だが、まずは接続とスポーンが成立することを確認する。
+	done := time.After(*hold)
+	go func() {
+		for {
+			if _, err := conn.ReadPacket(); err != nil {
+				return
+			}
+		}
+	}()
+
+	<-done
+	emit(event{Event: "done"})
 }
