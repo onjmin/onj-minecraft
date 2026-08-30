@@ -106,6 +106,12 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// 開発用のプロキシ。実クライアントが何を送っているかを見るためのもの。
+	if listen, upstream, ok := proxyRequested(); ok {
+		runProxy(ctx, listen, upstream)
+		return
+	}
+
 	// 開発用のローカルサーバーへ直に繋ぐ経路。Realms は NetherNet だが
 	// 自前で立てた統合版サーバーは RakNet なので、認証もシグナリングも要らない。
 	// online-mode=false で動かす前提。
