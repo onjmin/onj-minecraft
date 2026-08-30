@@ -179,14 +179,13 @@ async function main() {
 		}
 	}
 
-	// 未実装のものが黙って成功しないことを確かめる。
-	// ここが通ってしまうと skills/ が静かに失敗し続ける。
-	try {
-		await driver.craft("stick", 1);
-		check("未実装のクラフトが例外になる", false, "例外が飛ばなかった");
-	} catch {
-		check("未実装のクラフトが例外になる", true);
-	}
+	// レシピ表が読めているか。canCraft は接続時に取った一覧で答える。
+	check(
+		"レシピ表が読めている",
+		driver.canCraft("stick") && driver.canCraft("crafting_table"),
+		"棒と作業台のレシピを引ける",
+	);
+	check("知らない物は作れないと答える", !driver.canCraft("not_a_real_item"));
 
 	await driver.disconnect();
 	console.log(failures === 0 ? "\nすべて通りました" : `\n${failures}件失敗しました`);
