@@ -205,11 +205,16 @@ func main() {
 	}
 
 	id := conn.GameData()
+	// ChatRestrictionLevel が Dropped(1) なら、サーバーは発言を他プレイヤーにだけ
+	// 落とし、送信者には返す。能力フラグの Muted も同様に発言だけを消す。
+	// どちらも「エコーは返るのに誰にも届かない」症状を説明する。
 	emit(event{Event: "spawn", Data: map[string]any{
-		"entityRuntimeID": id.EntityRuntimeID,
-		"position":        []float32{id.PlayerPosition[0], id.PlayerPosition[1], id.PlayerPosition[2]},
-		"dimension":       id.Dimension,
-		"gameMode":        id.PlayerGameMode,
+		"entityRuntimeID":      id.EntityRuntimeID,
+		"position":             []float32{id.PlayerPosition[0], id.PlayerPosition[1], id.PlayerPosition[2]},
+		"dimension":            id.Dimension,
+		"gameMode":             id.PlayerGameMode,
+		"playerPermissions":    id.PlayerPermissions,
+		"chatRestrictionLevel": id.ChatRestrictionLevel,
 	}})
 
 	// 他プレイヤーの発言を拾う。自分の発言もサーバーから返ってくる。
@@ -268,6 +273,17 @@ func main() {
 				chunkMu.Lock()
 				chunkSeen[[2]int32{v.Position.X(), v.Position.Z()}] = true
 				chunkMu.Unlock()
+			case *packet.UpdateAbilities:
+				// Muted が立っていれば発言はサーバーで落とされる。
+				for _, l := range v.AbilityData.Layers {
+					emit(event{Event: "abilities", Data: map[string]any{
+						"layer":     l.Type,
+						"muted":     l.Values&(protocol.AbilityMuted) != 0,
+						"mutedSet":  l.Abilities&(protocol.AbilityMuted) != 0,
+						"values":    l.Values,
+						"abilities": l.Abilities,
+					}})
+				}
 			case *packet.MovePlayer:
 				// コマンドが実際に実行されたかは、/tp で自分が飛ばされるかで分かる。
 				// CommandOutput は返らないことがあるが、これは効果そのものを見る。
@@ -385,10 +401,10 @@ func main() {
 		// チャンクの読み込みなどが落ち着いてから送る
 		time.Sleep(3 * time.Second)
 		if err := conn.WritePacket(&packet.Text{
-			TextType:        packet.TextTypeChat,
-			SourceName:      conn.IdentityData().DisplayName,
-			Message:         *say,
-			XUID:            conn.IdentityData().XUID,
+			TextType:   packet.TextTypeChat,
+			SourceName: conn.IdentityData().DisplayName,
+			Message:    *say,
+			XUID:       conn.IdentityData().XUID,
 		}); err != nil {
 			emit(event{Event: "error", Error: fmt.Sprintf("発言の送信に失敗: %v", err)})
 		} else {
