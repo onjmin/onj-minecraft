@@ -16,12 +16,6 @@ import (
 	"github.com/sandertv/gophertunnel/minecraft/protocol/packet"
 )
 
-// クラフト枠の番号。手持ちの 2x2 は 28..31、作業台の 3x3 は 32..40。
-const (
-	craftingGridBase2x2 byte = 28
-	craftingGridBase3x3 byte = 32
-)
-
 // craftInput は素材1種。
 type craftInput struct {
 	Name  string
@@ -158,14 +152,27 @@ func buildRecipe(id uint32, block string, input []protocol.ItemDescriptorCount, 
 // 手順は「レシピを指定 → 素材を消費 → 出来上がり枠から手持ちへ移す」。
 // 素材の消費では、そのスロットの StackNetworkID を正しく載せないと弾かれる。
 func (s *session) craftRequestLocked(rec craftRecipe, requestID int32) (*protocol.ItemStackRequest, error) {
-	// 実クライアントはレシピ指定の直後に「何ができるか」を申告する。
-	// 名前に "Deprecated" と付いているが、これが無いとサーバーは
-	// InvalidCraftRequest(status=7) で拒否する。
+	// レシピブックからの「材料を自動で集めて作る」形にする。
+	//
+	// CraftRecipe の方はクラフト枠に素材が入っている前提で読むため、枠が空の
+	// まま送ると InvalidCraftRequest(status=7) で拒否される。AutoCraftRecipe は
+	// クラフト枠と手持ちの両方から自動で集めてくれるので、事前の詰め込みが要らない。
+	// (dragonfly の handleAutoCraft で確認)
+	ingredients := make([]protocol.ItemDescriptorCount, 0, len(rec.Inputs))
+	for _, in := range rec.Inputs {
+		ingredients = append(ingredients, protocol.ItemDescriptorCount{
+			Descriptor: &protocol.DefaultItemDescriptor{Name: "minecraft:" + in.Name},
+			Count:      int32(in.Count),
+		})
+	}
+
 	actions := []protocol.StackRequestAction{
-		&protocol.CraftRecipeStackRequestAction{
+		&protocol.AutoCraftRecipeStackRequestAction{
 			RecipeNetworkID: rec.NetworkID,
 			NumberOfCrafts:  1,
+			Ingredients:     ingredients,
 		},
+		// 実クライアントはこの後に結果を申告する。無くても通るが、合わせておく。
 		&protocol.CraftResultsDeprecatedStackRequestAction{
 			ResultItems: []protocol.StackRequestItem{{
 				Identifier: "minecraft:" + rec.Output,
@@ -175,44 +182,17 @@ func (s *session) craftRequestLocked(rec craftRecipe, requestID int32) (*protoco
 		},
 	}
 
-	// 素材はクラフト枠から消費する扱いにする。手持ちの枠から消費すると
-	// サーバーに InvalidCraftRequest で拒否される。
-	// 2x2 の枠は 28..31、3x3 は 32..40。
-	gridSlot := byte(craftingGridBase2x2)
-	if rec.NeedsTable {
-		gridSlot = craftingGridBase3x3
-	}
-
-	// 素材を、手持ちのどのスロットから何個使うかに割り当てる。
+	// 素材が足りるかはこちらでも見ておく。足りないまま送ると拒否されるだけで
+	// 理由が分からない。
 	for _, in := range rec.Inputs {
-		remaining := in.Count
+		have := 0
 		for _, item := range s.rawSlots {
-			if remaining <= 0 {
-				break
+			if name, ok := s.itemNames[item.Stack.ItemType.NetworkID]; ok && name == in.Name {
+				have += int(item.Stack.Count)
 			}
-			name, ok := s.itemNames[item.Stack.ItemType.NetworkID]
-			if !ok || name != in.Name {
-				continue
-			}
-			use := int(item.Stack.Count)
-			if use > remaining {
-				use = remaining
-			}
-			actions = append(actions, &protocol.ConsumeStackRequestAction{
-				DestroyStackRequestAction: protocol.DestroyStackRequestAction{
-					Count: byte(use),
-					Source: protocol.StackRequestSlotInfo{
-						Container:      protocol.FullContainerName{ContainerID: protocol.ContainerCraftingInput},
-						Slot:           gridSlot,
-						StackNetworkID: item.StackNetworkID,
-					},
-				},
-			})
-			gridSlot++
-			remaining -= use
 		}
-		if remaining > 0 {
-			return nil, fmt.Errorf("%s が %d 個足りません", in.Name, remaining)
+		if have < in.Count {
+			return nil, fmt.Errorf("%s が %d 個足りません", in.Name, in.Count-have)
 		}
 	}
 
