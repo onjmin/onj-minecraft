@@ -55,6 +55,9 @@ type command struct {
 // ずれ、経路探索も採掘対象も全部おかしくなる。
 const eyeHeight = float32(1.62)
 
+// 攻撃が届く距離。バニラのプレイヤーは3ブロックほど。
+const attackReach = float32(3.5)
+
 // 1tick あたりの移動量。バニラの歩行 4.317 ブロック/秒、走行 5.612 ブロック/秒。
 const (
 	walkSpeed   = float32(0.2159)
@@ -1251,6 +1254,47 @@ func (s *session) dispatch(c command) {
 		}
 		s.mu.Unlock()
 		s.reply(c.ID, true, "", map[string]any{"recipes": found})
+
+	case "attack":
+		// 攻撃は InventoryTransaction に載せる。手に持っている物で威力が変わる。
+		rid := uint64(c.Count)
+		s.mu.Lock()
+		e, ok := s.entities[rid]
+		if !ok {
+			s.mu.Unlock()
+			s.reply(c.ID, false, "その相手が見当たりません", nil)
+			return
+		}
+		// 届かない距離から殴ってもサーバーに無視される。
+		dist := s.feetLocked().Sub(e.Pos).Len()
+		if dist > attackReach {
+			s.mu.Unlock()
+			s.reply(c.ID, false, fmt.Sprintf("遠すぎます（%.1f ブロック）", dist), nil)
+			return
+		}
+		// 目線が外れていると当たらない判定のサーバーがある。
+		s.lookAtLocked(e.Pos[0], e.Pos[1]+1, e.Pos[2])
+		held := s.rawSlots[int(s.heldSlot)]
+		slot := s.heldSlot
+		pos := s.pos
+		s.mu.Unlock()
+
+		err := s.conn.WritePacket(&packet.InventoryTransaction{
+			TransactionData: &protocol.UseItemOnEntityTransactionData{
+				TargetEntityRuntimeID: rid,
+				ActionType:            protocol.UseItemOnEntityActionAttack,
+				HotBarSlot:            slot,
+				HeldItem:              held,
+				Position:              pos,
+				// 相手の中心あたりを叩く。
+				ClickedPosition: mgl32.Vec3{0, 1, 0},
+			},
+		})
+		if err != nil {
+			s.reply(c.ID, false, fmt.Sprintf("攻撃の送信に失敗: %v", err), nil)
+			return
+		}
+		s.reply(c.ID, true, "", map[string]any{"distance": dist})
 
 	case "snapshot":
 		// TypeScript 側の world.* は同期APIなので、都度問い合わせるわけにいかない。

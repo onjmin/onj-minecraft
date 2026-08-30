@@ -453,8 +453,31 @@ export class BedrockDriver implements BotDriver {
 	async activateBlock(_position: Position): Promise<void> {
 		notImplemented("ブロックの操作");
 	}
-	async attack(_signal: AbortSignal, _entityId: number): Promise<void> {
-		notImplemented("攻撃");
+	/**
+	 * 相手を殴る。
+	 * 届く距離まで自分で寄る。skills/ 側は追従してから呼ぶが、
+	 * 相手が動くので呼ばれた時点で離れていることがある。
+	 */
+	async attack(signal: AbortSignal, entityId: number): Promise<void> {
+		// 相手は動く。寄っている間に離れるので、座標を取り直しながら追う。
+		for (let i = 0; i < 4; i++) {
+			if (signal.aborted) throw new Error("中断された");
+			await this.refresh();
+			const target = this.entities.find((e) => e.id === entityId);
+			if (!target) throw new Error(`攻撃対象(${entityId})が見つかりません`);
+
+			if (distance(this.state.position, target.position) <= 3) {
+				await this.sidecar.send("attack", { count: entityId });
+				return;
+			}
+			await this.goto(signal, {
+				kind: "xz",
+				x: target.position.x,
+				z: target.position.z,
+				distance: 1.2,
+			});
+		}
+		throw new Error(`攻撃対象(${entityId})に近づけませんでした`);
 	}
 	async equip(itemName: string, destination: string): Promise<void> {
 		if (destination !== "hand") {
