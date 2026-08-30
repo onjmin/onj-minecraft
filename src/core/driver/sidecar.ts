@@ -9,8 +9,8 @@
  * 向こうから来るのがイベント。コマンドの結果は id で対応付ける。
  */
 import { type ChildProcess, spawn } from "node:child_process";
-import { createInterface, type Interface } from "node:readline";
 import path from "node:path";
+import { createInterface, type Interface } from "node:readline";
 
 export interface SidecarEvent {
 	event: string;
@@ -19,13 +19,30 @@ export interface SidecarEvent {
 }
 
 export interface SidecarOptions {
-	realmInvite: string;
+	/** Realm の招待コード。address を指定する場合は不要。 */
+	realmInvite?: string;
+	/**
+	 * 開発用。統合版サーバーへ直に繋ぐ (例: 127.0.0.1:19132)。
+	 * Realms は NetherNet だがローカルサーバーは RakNet なので経路が違う。
+	 */
+	address?: string;
+	/** 開発用の表示名。online-mode=false のサーバーで複数体を繋ぎ分けるのに使う。 */
+	name?: string;
 	/** 認証トークンのキャッシュ先。既定はプロジェクト直下の .bedrock-auth */
 	tokenCache?: string;
 	/** デバイスコード認証が必要になったときの通知 */
 	onMsaCode?: (message: string) => void;
 	/** 実行ファイルの場所を明示したい場合 */
 	binaryPath?: string;
+	/**
+	 * WSL 経由で起動する。
+	 * ローカル開発サーバーは WSL の Docker 上にあり、WSL2 は UDP のポート転送が
+	 * 効かないため、Windows から直に繋ぐと RakNet が届かない。サイドカー自体を
+	 * WSL 側で動かして回避する。
+	 */
+	viaWsl?: boolean;
+	/** WSL のディストリビューション名。既定は Ubuntu。 */
+	wslDistro?: string;
 }
 
 type Pending = {
@@ -35,9 +52,16 @@ type Pending = {
 };
 
 /** サイドカーの実行ファイルの既定の置き場所。 */
-function defaultBinary(): string {
-	const name = process.platform === "win32" ? "onj-bedrock.exe" : "onj-bedrock";
+function defaultBinary(viaWsl: boolean): string {
+	const name = !viaWsl && process.platform === "win32" ? "onj-bedrock.exe" : "onj-bedrock";
 	return path.resolve(process.cwd(), "sidecar", "bedrock", "bin", name);
+}
+
+/** C:\foo\bar → /mnt/c/foo/bar。WSL に渡すパスの変換。 */
+function toWslPath(winPath: string): string {
+	const m = /^([A-Za-z]):[\\/](.*)$/.exec(winPath);
+	if (!m) return winPath.replace(/\\/g, "/");
+	return `/mnt/${m[1].toLowerCase()}/${m[2].replace(/\\/g, "/")}`;
 }
 
 export class BedrockSidecar {
@@ -86,11 +110,26 @@ export class BedrockSidecar {
 	async start(timeoutMs = 180_000): Promise<void> {
 		if (this.proc) throw new Error("サイドカーは既に起動しています");
 
-		const bin = this.options.binaryPath ?? defaultBinary();
-		const args = ["-invite", this.options.realmInvite];
-		if (this.options.tokenCache) args.push("-token-cache", this.options.tokenCache);
+		const o = this.options;
+		if (!o.address && !o.realmInvite) {
+			throw new Error("realmInvite か address のどちらかを指定してください");
+		}
 
-		const proc = spawn(bin, args, { stdio: ["pipe", "pipe", "pipe"] });
+		const viaWsl = o.viaWsl ?? false;
+		const bin = o.binaryPath ?? defaultBinary(viaWsl);
+		const args: string[] = [];
+		if (o.address) args.push("-address", o.address);
+		else args.push("-invite", o.realmInvite!);
+		if (o.name) args.push("-name", o.name);
+		if (o.tokenCache) args.push("-token-cache", o.tokenCache);
+
+		const [file, spawnArgs] = viaWsl
+			? ["wsl", ["-d", o.wslDistro ?? "Ubuntu", "--", toWslPath(bin), ...args]]
+			: [bin, args];
+
+		const proc = spawn(file as string, spawnArgs as string[], {
+			stdio: ["pipe", "pipe", "pipe"],
+		});
 		this.proc = proc;
 
 		proc.on("error", (e) => {
@@ -181,7 +220,11 @@ export class BedrockSidecar {
 	 * コマンドを送り、結果を待つ。
 	 * goto のように完了まで時間がかかるものがあるので、待ち時間は呼び出し側が決める。
 	 */
-	send(cmd: string, args: Record<string, any> = {}, timeoutMs = 15_000): Promise<Record<string, any>> {
+	send(
+		cmd: string,
+		args: Record<string, any> = {},
+		timeoutMs = 15_000,
+	): Promise<Record<string, any>> {
 		const proc = this.proc;
 		if (!proc || !proc.stdin?.writable) {
 			return Promise.reject(new Error("サイドカーが起動していません"));

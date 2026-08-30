@@ -28,19 +28,28 @@ import type {
 
 export interface BedrockDriverOptions {
 	/** Realm の招待コードまたはリンク */
-	realmInvite: string;
+	realmInvite?: string;
+	/**
+	 * 開発用。ローカルの統合版サーバーへ直に繋ぐ (例: 127.0.0.1:19132)。
+	 * 指定すると Realms 経由ではなく RakNet で接続し、認証もしない。
+	 */
+	address?: string;
+	/** 開発用の表示名。online-mode=false のサーバーで複数体を繋ぎ分けるのに使う。 */
+	name?: string;
 	/** 認証トークンのキャッシュ先 */
 	tokenCache?: string;
 	/** デバイスコード認証が必要になったときの通知 */
 	onMsaCode?: (message: string) => void;
 	/** サイドカー実行ファイルの場所を明示したい場合 */
 	binaryPath?: string;
+	/** WSL 経由で起動する。ローカル開発サーバーへ繋ぐときに必要。 */
+	viaWsl?: boolean;
+	/** WSL のディストリビューション名。 */
+	wslDistro?: string;
 }
 
 function notImplemented(what: string): never {
-	throw new Error(
-		`統合版では${what}がまだ使えません（サイドカーのチャンク解析が未実装）`,
-	);
+	throw new Error(`統合版では${what}がまだ使えません（サイドカーのチャンク解析が未実装）`);
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -75,9 +84,13 @@ export class BedrockDriver implements BotDriver {
 		this.options = options;
 		this.sidecar = new BedrockSidecar({
 			realmInvite: options.realmInvite,
+			address: options.address,
+			name: options.name,
 			tokenCache: options.tokenCache,
 			onMsaCode: options.onMsaCode,
 			binaryPath: options.binaryPath,
+			viaWsl: options.viaWsl,
+			wslDistro: options.wslDistro,
 		});
 
 		// ワールド読み取りはサイドカー側が未対応。近似で誤魔化すと skills/ が
@@ -110,6 +123,19 @@ export class BedrockDriver implements BotDriver {
 	get recentPackets(): string[] {
 		return this.sidecar.recentEvents;
 	}
+
+	/**
+	 * 移動がどれだけサーバーに棄却されているかの診断値。
+	 * 補正が多く引き戻し量が大きいほど、こちらの予測が実際の物理と合っていない。
+	 */
+	public lastDiagnostics: {
+		corrections: number;
+		driftTotal: number;
+		ticksSent: number;
+		histHits: number;
+		histMisses: number;
+		maxDrift: number;
+	} | null = null;
 
 	// --- ライフサイクル ---
 
@@ -165,6 +191,14 @@ export class BedrockDriver implements BotDriver {
 		this.state.pitch = Number(st.pitch ?? 0);
 		this.state.health = Number(st.health ?? 20);
 		this.state.food = Number(st.food ?? 20);
+		this.lastDiagnostics = {
+			corrections: Number(st.corrections ?? 0),
+			driftTotal: Number(st.driftTotal ?? 0),
+			ticksSent: Number(st.ticksSent ?? 0),
+			histHits: Number(st.histHits ?? 0),
+			histMisses: Number(st.histMisses ?? 0),
+			maxDrift: Number(st.maxDrift ?? 0),
+		};
 		this.items = (inv.items ?? []).map((i: any) => ({
 			name: String(i.name),
 			count: Number(i.count),

@@ -91,6 +91,8 @@ func liveToken(cachePath string) (*oauth2.Token, error) {
 func main() {
 	invite := flag.String("invite", "", "Realm の招待コード（https://realms.gg/ は省略可）")
 	cache := flag.String("token-cache", ".bedrock-auth/gophertunnel.json", "MSAトークンのキャッシュ先")
+	address := flag.String("address", "", "開発用: 統合版サーバーへ直に繋ぐ (例: 127.0.0.1:19132)")
+	name := flag.String("name", "", "開発用: 表示名を指定する（複数体を繋ぎ分けるため。online-mode=false のときだけ効く）")
 	flag.Parse()
 
 	emit(event{Event: "ready", Data: map[string]any{
@@ -98,12 +100,33 @@ func main() {
 		"version":  protocol.CurrentVersion,
 	}})
 
-	if *invite == "" {
-		fail("-invite を指定してください")
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// 開発用のローカルサーバーへ直に繋ぐ経路。Realms は NetherNet だが
+	// 自前で立てた統合版サーバーは RakNet なので、認証もシグナリングも要らない。
+	// online-mode=false で動かす前提。
+	if *address != "" {
+		d := &minecraft.Dialer{}
+		if *name != "" {
+			// オフライン接続の表示名は IdentityData 側。ClientData ではサーバーに
+			// 反映されず Steve のままになる。
+			d.IdentityData = login.IdentityData{DisplayName: *name}
+			d.ClientData = login.ClientData{ThirdPartyName: *name}
+		}
+		conn, err := d.DialContext(ctx, "raknet", *address)
+		if err != nil {
+			fail("サーバーへの接続に失敗(%s): %v", *address, err)
+		}
+		defer conn.Close()
+		emit(event{Event: "connected", Data: map[string]any{"address": *address}})
+		runSession(ctx, conn)
+		return
+	}
+
+	if *invite == "" {
+		fail("-invite か -address を指定してください")
+	}
 
 	// --- 認証 ---
 	tok, err := liveToken(*cache)
@@ -193,14 +216,17 @@ func main() {
 	defer conn.Close()
 	emit(event{Event: "connected"})
 
+	runSession(ctx, conn)
+}
+
+// runSession はスポーンさせてからセッションに引き渡す。
+// Realms 経由でもローカルサーバーでも、ここから先の扱いは同じ。
+func runSession(ctx context.Context, conn *minecraft.Conn) {
 	if err := conn.DoSpawn(); err != nil {
 		fail("スポーンに失敗: %v", err)
 	}
 
 	id := conn.GameData()
-	// ChatRestrictionLevel が Dropped(1) なら、サーバーは発言を他プレイヤーにだけ
-	// 落とし、送信者には返す。能力フラグの Muted も同様に発言だけを消す。
-	// どちらも「エコーは返るのに誰にも届かない」症状を説明する。
 	emit(event{Event: "spawn", Data: map[string]any{
 		"entityRuntimeID":      id.EntityRuntimeID,
 		"position":             []float32{id.PlayerPosition[0], id.PlayerPosition[1], id.PlayerPosition[2]},

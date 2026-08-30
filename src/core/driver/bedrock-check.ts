@@ -1,8 +1,11 @@
 /**
  * BedrockDriver を実 Realm に繋いで検証する。
  *
- * 実行:
+ * 実行(本番 Realms):
  *   REALM_INVITE=https://realms.gg/xxxx npx tsx src/core/driver/bedrock-check.ts
+ * 実行(ローカル開発サーバー):
+ *   docker compose -f docker-compose.bedrock-dev.yml up -d
+ *   BEDROCK_ADDRESS=127.0.0.1:19132 npx tsx src/core/driver/bedrock-check.ts
  *
  * LLM を介さず直接ドライバを叩く。思考ループ越しに待つと時間がかかるうえ、
  * 失敗が「LLM が選ばなかった」のか「実装が壊れている」のか切り分けられない。
@@ -13,6 +16,10 @@
 import { BedrockDriver } from "./bedrock";
 
 const INVITE = process.env.REALM_INVITE ?? "";
+/** 開発用。指定するとローカルサーバーへ直に繋ぐ。 */
+const ADDRESS = process.env.BEDROCK_ADDRESS ?? "";
+// Windows から WSL の Docker へは UDP が転送されないため、既定で WSL 経由にする。
+const VIA_WSL = (process.env.BEDROCK_WSL ?? (process.platform === "win32" ? "1" : "0")) === "1";
 const SEND_CHAT = process.env.SEND_CHAT ?? "";
 /** 移動検証で進みたい距離（ブロック）。0 なら移動を試さない。 */
 const WALK = Number(process.env.WALK_DISTANCE ?? 6);
@@ -27,10 +34,15 @@ const dist = (a: { x: number; z: number }, b: { x: number; z: number }) =>
 	Math.hypot(a.x - b.x, a.z - b.z);
 
 async function main() {
-	if (!INVITE) throw new Error("REALM_INVITE を指定してください");
+	if (!INVITE && !ADDRESS) {
+		throw new Error("REALM_INVITE か BEDROCK_ADDRESS を指定してください");
+	}
 
 	const driver = new BedrockDriver({
-		realmInvite: INVITE,
+		realmInvite: INVITE || undefined,
+		address: ADDRESS || undefined,
+		name: ADDRESS ? "kusabot" : undefined,
+		viaWsl: ADDRESS ? VIA_WSL : false,
 		onMsaCode: (m) => console.log("要サインイン:", m),
 	});
 
@@ -54,11 +66,18 @@ async function main() {
 	check("体力が取れる", st.health > 0, `HP ${st.health} / 満腹度 ${st.food}`);
 
 	const items = driver.inventory.items();
-	console.log(`  持ち物 ${items.length} 種: ${items.map((i) => `${i.name}x${i.count}`).join(", ") || "なし"}`);
+	console.log(
+		`  持ち物 ${items.length} 種: ${items.map((i) => `${i.name}x${i.count}`).join(", ") || "なし"}`,
+	);
 
 	const ents = driver.nearbyEntities(64);
 	console.log(
-		`  周囲 ${ents.length} 体: ${ents.slice(0, 8).map((e) => e.name).join(", ") || "なし"}`,
+		`  周囲 ${ents.length} 体: ${
+			ents
+				.slice(0, 8)
+				.map((e) => e.name)
+				.join(", ") || "なし"
+		}`,
 	);
 
 	// 視点は世界の状態に依存しないので必ず通るはず。

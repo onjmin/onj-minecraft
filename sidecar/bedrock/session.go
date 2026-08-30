@@ -4,8 +4,9 @@ package main
 // 状態の変化と結果を標準出力へ流す。TypeScript 側の BedrockDriver が
 // この向こう側にいる。
 //
-// 統合版はサーバー権限型なので、位置を自前で進めてはいけない。
-// 入力を送り、サーバーが返す補正を正として取り込む。
+// 統合版はサーバー権限型だが、クライアントが自分で動いた先を予測して送る前提の
+// 設計になっている。予測を送らずに補正だけ待つと補正の刻みぶんしか進まない。
+// 楽観的に進めておき、外れたら CorrectPlayerMovePrediction を正として取り込む。
 
 import (
 	"bufio"
@@ -42,6 +43,12 @@ type command struct {
 	Timeout int     `json:"timeoutMs"`
 }
 
+// 1tick あたりの移動量。バニラの歩行 4.317 ブロック/秒、走行 5.612 ブロック/秒。
+const (
+	walkSpeed   = float32(0.2159)
+	sprintSpeed = float32(0.2806)
+)
+
 type entityInfo struct {
 	RuntimeID uint64
 	UniqueID  int64
@@ -77,6 +84,21 @@ type session struct {
 	entities map[uint64]*entityInfo
 	unique   map[int64]uint64 // RemoveActor は unique ID で来る
 	goal     *target
+
+	// 送った位置の履歴。補正は数tick前のものが返ってくるので、その時点の
+	// 自分の予測と突き合わせて「ずれ」だけを求めるために要る。
+	// start_game の rewind_history_size が 40 なので、それを覆う長さにする。
+	history     [64]mgl32.Vec3
+	historyTick [64]uint64
+	// 診断用。補正がどれだけ来て、どれだけ引き戻されたか。
+	corrections int
+	driftTotal  float32
+	ticksSent   uint64
+	// 補正の tick が履歴と噛み合ったか。噛み合わないなら丸ごと差し替えており、
+	// その間に進んだぶんを毎回捨てていることになる。
+	histHits   int
+	histMisses int
+	maxDrift   float32
 
 	// インベントリ。パケットは network ID しか持たないので、StartGame の
 	// アイテム表で名前に戻す。
@@ -127,9 +149,14 @@ func (s *session) serve(ctx context.Context) {
 	go s.tick()
 	go s.readCommands()
 
+	// StartGame の座標はチャンクが読み込まれるまでの仮値で、Y に 32768 付近の
+	// 番兵が入っていることがある。そのまま歩かせると落下中に動かすことになり
+	// 移動がまともに進まないので、実位置が来るまで待つ。
+	s.waitForRealPosition(10 * time.Second)
+
 	emit(event{Event: "ready_to_act", Data: map[string]any{
 		"entityRuntimeID": s.game.EntityRuntimeID,
-		"position":        vec(s.pos),
+		"position":        vec(s.readPos()),
 	}})
 
 	select {
@@ -140,6 +167,32 @@ func (s *session) serve(ctx context.Context) {
 }
 
 func vec(v mgl32.Vec3) []float32 { return []float32{v[0], v[1], v[2]} }
+
+func (s *session) readPos() mgl32.Vec3 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pos
+}
+
+// waitForRealPosition は仮の座標が本物に置き換わるのを待つ。
+// 併せて着地も待つので、歩き出しが落下中にならない。
+func (s *session) waitForRealPosition(limit time.Duration) {
+	deadline := time.Now().Add(limit)
+	for time.Now().Before(deadline) {
+		s.mu.Lock()
+		y, grounded := s.pos[1], s.onGround
+		s.mu.Unlock()
+		// 仮値でなく、かつ着地していれば動かしてよい。
+		if y < 1000 && grounded {
+			return
+		}
+		select {
+		case <-s.done:
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
 
 // --- 受信 ---
 
@@ -158,7 +211,26 @@ func (s *session) handle(pk packet.Packet) {
 	switch v := pk.(type) {
 	case *packet.CorrectPlayerMovePrediction:
 		s.mu.Lock()
-		s.pos = mgl32.Vec3{v.Position[0], v.Position[1], v.Position[2]}
+		corrected := mgl32.Vec3{v.Position[0], v.Position[1], v.Position[2]}
+		slot := v.Tick % uint64(len(s.history))
+		if s.historyTick[slot] == v.Tick {
+			// 補正が指す tick の予測と比べ、ずれたぶんだけ今の位置に反映する。
+			// 丸ごと差し替えると、その tick 以降に進んだぶんを毎回捨てることになり、
+			// 歩行速度がバニラの3割程度まで落ちる。
+			drift := corrected.Sub(s.history[slot])
+			s.pos = s.pos.Add(drift)
+			s.driftTotal += drift.Len()
+			s.histHits++
+			if d := drift.Len(); d > s.maxDrift {
+				s.maxDrift = d
+			}
+		} else {
+			// 履歴が流れているほど古い補正。素直に従う。
+			s.driftTotal += corrected.Sub(s.pos).Len()
+			s.histMisses++
+			s.pos = corrected
+		}
+		s.corrections++
 		s.onGround = v.OnGround
 		s.mu.Unlock()
 
@@ -229,12 +301,22 @@ func (s *session) handle(pk packet.Packet) {
 
 	case *packet.Text:
 		// 自分の発言もサーバーから返ってくるので、送信者で切り分ける。
+		// オフラインのサーバーでは XUID が全員空になるため、XUID 同士の比較だけだと
+		// 他人の発言まで自分のものと誤判定する。空のときは表示名で見る。
+		source := strings.ReplaceAll(v.SourceName, "§r", "")
+		me := s.conn.IdentityData()
+		self := false
+		if v.XUID != "" && me.XUID != "" {
+			self = v.XUID == me.XUID
+		} else if source != "" {
+			self = source == me.DisplayName
+		}
 		emit(event{Event: "chat", Data: map[string]any{
 			"type":    v.TextType,
-			"source":  strings.ReplaceAll(v.SourceName, "§r", ""),
+			"source":  source,
 			"message": v.Message,
 			"xuid":    v.XUID,
-			"self":    v.XUID == s.conn.IdentityData().XUID,
+			"self":    self,
 		}})
 
 	case *packet.InventoryContent:
@@ -328,6 +410,7 @@ func (s *session) buildInput(n uint64) *packet.PlayerAuthInput {
 	// 必ず NewInputFlags を通す。
 	flags := protocol.NewInputFlags(packet.InputFlagCount)
 	move := mgl32.Vec2{}
+	delta := mgl32.Vec3{}
 
 	s.steerLocked(n)
 
@@ -359,6 +442,32 @@ func (s *session) buildInput(n uint64) *packet.PlayerAuthInput {
 		flags.Set(packet.InputFlagSprinting)
 	}
 
+	// サーバー権限型では、クライアントが自分で動いた先を予測して送る。
+	// 補正だけに任せると補正の刻みぶんしか進まず、歩行が極端に遅くなる。
+	// 壁にぶつかれば CorrectPlayerMovePrediction が正しい位置へ引き戻すので、
+	// 楽観的に進めてよい。縦方向はサーバーの言い値に従う。
+	if move[0] != 0 || move[1] != 0 {
+		speed := walkSpeed
+		if s.controls["sprint"] {
+			speed = sprintSpeed
+		}
+		rad := float64(s.yaw) * math.Pi / 180
+		sin, cos := math.Sin(rad), math.Cos(rad)
+		// yaw 0 は +Z を向く。前方は (-sin, cos)、右方は (cos, sin)。
+		fx := float32(-sin)*move[1] + float32(cos)*move[0]
+		fz := float32(cos)*move[1] + float32(sin)*move[0]
+		if l := float32(math.Hypot(float64(fx), float64(fz))); l > 0 {
+			delta = mgl32.Vec3{fx / l * speed, 0, fz / l * speed}
+			s.pos[0] += delta[0]
+			s.pos[2] += delta[2]
+		}
+	}
+
+	slot := n % uint64(len(s.history))
+	s.history[slot] = s.pos
+	s.historyTick[slot] = n
+	s.ticksSent = n
+
 	return &packet.PlayerAuthInput{
 		Pitch:            s.pitch,
 		Yaw:              s.yaw,
@@ -370,6 +479,9 @@ func (s *session) buildInput(n uint64) *packet.PlayerAuthInput {
 		PlayMode:         packet.PlayModeNormal,
 		InteractionModel: packet.InteractionModelCrosshair,
 		Tick:             n,
+		// サーバーは移動量の妥当性を Delta でも見る。空のまま位置だけ進めると
+		// 「動いていないのに位置が変わった」と判定されて補正で引き戻される。
+		Delta: delta,
 	}
 }
 
@@ -556,6 +668,13 @@ func (s *session) dispatch(c command) {
 			"onGround": s.onGround,
 			"health":   s.health,
 			"food":     s.food,
+			// 移動が伸びない原因を切り分けるための診断値。
+			"corrections": s.corrections,
+			"driftTotal":  s.driftTotal,
+			"ticksSent":   s.ticksSent,
+			"histHits":    s.histHits,
+			"histMisses":  s.histMisses,
+			"maxDrift":    s.maxDrift,
 		}
 		s.mu.Unlock()
 		s.reply(c.ID, true, "", d)
