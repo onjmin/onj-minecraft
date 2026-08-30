@@ -21,16 +21,20 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/df-mc/go-playfab/v2"
 	"github.com/df-mc/go-xsapi/v2"
 	"github.com/df-mc/go-xsapi/v2/xal/sisu"
+	"github.com/go-gl/mathgl/mgl32"
+	"github.com/google/uuid"
 	"github.com/sandertv/gophertunnel/minecraft"
 	"github.com/sandertv/gophertunnel/minecraft/auth"
 	"github.com/sandertv/gophertunnel/minecraft/p2p"
 	"github.com/sandertv/gophertunnel/minecraft/protocol"
 	"github.com/sandertv/gophertunnel/minecraft/protocol/login"
+	"github.com/sandertv/gophertunnel/minecraft/protocol/packet"
 	"github.com/sandertv/gophertunnel/minecraft/realms"
 	"github.com/sandertv/gophertunnel/minecraft/service"
 	"golang.org/x/oauth2"
@@ -92,6 +96,8 @@ func main() {
 	invite := flag.String("invite", "", "Realm の招待コード（https://realms.gg/ は省略可）")
 	cache := flag.String("token-cache", ".bedrock-auth/gophertunnel.json", "MSAトークンのキャッシュ先")
 	hold := flag.Duration("hold", 60*time.Second, "接続を維持する時間")
+	say := flag.String("say", "", "スポーン後に発言する内容（空なら発言しない）")
+	cmd := flag.String("cmd", "", "スポーン後に実行するコマンド（例: say こんにちは）")
 	flag.Parse()
 
 	emit(event{Event: "ready", Data: map[string]any{
@@ -206,17 +212,191 @@ func main() {
 		"gameMode":        id.PlayerGameMode,
 	}})
 
-	// 受信を回しつつ指定時間だけ接続を維持する。
-	// 送信が本題だが、まずは接続とスポーンが成立することを確認する。
-	done := time.After(*hold)
+	// 他プレイヤーの発言を拾う。自分の発言もサーバーから返ってくる。
+	// サーバーは受け入れられない移動を補正して返す。これを取り込まないと
+	// 位置がずれ続け、以降の移動もすべて弾かれる。
+	var posMu sync.Mutex
+	pos := mgl32.Vec3{id.PlayerPosition[0], id.PlayerPosition[1], id.PlayerPosition[2]}
+	corrections := 0
+	readPos := func() mgl32.Vec3 {
+		posMu.Lock()
+		defer posMu.Unlock()
+		return pos
+	}
+
+	// サーバーがこちらの位置を追跡しているかは、送られてくるチャンクの
+	// 座標で分かる。位置が無視されていればスポーン周辺から動かない。
+	var chunkMu sync.Mutex
+	chunkSeen := map[[2]int32]bool{}
+	chunkAt := func() (int32, int32, int32, int32, int) {
+		chunkMu.Lock()
+		defer chunkMu.Unlock()
+		if len(chunkSeen) == 0 {
+			return 0, 0, 0, 0, 0
+		}
+		var minX, maxX, minZ, maxZ int32
+		first := true
+		for c := range chunkSeen {
+			if first {
+				minX, maxX, minZ, maxZ, first = c[0], c[0], c[1], c[1], false
+				continue
+			}
+			if c[0] < minX {
+				minX = c[0]
+			}
+			if c[0] > maxX {
+				maxX = c[0]
+			}
+			if c[1] < minZ {
+				minZ = c[1]
+			}
+			if c[1] > maxZ {
+				maxZ = c[1]
+			}
+		}
+		return minX, maxX, minZ, maxZ, len(chunkSeen)
+	}
+
 	go func() {
 		for {
-			if _, err := conn.ReadPacket(); err != nil {
+			pk, err := conn.ReadPacket()
+			if err != nil {
 				return
+			}
+			switch v := pk.(type) {
+			case *packet.LevelChunk:
+				chunkMu.Lock()
+				chunkSeen[[2]int32{v.Position.X(), v.Position.Z()}] = true
+				chunkMu.Unlock()
+			case *packet.CorrectPlayerMovePrediction:
+				posMu.Lock()
+				pos = mgl32.Vec3{v.Position[0], v.Position[1], v.Position[2]}
+				corrections++
+				n := corrections
+				posMu.Unlock()
+				// 毎tick出ると読めないので最初の数回だけ報せる
+				if n <= 3 {
+					emit(event{Event: "move_correction", Data: map[string]any{
+						"position": []float32{v.Position[0], v.Position[1], v.Position[2]},
+						"onGround": v.OnGround,
+						"tick":     v.Tick,
+					}})
+				}
+			case *packet.CommandOutput:
+				emit(event{Event: "command_output", Data: map[string]any{
+					"success": v.SuccessCount,
+					"count":   len(v.OutputMessages),
+				}})
+			}
+			if t, ok := pk.(*packet.Text); ok {
+				emit(event{Event: "text", Data: map[string]any{
+					"type":    t.TextType,
+					"source":  t.SourceName,
+					"message": t.Message,
+					"xuid":    t.XUID,
+				}})
 			}
 		}
 	}()
 
-	<-done
+	// サーバー権限型なので、クライアントは毎tick player_auth_input を送って
+	// 「稼働中のプレイヤー」であり続ける必要がある。これを送らないと
+	// 接続はあってもチャットが中継されず、コマンドも黙殺される。
+	go func() {
+		t := time.NewTicker(50 * time.Millisecond)
+		defer t.Stop()
+		var tick uint64
+		for range t.C {
+			tick++
+			// 入力フラグは「ゼロ値 = 未送信」であり、空の集合とは別物である。
+			// NewInputFlags を通さないとフィールドごと送られず、サーバーは
+			// この player_auth_input を入力として扱わない。
+			flags := protocol.NewInputFlags(packet.InputFlagCount)
+			move := mgl32.Vec2{}
+			delta := mgl32.Vec3{}
+			yaw := id.Yaw
+
+			// 5秒待ってから東(+X)へ歩き続ける。走行速度は約4.3ブロック/秒。
+			// 60秒あれば十数チャンク分は進むので、サーバーが位置を追跡して
+			// いれば新しいチャンクが次々に届くはずである。
+			// 座標は自前で進めない。前進入力だけを送り、サーバーが動かした
+			// 結果を補正パケットから受け取る。これで「サーバーが入力を
+			// 受理しているか」を、こちらの予測とは無関係に判定できる。
+			// 塞がれている方向だと動かないので、15秒ごとに向きを変える。
+			if tick > 100 {
+				yaws := []float32{-90, 0, 90, 180} // 東, 南, 西, 北
+				yaw = yaws[((tick-100)/300)%uint64(len(yaws))]
+				flags.Set(packet.InputFlagUp)
+				move = mgl32.Vec2{0, 1}
+			}
+			sendPos := readPos()
+			if err := conn.WritePacket(&packet.PlayerAuthInput{
+				Pitch:            id.Pitch,
+				Yaw:              yaw,
+				HeadYaw:          yaw,
+				Position:         sendPos,
+				MoveVector:       move,
+				InputData:        flags,
+				InputMode:        packet.InputModeMouse,
+				PlayMode:         packet.PlayModeNormal,
+				InteractionModel: packet.InteractionModelCrosshair,
+				Tick:             tick,
+				Delta:            delta,
+			}); err != nil {
+				return
+			}
+		}
+	}()
+	go func() {
+		t := time.NewTicker(10 * time.Second)
+		defer t.Stop()
+		for range t.C {
+			minX, maxX, minZ, maxZ, n := chunkAt()
+			emit(event{Event: "chunks", Data: map[string]any{
+				"count":  n,
+				"chunkX": []int32{minX, maxX},
+				"chunkZ": []int32{minZ, maxZ},
+				"posX":   readPos()[0],
+				"posZ":   readPos()[2],
+			}})
+		}
+	}()
+	emit(event{Event: "ticking"})
+
+	if *say != "" {
+		// チャンクの読み込みなどが落ち着いてから送る
+		time.Sleep(3 * time.Second)
+		if err := conn.WritePacket(&packet.Text{
+			TextType:   packet.TextTypeChat,
+			SourceName: conn.IdentityData().DisplayName,
+			Message:    *say,
+			XUID:       conn.IdentityData().XUID,
+		}); err != nil {
+			emit(event{Event: "error", Error: fmt.Sprintf("発言の送信に失敗: %v", err)})
+		} else {
+			emit(event{Event: "said", Data: map[string]any{"message": *say}})
+		}
+	}
+
+	if *cmd != "" {
+		time.Sleep(2 * time.Second)
+		// /say はシステムメッセージとして配信されるので、
+		// プレイヤー間チャットのフィルタを受けない。切り分けに使う。
+		if err := conn.WritePacket(&packet.CommandRequest{
+			CommandLine: *cmd,
+			CommandOrigin: protocol.CommandOrigin{
+				Origin:         protocol.CommandOriginPlayer,
+				UUID:           uuid.New(),
+				PlayerUniqueID: id.EntityUniqueID,
+			},
+			Version: "52",
+		}); err != nil {
+			emit(event{Event: "error", Error: fmt.Sprintf("コマンドの送信に失敗: %v", err)})
+		} else {
+			emit(event{Event: "commanded", Data: map[string]any{"command": *cmd}})
+		}
+	}
+
+	time.Sleep(*hold)
 	emit(event{Event: "done"})
 }
