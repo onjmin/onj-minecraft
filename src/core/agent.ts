@@ -1007,6 +1007,29 @@ export class MinecraftAgent {
 				const prey = ["cow", "pig", "sheep", "chicken", "rabbit"];
 				return this.driver.nearbyEntities(32).some((e) => prey.includes(e.name));
 			}
+			case "crafting.tool":
+			case "crafting.weapon":
+			case "crafting.torch": {
+				// 棒か、棒になる木を持っていなければ何も作れない。
+				// 実測で crafting.tool が10分に21回選ばれ、全部
+				// 「棒が要る」で即失敗していた。
+				return this.driver.inventory
+					.items()
+					.some(
+						(i) =>
+							i.name === "stick" ||
+							i.name.endsWith("_planks") ||
+							i.name.endsWith("_log") ||
+							i.name.endsWith("_wood"),
+					);
+			}
+			case "crafting.smelting": {
+				// かまどか、かまどになる丸石が要る。
+				const items = this.driver.inventory.items();
+				return items.some(
+					(i) => i.name === "furnace" || i.name === "cobblestone" || i.name === "blackstone",
+				);
+			}
 			case "goto.player": {
 				// 殴られた直後は近づかない。誰もいないなら行き先が無い。
 				if (this.wasAttackedByPlayerRecently()) return false;

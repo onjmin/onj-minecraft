@@ -66,6 +66,12 @@ const attackReach = float32(3.5)
 // 潜って隠れることもできなくなる。実際に届く間合いの少し外にとどめる。
 const defendRange = float32(5)
 
+// 殴られてから、遠くの敵にも反応し続ける時間。
+const hurtMemory = 4 * time.Second
+
+// 殴られている間の反応距離。撃ってくる相手を含める。
+const hurtDefendRange = float32(16)
+
 // 一度に逃げ続ける上限(tick)。これを過ぎたら本来の行動へ戻す。
 // 戻ってまだ危なければまた逃げる。走りっぱなしにしないための区切り。
 const fleeMaxTicks = uint64(60)
@@ -183,6 +189,8 @@ type session struct {
 	// 逃げ始めた tick と、逃げ終えた tick。走りっぱなしを防ぐ。
 	fleeSince uint64
 	fleeUntil uint64
+	// 最後に damage を受けた時刻。撃たれているときは遠くの敵にも反応する。
+	lastHurt time.Time
 	// 殴ってきたプレイヤー。相手にせず逃げるためだけに覚える。
 	// 殴り返すと事が大きくなるだけで、こちらに得が無い。
 	playerThreat      uint64
@@ -465,6 +473,7 @@ func (s *session) handle(pk packet.Packet) {
 				// 攻撃検出が一度も発火しなかったのはこの取り違えが原因。
 				if a.Value < s.health {
 					s.notePlayerAttackLocked()
+					s.lastHurt = time.Now()
 				}
 				s.health = a.Value
 			case "minecraft:player.hunger":
@@ -1107,8 +1116,16 @@ func (s *session) defendLocked(n uint64) bool {
 		}
 	}
 
+	// 殴られた直後は遠くの敵にも反応する。骨は間合いの外から撃ってくるので、
+	// 5ブロックで見ていると一方的に削られる。実測で10分に12回、mob に
+	// 殺されていた。
+	reach := float32(defendRange)
+	if time.Since(s.lastHurt) < hurtMemory {
+		reach = hurtDefendRange
+	}
+
 	var target *entityInfo
-	best := float32(defendRange)
+	best := reach
 	for _, e := range s.entities {
 		if !hostileName(e.Name) {
 			continue
