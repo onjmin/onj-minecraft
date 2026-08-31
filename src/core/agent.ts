@@ -285,6 +285,15 @@ export class MinecraftAgent {
 			this.driver.on("chat", (username: string, message: string) =>
 				this.handleIncomingChat(username, message),
 			);
+			// サーバーからの通知。誰が誰にやられたか、誰が入ってきたか。
+			// 返答はさせない。全部に反応すると場の空気を悪くする。
+			// 判断の材料として履歴に残すだけにする。
+			this.driver.on("system", (message: string) => this.handleSystemMessage(message));
+			// 殴られた相手から逃げるのはサイドカーの反射が担当する。
+			// ここでは記録だけ。人に殴られたことは覚えておく価値がある。
+			this.driver.on("attacked_by_player", (d: any) => {
+				this.handleSystemMessage(`${d?.name ?? "誰か"} に攻撃された`);
+			});
 			// 死んだ場所を控える。持ち物は全部そこに落ちている。
 			this.driver.on("death", () => {
 				// 回収に戻った先で殺されたなら、まだ敵がそこにいる。
@@ -505,6 +514,20 @@ export class MinecraftAgent {
 			return null;
 		}
 		return `${this.pendingRequest.from} からの依頼: ${this.pendingRequest.text}`;
+	}
+
+	/**
+	 * サーバーからの通知を受ける。キルログ・死亡ログ・参加退出。
+	 *
+	 * 話しかけられたことにはしない。これに返事を始めると、誰かが死ぬたびに
+	 * 喋るボットになって場が荒れる。記録と、次の判断の材料に留める。
+	 */
+	private handleSystemMessage(message: string): void {
+		this.log(`[通知] ${message}`);
+		appendChatLog("in", "サーバー", message);
+		// 会話の列には積むが、話しかけられた扱いにはしない。
+		// lastHeardAt を動かさないので、これで喋り出すことはない。
+		this.conversation.record("サーバー", message, false);
 	}
 
 	/** 思考ループの待ちを切り上げて、すぐ考え直させる。 */

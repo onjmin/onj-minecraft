@@ -76,6 +76,15 @@ const fleeCooldownTicks = uint64(60)
 // これを下回ったら戦わずに逃げる。
 const defendFleeHealth = float32(10)
 
+// 殴られた瞬間、この距離にいるプレイヤーを犯人と見なす。
+const playerThreatRange = float32(6)
+
+// 殴ってきたプレイヤーから逃げ続ける時間。
+const playerThreatDuration = 20 * time.Second
+
+// 殴ってきたプレイヤーがこの距離まで近いなら逃げる。
+const playerFleeRange = float32(16)
+
 // 攻撃の間隔(tick)。バニラの剣は概ね0.6秒。
 const attackIntervalTicks = uint64(12)
 
@@ -174,6 +183,10 @@ type session struct {
 	// 逃げ始めた tick と、逃げ終えた tick。走りっぱなしを防ぐ。
 	fleeSince uint64
 	fleeUntil uint64
+	// 殴ってきたプレイヤー。相手にせず逃げるためだけに覚える。
+	// 殴り返すと事が大きくなるだけで、こちらに得が無い。
+	playerThreat      uint64
+	playerThreatUntil time.Time
 	// 今開いているコンテナ。開いていなければ nil。
 	// チェストもかまども、開いてからでないと中身が届かず操作もできない。
 	container *openContainer
@@ -434,6 +447,9 @@ func (s *session) handle(pk packet.Packet) {
 
 	case *packet.SetHealth:
 		s.mu.Lock()
+		if float32(v.Health) < s.health {
+			s.notePlayerAttackLocked()
+		}
 		s.health = float32(v.Health)
 		s.mu.Unlock()
 
@@ -541,6 +557,9 @@ func (s *session) handle(pk packet.Packet) {
 			"message": v.Message,
 			"xuid":    v.XUID,
 			"self":    self,
+			// キルログや死亡ログは翻訳キー(death.attack.player など)と
+			// 差し込み語で来る。語が無いと誰が誰にやられたか分からない。
+			"parameters": v.Parameters,
 		}})
 
 	case *packet.LevelChunk:
@@ -1064,6 +1083,25 @@ func (s *session) steerLocked(n uint64) {
 // 呼び出し側が mu を持つこと。
 func (s *session) defendLocked(n uint64) bool {
 	feet := s.feetLocked()
+
+	// 殴ってきたプレイヤーからは、何をおいても離れる。殴り返すと事が
+	// 大きくなるだけで、こちらに得が無い。
+	if time.Now().Before(s.playerThreatUntil) {
+		if e, ok := s.entities[s.playerThreat]; ok {
+			d := e.Pos.Sub(feet).Len()
+			if d < playerFleeRange {
+				dx := e.Pos[0] - s.pos[0]
+				dz := e.Pos[2] - s.pos[2]
+				s.yaw = float32(math.Atan2(float64(dx), float64(-dz)) * 180 / math.Pi)
+				s.controls["forward"] = true
+				s.controls["sprint"] = true
+				s.controls["jump"] = false
+				s.fighting = 0
+				return true
+			}
+		}
+	}
+
 	var target *entityInfo
 	best := float32(defendRange)
 	for _, e := range s.entities {
@@ -1245,6 +1283,38 @@ func (s *session) hasWeaponLocked() bool {
 		}
 	}
 	return false
+}
+
+// notePlayerAttackLocked は、体力が減った瞬間に近くにいたプレイヤーを
+// 「殴ってきた相手」として覚える。
+//
+// 統合版は誰に殴られたかを直接は教えてくれない。間合いにいるプレイヤーが
+// 犯人である可能性が高い、という当たりの付け方をする。外れても害は小さい。
+// 逃げるだけで、殴り返しはしないため。
+// 呼び出し側が mu を持つこと。
+func (s *session) notePlayerAttackLocked() {
+	feet := s.feetLocked()
+	var nearest *entityInfo
+	best := float32(playerThreatRange)
+	for _, e := range s.entities {
+		if !e.IsPlayer {
+			continue
+		}
+		d := e.Pos.Sub(feet).Len()
+		if d < best {
+			best = d
+			nearest = e
+		}
+	}
+	if nearest == nil {
+		return
+	}
+	s.playerThreat = nearest.RuntimeID
+	s.playerThreatUntil = time.Now().Add(playerThreatDuration)
+	emit(event{Event: "attacked_by_player", Data: map[string]any{
+		"name":     nearest.Name,
+		"distance": best,
+	}})
 }
 
 // hostileName は襲ってくる相手か。名前で判断する。

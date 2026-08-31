@@ -201,7 +201,18 @@ export interface BotDriver {
 	connect(): Promise<void>;
 	disconnect(): Promise<void>;
 	on(
-		event: "spawn" | "death" | "respawn" | "health" | "chat" | "kicked" | "end",
+		event:
+			| "spawn"
+			| "death"
+			| "respawn"
+			| "health"
+			| "chat"
+			// サーバーからの通知(キルログ・死亡ログ・参加退出)
+			| "system"
+			// プレイヤーに殴られた
+			| "attacked_by_player"
+			| "kicked"
+			| "end",
 		listener: (...args: any[]) => void,
 	): void;
 	off(event: string, listener: (...args: any[]) => void): void;

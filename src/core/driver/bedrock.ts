@@ -82,6 +82,45 @@ const SMELTABLE = new Set([
 	"kelp",
 ]);
 
+/**
+ * サーバーからの通知を人が読める形にする。
+ *
+ * 統合版は翻訳キーと差し込み語で送ってくる(例: death.attack.player に
+ * ["kusabot2361", "SliestYard48532"])。そのままでは誰が誰にやられたか
+ * 分からない。よく出るものだけ日本語にし、他はキーと語を並べて出す。
+ * 全部を訳す必要はない。読めれば判断の材料になる。
+ */
+function describeSystemMessage(key: string, params: unknown): string {
+	const args = Array.isArray(params) ? params.map((p) => String(p)) : [];
+	const who = args[0] ?? "誰か";
+	const by = args[1] ?? "何か";
+	switch (key) {
+		case "death.attack.player":
+			return `${who} が ${by} に倒された`;
+		case "death.attack.mob":
+		case "death.attack.arrow":
+			return `${who} が ${by} にやられた`;
+		case "death.attack.drown":
+			return `${who} が溺れた`;
+		case "death.attack.fall":
+			return `${who} が落下して死んだ`;
+		case "death.attack.inFire":
+		case "death.attack.onFire":
+			return `${who} が焼け死んだ`;
+		case "death.attack.lava":
+			return `${who} が溶岩で死んだ`;
+		case "death.attack.explosion":
+		case "death.attack.explosion.player":
+			return `${who} が爆発で死んだ`;
+		case "multiplayer.player.joined":
+			return `${who} が入ってきた`;
+		case "multiplayer.player.left":
+			return `${who} が出ていった`;
+		default:
+			return args.length > 0 ? `${key} (${args.join(", ")})` : key;
+	}
+}
+
 /** 防具コンテナのスロット番号。Java版の destination 名に合わせる。 */
 const ARMOR_SLOTS: Record<string, number> = {
 	head: 0,
@@ -140,6 +179,8 @@ export class BedrockDriver implements BotDriver {
 	private craftable = new Set<string>();
 
 	private chatListeners: ((username: string, message: string) => void)[] = [];
+	/** サーバーからの通知(キルログ・死亡ログ・参加退出)の受け手。 */
+	private systemListeners: ((message: string) => void)[] = [];
 	private endListeners: ((reason: string) => void)[] = [];
 	public disconnectReason: string | null = null;
 
@@ -237,7 +278,14 @@ export class BedrockDriver implements BotDriver {
 			if (!d || d.self) return;
 			const source = String(d.source ?? "").trim();
 			const message = String(d.message ?? "").trim();
-			if (!source || !message) return;
+			if (!message) return;
+			if (!source) {
+				// 送信者が無いものはサーバーからの通知。キルログや死亡ログ、
+				// 参加/退出がここに来る。捨てていたので、誰が誰にやられたかを
+				// 一切知らないままだった。
+				for (const l of this.systemListeners) l(describeSystemMessage(message, d.parameters));
+				return;
+			}
 			for (const l of this.chatListeners) l(source, message);
 		});
 		// 死亡は黙って進めない。持ち物が全部落ちるので、以降の判断が
@@ -376,6 +424,7 @@ export class BedrockDriver implements BotDriver {
 
 	on(event: string, listener: (...args: any[]) => void): void {
 		if (event === "chat") this.chatListeners.push(listener as any);
+		else if (event === "system") this.systemListeners.push(listener as any);
 		else if (event === "end" || event === "kicked") this.endListeners.push(listener as any);
 		// spawn/death/health は現状 workflow 側で使っていないので受けるだけにしない。
 		else this.sidecar.on(event, listener as any);
