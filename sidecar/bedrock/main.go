@@ -23,6 +23,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/df-mc/go-playfab/v2"
@@ -89,6 +90,17 @@ func liveToken(cachePath string) (*oauth2.Token, error) {
 		return nil, fmt.Errorf("トークンを保存できない: %w", err)
 	}
 	return tok, nil
+}
+
+// inviteCode は招待リンクから招待コードだけを取り出す。
+func inviteCode(invite string) string {
+	code := strings.TrimSpace(invite)
+	for _, prefix := range []string{"https://realms.gg/", "http://realms.gg/", "realms.gg/"} {
+		if rest, ok := strings.CutPrefix(code, prefix); ok {
+			return rest
+		}
+	}
+	return code
 }
 
 func main() {
@@ -189,8 +201,12 @@ func main() {
 	emit(event{Event: "authenticated"})
 
 	// --- Realm の接続情報 ---
+	// gophertunnel は招待コードをそのまま URL に埋めるので、共有される
+	// https://realms.gg/xxxx を丸ごと渡すと 404 になる。人間が受け取るのは
+	// URL の方なので、ここで剥がす。TypeScript 側でも剥がしているが、
+	// このバイナリを直接叩く経路もあるため両方で面倒を見る。
 	rc := realms.NewClient(msa, nil)
-	realm, err := rc.Realm(ctx, *invite)
+	realm, err := rc.Realm(ctx, inviteCode(*invite))
 	if err != nil {
 		fail("Realm の取得に失敗: %v", err)
 	}

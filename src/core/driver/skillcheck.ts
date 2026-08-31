@@ -9,6 +9,12 @@
  *   DISABLE_AUTONOMY=1 npx tsx src/core/driver/skillcheck.ts
  * 実行(統合版・ローカル開発サーバー):
  *   DISABLE_AUTONOMY=1 BEDROCK_ADDRESS=127.0.0.1:19132 npx tsx src/core/driver/skillcheck.ts
+ * 実行(統合版・本番 Realms):
+ *   DISABLE_AUTONOMY=1 REALM_INVITE=https://realms.gg/xxxx  *     npx tsx --env-file=.env src/core/driver/skillcheck.ts
+ *
+ * 本番を回す意味: ローカルの開発サーバーは平地・単一バイオーム・チート有効で、
+ * 木も鉱石も動物も無い。そこで通ったことは本番で通ることを意味しない。
+ * 本番は他プレイヤーの建築物があり、地形も持ち物も毎回違う。
  *
  * 判定について:
  *   スキルが「失敗」を返すこと自体は異常ではない（材料が無い等）。
@@ -38,6 +44,8 @@ import { BedrockDriver } from "./bedrock";
 
 /** 指定すると統合版のローカルサーバーへ繋ぐ。無ければ Java 版。 */
 const BEDROCK_ADDRESS = process.env.BEDROCK_ADDRESS ?? "";
+/** 指定すると統合版の本番 Realm へ繋ぐ。BEDROCK_ADDRESS より優先。 */
+const REALM_INVITE = process.env.REALM_INVITE ?? "";
 const VIA_WSL = (process.env.BEDROCK_WSL ?? (process.platform === "win32" ? "1" : "0")) === "1";
 
 // 1スキルあたりの上限。設置系は tryPlaceBlock が候補ごとに待機を挟むため長めが要る。
@@ -68,15 +76,21 @@ async function main() {
 	const profile = Object.values(profiles)[0];
 
 	let agent: MinecraftAgent;
-	if (BEDROCK_ADDRESS) {
+	if (REALM_INVITE || BEDROCK_ADDRESS) {
 		// 統合版はドライバが接続を握るので、注入してから自分で繋ぐ。
+		// 本番 Realm では表示名を選べない(アカウントのゲーマータグになる)ので
+		// name と viaWsl はローカルへ繋ぐときだけ渡す。
 		const driver = new BedrockDriver({
-			address: BEDROCK_ADDRESS,
-			name: "skillcheck",
-			viaWsl: VIA_WSL,
+			realmInvite: REALM_INVITE || undefined,
+			address: REALM_INVITE ? undefined : BEDROCK_ADDRESS,
+			name: REALM_INVITE ? undefined : "skillcheck",
+			viaWsl: REALM_INVITE ? false : VIA_WSL,
+			onMsaCode: (m) => console.log("要サインイン:", m),
 		});
 		agent = new MinecraftAgent(profile, [], driver);
-		console.log(`[skillcheck] 統合版 ${BEDROCK_ADDRESS} へ接続中...`);
+		console.log(
+			`[skillcheck] 統合版 ${REALM_INVITE ? "本番 Realm" : BEDROCK_ADDRESS} へ接続中...`,
+		);
 		await driver.connect();
 	} else {
 		agent = new MinecraftAgent(profile, []);
