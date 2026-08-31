@@ -380,7 +380,16 @@ export class BedrockDriver implements BotDriver {
 		try {
 			await this.sidecar.send(
 				"goto",
-				{ x: target.x, z: target.z, range: target.distance, timeoutMs: 30_000 },
+				{
+					x: target.x,
+					z: target.z,
+					range: target.distance,
+					// 高さも合わせたいときだけ渡す。水平だけで判定すると、
+					// 掘った穴の真上に立った時点で到達扱いになる。
+					y: target.y ?? 0,
+					value: target.y !== undefined,
+					timeoutMs: 30_000,
+				},
 				35_000,
 			);
 		} finally {
@@ -392,7 +401,9 @@ export class BedrockDriver implements BotDriver {
 	 * MoveGoal を XZ の目標に落とす。ブロックを見ないと決められない目標
 	 * (getToBlock / lookAtBlock) は、ワールド読み取りが入るまで扱えない。
 	 */
-	private resolveGoal(goal: MoveGoal): { x: number; z: number; distance: number } | null {
+	private resolveGoal(
+		goal: MoveGoal,
+	): { x: number; z: number; distance: number; y?: number } | null {
 		switch (goal.kind) {
 			case "near": {
 				// 目標が固いブロックなら、その中心には立てない。隣の立てる場所を狙う。
@@ -402,7 +413,14 @@ export class BedrockDriver implements BotDriver {
 					const spot = this.standableNear(goal.position);
 					return { x: spot.x, z: spot.z, distance: Math.max(goal.distance, 1.2) };
 				}
-				return { x: goal.position.x, z: goal.position.z, distance: goal.distance };
+				// 固くない目標(落ちているアイテムなど)は高さも合わせる。
+				// 水平だけだと、掘った穴の真上で「着いた」ことになる。
+				return {
+					x: goal.position.x,
+					z: goal.position.z,
+					y: goal.position.y,
+					distance: goal.distance,
+				};
 			}
 			case "block":
 				return { x: goal.position.x, z: goal.position.z, distance: 0.7 };
@@ -658,6 +676,7 @@ export class BedrockDriver implements BotDriver {
 		// 取りに行けなかったものを覚えておく。同じものを毎回選び直すと
 		// 6回の試行を1個に使い切ってしまい、隣に落ちている他のものを残す。
 		const unreachable = new Set<number>();
+		const trace = process.env.BEDROCK_TRACE_PICKUP === "1";
 
 		// 一度に何個も追いかけると時間切れになるので、近いものから数個まで。
 		for (let i = 0; i < 6; i++) {
@@ -668,6 +687,14 @@ export class BedrockDriver implements BotDriver {
 				.filter((e) => e.kind === "item" && !unreachable.has(e.id))
 				.sort((a, b) => distance(here, a.position) - distance(here, b.position));
 			const target = items[0];
+			if (trace) {
+				console.log(
+					`[pickup] ${i}回目: 落下物 ${items.length} 個` +
+						(target
+							? ` 最寄り ${target.name} 距離 ${distance(here, target.position).toFixed(1)}`
+							: " なし"),
+				);
+			}
 			if (!target || distance(here, target.position) > 24) {
 				// 最初の数回は現れるのを待つ。すぐ諦めると掘った物を取り逃す。
 				if (i < 3) {
@@ -678,23 +705,25 @@ export class BedrockDriver implements BotDriver {
 			}
 
 			try {
-				// 統合版は1ブロックほどに近づけばサーバーが勝手に拾う。
-				// 0.8 だと経路探索がマス目の中心にしか止まれず、ほぼ毎回
-				// 「届かなかった」になっていた。踏みに行ける距離で足りる。
+				// 統合版の自動回収はおよそ1ブロック。ここを緩めると、到達は
+				// しやすくなるが回収範囲の外で止まり、いつまでも拾えない。
+				// 実際 1.5 にしたとき、掘った土から1.7ブロック手前で止まって
+				// 在庫更新が一度も来なかった。経路探索はマス目の中心にしか
+				// 止まれないので、これ以上は詰められない。
 				await this.goto(signal, {
-					kind: "xz",
-					x: target.position.x,
-					z: target.position.z,
-					distance: 1.5,
+					kind: "near",
+					position: target.position,
+					distance: 0.9,
 				});
-			} catch {
+			} catch (e) {
 				// 届かないものは飛ばして次を取りに行く。ここで return すると
 				// 1つ取れなかっただけで残り全部を捨てることになる。
+				if (trace) console.log(`[pickup] ${target.name} へ行けない: ${e}`);
 				unreachable.add(target.id);
 				continue;
 			}
 			// 拾われるまで少し待つ。判定はサーバー側。
-			await sleep(500);
+			await sleep(800);
 		}
 	}
 	async craft(itemName: string, count: number, craftingTable?: Position): Promise<void> {

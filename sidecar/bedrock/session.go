@@ -87,6 +87,10 @@ type entityInfo struct {
 	Type      string
 	IsPlayer  bool
 	Pos       mgl32.Vec3
+	// Item は落ちているアイテムの中身。拾ったときに持ち物へ足すのに要る。
+	// 統合版のサーバーは拾得で持ち物の更新を送ってこない。実クライアントが
+	// 自前で予測する作りなので、こちらも同じことをする必要がある。
+	Item protocol.ItemInstance
 }
 
 // digTask は進行中の採掘。統合版の採掘はサーバー権限型で、
@@ -101,8 +105,15 @@ type digTask struct {
 
 // 到達目標。tick ループが毎回参照して進路を決める。
 type target struct {
-	id        int
-	x, z      float32
+	id   int
+	x, z float32
+	// y は高さも合わせたいときの目標。hasY が false なら高さは見ない。
+	//
+	// 水平だけで判定すると、掘った穴の真上に立った時点で「着いた」ことに
+	// なる。落ちているアイテムを拾いに行くときにこれで詰まり、距離2の
+	// ままいくら待っても拾えなかった。
+	y         float32
+	hasY      bool
 	tolerance float32
 	deadline  time.Time
 	// 進んでいないことを検出して自動ジャンプするための記録
@@ -402,6 +413,7 @@ func (s *session) handle(pk packet.Packet) {
 			Name:      name,
 			Type:      "item",
 			Pos:       mgl32.Vec3{v.Position[0], v.Position[1], v.Position[2]},
+			Item:      v.Item,
 		}
 		s.unique[v.EntityUniqueID] = v.EntityRuntimeID
 		s.mu.Unlock()
@@ -416,6 +428,21 @@ func (s *session) handle(pk packet.Packet) {
 			Pos:       mgl32.Vec3{v.Position[0], v.Position[1], v.Position[2]},
 		}
 		s.unique[v.EntityUniqueID] = v.EntityRuntimeID
+		s.mu.Unlock()
+
+	case *packet.TakeItemActor:
+		// 拾った。統合版は持ち物の更新を送ってこないので、自分で足す。
+		// これをしないと、掘って拾えているのに持ち物が再接続まで古いままで、
+		// 採集スキルが「壊したのに何も得ていない」と報告し続ける。
+		if v.TakerEntityRuntimeID != s.game.EntityRuntimeID {
+			return
+		}
+		s.mu.Lock()
+		if e, ok := s.entities[v.ItemEntityRuntimeID]; ok && e.Type == "item" {
+			s.addItemLocked(e.Item)
+			delete(s.entities, v.ItemEntityRuntimeID)
+			delete(s.unique, e.UniqueID)
+		}
 		s.mu.Unlock()
 
 	case *packet.RemoveActor:
@@ -512,6 +539,9 @@ func (s *session) handle(pk packet.Packet) {
 		emit(event{Event: "container_close", Data: map[string]any{"windowId": v.WindowID}})
 
 	case *packet.InventoryContent:
+		if os.Getenv("BEDROCK_TRACE_INV") == "1" {
+			fmt.Fprintf(os.Stderr, "invContent win=%d n=%d\n", v.WindowID, len(v.Content))
+		}
 		// WindowID 0 がプレイヤー自身の持ち物。
 		// それ以外は開いているコンテナの中身。
 		if v.WindowID != 0 {
@@ -541,6 +571,14 @@ func (s *session) handle(pk packet.Packet) {
 		s.mu.Unlock()
 
 	case *packet.InventorySlot:
+		if os.Getenv("BEDROCK_TRACE_INV") == "1" {
+			cid := int32(-1)
+			if c, ok := v.Container.Value(); ok {
+				cid = int32(c.ContainerID)
+			}
+			fmt.Fprintf(os.Stderr, "invSlot win=%d slot=%d container=%d count=%d\n",
+				v.WindowID, v.Slot, cid, v.NewItem.Stack.Count)
+		}
 		if v.WindowID != 0 {
 			return
 		}
@@ -833,7 +871,12 @@ func (s *session) steerLocked(n uint64) {
 	}
 
 	dist := horizontalDist(s.feetLocked(), g.x, g.z)
-	if dist <= g.tolerance {
+	// 高さを指定されているなら、そこも合わせる。1段ぶんは許す。
+	heightOK := true
+	if g.hasY {
+		heightOK = math.Abs(float64(s.feetLocked()[1]-g.y)) <= 1.5
+	}
+	if dist <= g.tolerance && heightOK {
 		s.finishGoalLocked(true, "")
 		return
 	}
@@ -857,7 +900,11 @@ func (s *session) steerLocked(n uint64) {
 			int32(math.Floor(float64(feet[2]))),
 		}
 		gx, gz := clampToward(s.feetLocked(), g.x, g.z, planReach)
-		to := blockPos{int32(math.Floor(float64(gx))), from.Y, int32(math.Floor(float64(gz)))}
+		goalY := from.Y
+		if g.hasY {
+			goalY = int32(math.Floor(float64(g.y)))
+		}
+		to := blockPos{int32(math.Floor(float64(gx))), goalY, int32(math.Floor(float64(gz)))}
 		tol := float64(g.tolerance)
 		if dist > planReach {
 			// 中間地点なので、そこにぴったり着く必要はない。
@@ -1008,6 +1055,7 @@ func (s *session) dispatch(c command) {
 		}
 		s.goal = &target{
 			id: c.ID, x: c.X, z: c.Z, tolerance: tol,
+			y: c.Y, hasY: c.Value,
 			deadline: time.Now().Add(time.Duration(timeout) * time.Millisecond),
 			lastPos:  s.pos,
 		}
@@ -2047,6 +2095,58 @@ func firstFreeSlotLocked(s *session, used map[int]bool) int {
 		}
 	}
 	return -1
+}
+
+// addItemLocked は拾ったアイテムを持ち物の写しへ足す。
+//
+// 同じ物の山があればそこへ、無ければ空き枠へ。サーバーの割り当てと必ずしも
+// 一致しないが、こちらが見たいのは「何をどれだけ持っているか」なので足りる。
+// 実際の配置は次の InventoryContent で上書きされる。
+// 呼び出し側が mu を持つこと。
+func (s *session) addItemLocked(item protocol.ItemInstance) {
+	if item.Stack.Count == 0 {
+		return
+	}
+	name, ok := s.itemNames[item.Stack.ItemType.NetworkID]
+	if !ok {
+		return
+	}
+	for slot := 0; slot < 36; slot++ {
+		it, used := s.rawSlots[slot]
+		if !used || it.Stack.Count == 0 {
+			continue
+		}
+		if n, ok := s.itemNames[it.Stack.ItemType.NetworkID]; !ok || n != name {
+			continue
+		}
+		if int(it.Stack.Count)+int(item.Stack.Count) > 64 {
+			continue
+		}
+		it.Stack.Count += item.Stack.Count
+		s.rawSlots[slot] = it
+		s.syncSlotLocked(slot, it)
+		return
+	}
+	if slot, ok := s.freeSlotLocked(); ok {
+		s.rawSlots[slot] = item
+		s.syncSlotLocked(slot, item)
+	}
+}
+
+// syncSlotLocked は rawSlots の変更を、外へ出す一覧(slots)へ反映する。
+// 呼び出し側が mu を持つこと。
+func (s *session) syncSlotLocked(slot int, item protocol.ItemInstance) {
+	kept := s.slots[:0]
+	for _, x := range s.slots {
+		if x.Slot != slot {
+			kept = append(kept, x)
+		}
+	}
+	s.slots = kept
+	if it, ok := s.itemLocked(item); ok {
+		it.Slot = slot
+		s.slots = append(s.slots, it)
+	}
 }
 
 func faceToward(from mgl32.Vec3, bx, by, bz int32) int32 {
