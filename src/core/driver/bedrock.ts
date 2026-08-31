@@ -638,9 +638,21 @@ export class BedrockDriver implements BotDriver {
 	}
 	async craft(itemName: string, count: number, craftingTable?: Position): Promise<void> {
 		const want = stripNamespace(itemName);
-		// サイドカーは1回ぶんずつ作る。必要な回数だけ繰り返す。
+		// 3x3 の枠は作業台の画面を開いている間しか使えない。位置を渡さないと
+		// サイドカーは持ち物の画面しか開かず、3x3 のレシピが弾かれる。
+		// 以前は真偽値だけを渡しており、どこの作業台かが伝わっていなかった。
 		for (let i = 0; i < Math.max(1, count); i++) {
-			await this.sidecar.send("craft", { names: [want], value: Boolean(craftingTable) }, 20_000);
+			await this.sidecar.send(
+				"craft",
+				{
+					names: [want],
+					value: Boolean(craftingTable),
+					x: craftingTable?.x ?? 0,
+					y: craftingTable?.y ?? 0,
+					z: craftingTable?.z ?? 0,
+				},
+				20_000,
+			);
 			await sleep(250);
 		}
 		await this.refresh();

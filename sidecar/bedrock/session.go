@@ -1303,15 +1303,43 @@ func (s *session) dispatch(c command) {
 		}
 		s.mu.Unlock()
 
-		// クラフト枠は「持ち物の画面を開いている」状態でしか使えない。
-		// 実クライアントは開いたときにこれを送る。送らないとサーバーは
-		// 置き先を不正と判断する(FailedToValidateDstSlot)。
+		// クラフト枠は画面を開いている状態でしか使えない。
+		// 2x2 は持ち物の画面、3x3 は作業台の画面。実クライアントは開いた
+		// ときにこれを送る。送らないとサーバーは置き先を不正と判断する
+		// (FailedToValidateDstSlot)。
 		if err := s.conn.WritePacket(&packet.Interact{
 			ActionType:            packet.InteractActionOpenInventory,
 			TargetEntityRuntimeID: s.game.EntityRuntimeID,
 		}); err != nil {
 			s.reply(c.ID, false, fmt.Sprintf("持ち物を開けません: %v", err), nil)
 			return
+		}
+
+		// 作業台が要るレシピは、その作業台を実際に開く。持ち物の画面のままだと
+		// 3x3 の枠(32..40)が存在しないので置き先が不正になる。
+		if chosen.NeedsTable && c.Value {
+			s.mu.Lock()
+			bx := int32(math.Floor(float64(c.X)))
+			by := int32(math.Floor(float64(c.Y)))
+			bz := int32(math.Floor(float64(c.Z)))
+			face := faceToward(s.pos, bx, by, bz)
+			clicked, _ := s.world.runtimeIDAt(bx, by, bz)
+			held := s.rawSlots[int(s.heldSlot)]
+			s.pendingPlace = &protocol.UseItemTransactionData{
+				ActionType:       protocol.UseItemActionClickBlock,
+				TriggerType:      protocol.TriggerTypePlayerInput,
+				BlockPosition:    protocol.BlockPos{bx, by, bz},
+				BlockFace:        face,
+				HotBarSlot:       s.heldSlot,
+				HeldItem:         held,
+				Position:         s.pos,
+				ClickedPosition:  clickOffset(face),
+				BlockRuntimeID:   uint32(clicked),
+				ClientPrediction: protocol.ClientPredictionSuccess,
+			}
+			s.mu.Unlock()
+			// 開くのは次のtickに載る。サーバーが受理するまで少し待つ。
+			time.Sleep(500 * time.Millisecond)
 		}
 
 		if err := s.conn.WritePacket(&packet.ItemStackRequest{
