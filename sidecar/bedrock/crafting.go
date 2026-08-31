@@ -499,6 +499,13 @@ func (s *session) outputSlotLocked(outputName string) (int, int32, bool) {
 			// 既にある山へ重ねるときは、その山の識別子を載せる必要がある。
 			// 0 のままだと「空き枠へ置く」ことになり、実際は埋まっているので
 			// FailedToValidateDstSlot(50) で拒否される。
+			//
+			// ただし識別子が 0 の山は、こちらがクラフト後に自前で足したもので
+			// サーバーの値を知らない。そこへ重ねようとすると必ず弾かれるので、
+			// 空き枠を使う。板を続けて作ると2回目で必ず踏んでいた。
+			if it.StackNetworkID == 0 {
+				continue
+			}
 			return i, it.StackNetworkID, true
 		}
 	}

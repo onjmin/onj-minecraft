@@ -2804,6 +2804,12 @@ func (s *session) applyCraftLocked(eff craftOutcome) {
 	kept := s.slots[:0]
 	for _, it := range s.slots {
 		if it.Count > 0 {
+			// 生の写しの数も合わせる。ここがずれると、持ち替えが
+			// 空のスロットを指して「手に何も持っていません」になる。
+			if raw, ok := s.rawSlots[it.Slot]; ok {
+				raw.Stack.Count = uint16(it.Count)
+				s.rawSlots[it.Slot] = raw
+			}
 			kept = append(kept, it)
 		} else {
 			delete(s.rawSlots, it.Slot)
@@ -2815,6 +2821,10 @@ func (s *session) applyCraftLocked(eff craftOutcome) {
 	for i := range s.slots {
 		if s.slots[i].Name == eff.Output {
 			s.slots[i].Count += eff.OutputCount
+			if raw, ok := s.rawSlots[s.slots[i].Slot]; ok {
+				raw.Stack.Count = uint16(s.slots[i].Count)
+				s.rawSlots[s.slots[i].Slot] = raw
+			}
 			return
 		}
 	}
@@ -2825,4 +2835,30 @@ func (s *session) applyCraftLocked(eff craftOutcome) {
 		}
 	}
 	s.slots = append(s.slots, invSlot{Slot: slot, Name: eff.Output, Count: eff.OutputCount})
+	// 生の写しにも入れる。持ち替え・設置・次のクラフトは全てこちらを見る。
+	// ここを書かないと、作った物を手に持てない。作業台を作った直後の設置が
+	// 「手に何も持っていません」で失敗していた。
+	if id, ok := s.networkIDForLocked(eff.Output); ok {
+		s.rawSlots[slot] = protocol.ItemInstance{
+			// サーバーが割り当てた識別子は分からない。0 のままにしておき、
+			// 重ねる先には選ばない(outputSlotLocked が弾く)。
+			StackNetworkID: 0,
+			Stack: protocol.ItemStack{
+				ItemType: protocol.ItemType{NetworkID: id},
+				Count:    uint16(eff.OutputCount),
+			},
+		}
+	}
+}
+
+// networkIDForLocked は名前から実行時IDを引く。アイテム表は id→名前 しか
+// 持っていないので線形に探す。呼ぶ頻度は低い。
+// 呼び出し側が mu を持つこと。
+func (s *session) networkIDForLocked(name string) (int32, bool) {
+	for id, n := range s.itemNames {
+		if n == name {
+			return id, true
+		}
+	}
+	return 0, false
 }

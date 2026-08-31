@@ -137,21 +137,34 @@ async function main() {
 			y: Math.floor(st.position.y),
 			z: Math.floor(st.position.z),
 		};
-		const ref = { x: foot.x + 1, y: foot.y - 1, z: foot.z };
-		const below = driver.world.blockAt(ref);
-		if (below && below.name !== "air") {
+		// 置ける場所を探す。足元と同じ高さが空いていて、その下が固いところ。
+		// 適当に隣を狙うと、既に何か建っている場所を選んで失敗する。
+		const spot = [
+			{ x: 1, z: 0 },
+			{ x: -1, z: 0 },
+			{ x: 0, z: 1 },
+			{ x: 0, z: -1 },
+		]
+			.map((d) => ({ x: foot.x + d.x, y: foot.y, z: foot.z + d.z }))
+			.find((cand) => {
+				const here = driver.world.blockAt(cand);
+				const under = driver.world.blockAt({ ...cand, y: cand.y - 1 });
+				return here?.name === "air" && !!under && under.name !== "air";
+			});
+		if (spot) {
+			const ref = { ...spot, y: spot.y - 1 };
 			try {
 				await driver.equip("crafting_table", "hand");
 				await driver.placeBlock(new AbortController().signal, ref, { x: 0, y: 1, z: 0 });
 				await sleep(800);
-				const placed = driver.world.blockAt({ x: ref.x, y: ref.y + 1, z: ref.z });
-				tablePos = placed?.name === "crafting_table" ? { x: ref.x, y: ref.y + 1, z: ref.z } : null;
+				const placed = driver.world.blockAt(spot);
+				tablePos = placed?.name === "crafting_table" ? spot : null;
 				step("作業台を置ける", tablePos !== null, placed?.name ?? "不明");
 			} catch (e) {
 				step("作業台を置ける", false, String(e));
 			}
 		} else {
-			step("作業台を置ける", false, "隣に足場が無い");
+			step("作業台を置ける", false, "置ける場所が見つからない");
 		}
 	}
 
