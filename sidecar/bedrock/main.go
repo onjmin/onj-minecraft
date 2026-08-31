@@ -244,7 +244,14 @@ func main() {
 	dialer := minecraft.Dialer{
 		XBLClient:     xbl,
 		PlayFabClient: pf,
-		ClientData:    login.ClientData{},
+		// スキンを明示する。既定は真っ黒な人影で、他プレイヤーから見て
+		// ボットがどれか分からない。
+		ClientData: login.ClientData{
+			SkinID:          "onj-minecraft-bot",
+			SkinData:        skinDataBase64(),
+			SkinImageWidth:  skinW,
+			SkinImageHeight: skinH,
+		},
 	}
 	// Dial は既定タイムアウトが短く、Realm の応答が間に合わないことがあるため
 	// 明示的にコンテキストを渡す。

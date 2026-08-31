@@ -70,6 +70,8 @@ const MIN_UNINTERRUPTED_MS = Number(process.env.SKILL_MIN_RUN_MS ?? 60_000);
 const FLEE_HEALTH = Number(process.env.FLEE_HEALTH ?? 10);
 /** 死亡地点の落とし物を追いかける制限時間。落下物は5分ほどで消える。 */
 const DEATH_LOOT_WINDOW_MS = Number(process.env.DEATH_LOOT_WINDOW_MS ?? 240_000);
+/** 回収に戻って返り討ちに遭ったあと、次に試すまで置く間隔。 */
+const RECOVER_COOLDOWN_MS = Number(process.env.RECOVER_COOLDOWN_MS ?? 45_000);
 /** 一度の反射で振る回数。振り続けて本来の行動を止めない程度に。 */
 const ATTACK_SWINGS = 4;
 /** 頭上の蓋に使える物。何でもよいが、貴重な物を使わないよう絞る。 */
@@ -196,7 +198,7 @@ export class MinecraftAgent {
 	 * 死んだ場所と時刻。持ち物はそこに落ちているので、取りに戻る手掛かり。
 	 * 落下物は5分ほどで消えるため、古くなったら捨てる。
 	 */
-	private deathPoint: { position: Position; at: number } | null = null;
+	private deathPoint: { position: Position; at: number; retryAfter?: number } | null = null;
 	/** 人から話しかけられて、次の判断を急ぎたいときに立てる。 */
 	private humanRequestPending = false;
 	/** 思考ループの待ちを途中で切り上げるための呼び出し口。 */
@@ -263,12 +265,13 @@ export class MinecraftAgent {
 			);
 			// 死んだ場所を控える。持ち物は全部そこに落ちている。
 			this.driver.on("death", () => {
-				// 回収に戻った先で殺されたなら、そこは罠。二度と行かない。
+				// 回収に戻った先で殺されたなら、まだ敵がそこにいる。
+				// 諦めはしないが、すぐ戻ると同じことになる。間を置く。
 				// 実測で90秒に4回、ほぼ同じ座標で死に続けた。戻るたびに
 				// 拾い直した物をまた落とすので、往復するほど損をする。
-				if (this.currentTaskName === gotoDeathPointSkill.name) {
-					this.log("[反射] 回収に戻った先で死んだ。その地点は諦める");
-					this.deathPoint = null;
+				if (this.currentTaskName === gotoDeathPointSkill.name && this.deathPoint) {
+					this.log("[反射] 回収に戻った先で死んだ。敵が離れるまで待つ");
+					this.deathPoint.retryAfter = Date.now() + RECOVER_COOLDOWN_MS;
 					this.currentTaskName = exploreLandSkill.name;
 					this.currentTaskSince = Date.now();
 					return;
@@ -794,6 +797,8 @@ export class MinecraftAgent {
 			this.deathPoint = null;
 			return null;
 		}
+		// 直前に返り討ちに遭ったなら、少し置いてから。
+		if (this.deathPoint.retryAfter && Date.now() < this.deathPoint.retryAfter) return null;
 		return this.deathPoint.position;
 	}
 
