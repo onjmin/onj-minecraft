@@ -169,8 +169,19 @@ export class BedrockDriver implements BotDriver {
 	};
 	/** サイドカーから引いた持ち物の写し。items() が同期メソッドなので保持する。 */
 	private items: ItemInfo[] = [];
+	/**
+	 * 今着ている防具（頭・胴・脚・足）。
+	 *
+	 * サイドカーは防具コンテナへ物を入れる側しか実装しておらず、中身を
+	 * 読み返す口が無い。着せたのはこちらなので、こちらで控えておく。
+	 * 拾った防具を自分で着た場合など、サーバー側の実態とずれる余地はあるが、
+	 * 「装備しているのに丸腰と判定する」より実態に近い。
+	 */
+	private worn: (ItemInfo | null)[] = [null, null, null, null];
 	private entities: EntityInfo[] = [];
 	private pollTimer: NodeJS.Timeout | null = null;
+	/** 状態の取り直しを止めたか。次の周を組まないための印。 */
+	private polling = false;
 	/** 周辺ブロックの写し。world.* はここから答える。 */
 	private blocks = new BlockView();
 	/** 最後にスナップショットを取った位置。動いたら取り直す。 */
@@ -241,6 +252,7 @@ export class BedrockDriver implements BotDriver {
 			// 統合版の選択スロットはサイドカーがまだ扱っていない。
 			heldItem: () => null,
 			emptySlotCount: () => Math.max(0, 36 - this.items.length),
+			armor: () => this.worn.slice(),
 		};
 
 		// アイテム表はサイドカーが StartGame から取っているが、こちら側には
@@ -303,6 +315,8 @@ export class BedrockDriver implements BotDriver {
 				`[bedrock] 死亡しました（${d?.cause ?? "原因不明"}）。持ち物はその場に落ちています`,
 			);
 			this.items = [];
+			// 防具もその場に落ちる。控えを残すと「着ている」ことになってしまう。
+			this.worn = [null, null, null, null];
 		});
 		this.sidecar.on("respawn", (d: any) => {
 			if (d?.position) this.state.position = toPos(d.position);
@@ -320,11 +334,7 @@ export class BedrockDriver implements BotDriver {
 
 		// 状態と持ち物は同期メソッドで読まれるので、定期的に引いて写しを更新する。
 		await this.refresh();
-		this.pollTimer = setInterval(() => {
-			this.refresh().catch(() => {
-				// 切断時はここが失敗するが、end イベント側で処理する。
-			});
-		}, 1000);
+		this.startPolling();
 
 		const st = await this.sidecar.send("state");
 		this.username = String(st.username ?? this.username);
@@ -355,9 +365,38 @@ export class BedrockDriver implements BotDriver {
 		console.error("[bedrock] 周辺ブロックが届きませんでした。world の参照は null を返します");
 	}
 
+	/**
+	 * 状態の取り直しを回し続ける。
+	 *
+	 * setInterval ではなく、1回終わってから次を組む。1周には状態・持ち物・
+	 * エンティティの3往復に加えて周辺ブロックのスナップショット(33立方で
+	 * base64 95KB前後)が入るので、1秒に収まらないことがある。setInterval だと
+	 * 終わっていないのに次が始まり、サイドカーは要求を順番に捌くので、
+	 * 積む方が捌く方より速くなって行列が伸び続ける。読める状態はそのぶん
+	 * 古くなり、遅いほど古くなるという逆向きの働きになる。
+	 */
+	private startPolling(): void {
+		if (this.polling) return;
+		this.polling = true;
+
+		const tick = async () => {
+			if (!this.polling) return;
+			try {
+				await this.refresh();
+			} catch {
+				// 切断時はここが失敗するが、end イベント側で処理する。
+			}
+			if (!this.polling) return;
+			this.pollTimer = setTimeout(tick, 1000);
+		};
+
+		this.pollTimer = setTimeout(tick, 1000);
+	}
+
 	private stopPolling(): void {
+		this.polling = false;
 		if (this.pollTimer) {
-			clearInterval(this.pollTimer);
+			clearTimeout(this.pollTimer);
 			this.pollTimer = null;
 		}
 	}
@@ -728,6 +767,8 @@ export class BedrockDriver implements BotDriver {
 		await this.sidecar.send("wear", { names: [String(item.slot)], count: armorSlot });
 		await sleep(300);
 		await this.refresh();
+		// 着せたものを控える。防具コンテナは読み返せないので、ここが唯一の記録。
+		this.worn[armorSlot] = { name: want, count: 1, slot: -1 };
 	}
 
 	/**
@@ -830,11 +871,26 @@ export class BedrockDriver implements BotDriver {
 				// 実際 1.5 にしたとき、掘った土から1.7ブロック手前で止まって
 				// 在庫更新が一度も来なかった。経路探索はマス目の中心にしか
 				// 止まれないので、これ以上は詰められない。
-				await this.goto(signal, {
-					kind: "near",
-					position: target.position,
-					distance: 0.9,
-				});
+				//
+				// まず掘らずに行く。地形を壊さずに済むならその方がよい。
+				// 駄目なら掘ってでも取りに行く。木の下は葉に囲まれていて
+				// 掘らないと寄れず、実測で伐った原木9本が地面に残ったまま
+				// 一つも拾えなかった。
+				try {
+					await this.goto(signal, {
+						kind: "near",
+						position: target.position,
+						distance: 0.9,
+					});
+				} catch {
+					if (signal.aborted) throw new Error("中断された");
+					await this.goto(signal, {
+						kind: "xz",
+						x: target.position.x,
+						z: target.position.z,
+						distance: 0.9,
+					});
+				}
 			} catch (e) {
 				// 届かないものは飛ばして次を取りに行く。ここで return すると
 				// 1つ取れなかっただけで残り全部を捨てることになる。
