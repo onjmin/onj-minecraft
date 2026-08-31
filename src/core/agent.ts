@@ -74,6 +74,8 @@ const ATTACK_SWINGS = 4;
 const PLACEABLE_COVER = ["dirt", "cobblestone", "stone", "_planks", "gravel", "sand", "netherrack"];
 /** 防具かどうかの判定に使う。 */
 const ARMOR_SUFFIXES = ["_helmet", "_chestplate", "_leggings", "_boots"];
+/** この体力を下回ったら、昼でも潜って回復を待つ。 */
+const SHELTER_HEALTH = Number(process.env.SHELTER_HEALTH ?? 8);
 
 /** 攻撃してくる相手かどうか。名前で判断する。 */
 function isHostileMob(name: string): boolean {
@@ -1758,14 +1760,24 @@ export class MinecraftAgent {
 	 */
 	private async shelterAtNight(signal: AbortSignal): Promise<boolean> {
 		const state = this.driver.getState();
+		// 死んでいる間は何もしない。復帰の要求はサイドカーが出している。
+		if (state.health <= 0) return false;
+
 		const night = state.timeOfDay >= 13000 && state.timeOfDay <= 23000;
-		if (!night) return false;
+		// 傷ついていて、しかも敵が近いときだけ退く。体力だけで判断すると、
+		// 回復しないまま延々と潜り直して何も進まなくなる。実測で HP1 のまま
+		// 18回潜っていた。潜っても満腹度が足りなければ回復しない。
+		const hurt =
+			state.health <= SHELTER_HEALTH &&
+			this.driver.nearbyEntities(12).some((e) => isHostileMob(e.name));
+		if (!night && !hurt) return false;
 
 		const armed = this.hasWeapon();
 		const armored = this.driver.inventory
 			.items()
 			.some((i) => ARMOR_SUFFIXES.some((suf) => i.name.endsWith(suf)));
-		if (armed || armored) return false;
+		// 傷ついているときは装備の有無に関わらず退く。
+		if (!hurt && (armed || armored)) return false;
 
 		// 既に囲まれている(＝潜れている)なら、そのまま待つ。
 		const pos = state.position;
@@ -1773,7 +1785,9 @@ export class MinecraftAgent {
 		const above = this.driver.world.blockAt({ ...foot, y: foot.y + 2 });
 		if (above && above.name !== "air") return true;
 
-		this.log("[反射] 夜で丸腰。潜ってやり過ごす");
+		this.log(
+			hurt ? `[反射] 体力 ${state.health}。潜って回復を待つ` : "[反射] 夜で丸腰。潜ってやり過ごす",
+		);
 		await this.burrow(signal);
 		return true;
 	}

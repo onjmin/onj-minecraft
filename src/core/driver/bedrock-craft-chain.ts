@@ -14,6 +14,7 @@
  *     src/core/driver/bedrock-craft-chain.ts
  */
 import { profiles } from "../../profiles";
+import { collectStoneSkill } from "../../skills/collecting/stone";
 import { collectWoodSkill } from "../../skills/collecting/wood";
 import { MinecraftAgent } from "../agent";
 import { BedrockDriver } from "./bedrock";
@@ -204,21 +205,22 @@ async function main() {
 	// 6. ツルハシで石を掘り、かまどを作って精錬まで通す。
 	//    ここが通れば「木しか無い」状態から鉄まで手が届く。
 	if (count("wooden_pickaxe") > 0 || count("stone_pickaxe") > 0) {
-		const stones = driver.world.findBlocksMatching(
-			(n) => n === "stone" || n === "cobblestone" || n === "deepslate",
-			8,
-			10,
-		);
-		for (const b of stones) {
-			if (count("cobblestone") >= 8) break;
-			try {
-				await driver.equipBestTool(b.position);
-				await driver.dig(new AbortController().signal, b.position);
-				await driver.pickupNearbyItems(new AbortController().signal);
-			} catch {
-				// 届かない石は飛ばす。
-			}
+		// 自前で近くを掘るのではなく実際のスキルに任せる。地表には石が無く、
+		// 半径8を探しても見つからない。スキルは探索範囲も移動も持っている。
+		console.log("[chain] collecting.stone で丸石を採る...");
+		const ac2 = new AbortController();
+		const timer2 = setTimeout(() => ac2.abort(), 120_000);
+		try {
+			const r = await collectStoneSkill.handler({
+				agent,
+				signal: ac2.signal,
+				args: undefined as any,
+			});
+			console.log(`  ${r.success ? "成功" : "失敗"}: ${r.summary}`);
+		} catch (e) {
+			console.log(`  採掘で例外: ${e}`);
 		}
+		clearTimeout(timer2);
 		step("丸石を8個そろえる", count("cobblestone") >= 8, `${count("cobblestone")}個`);
 		show();
 	}

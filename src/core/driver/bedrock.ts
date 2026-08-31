@@ -707,6 +707,13 @@ export class BedrockDriver implements BotDriver {
 		}
 		await this.sidecar.send("hold", { count: slot });
 		await sleep(150);
+		if (process.env.BEDROCK_TRACE_TOOL === "1") {
+			await this.refresh();
+			const held = this.items.find((i) => i.slot === slot);
+			console.log(
+				`[tool] ${block.name} に ${best.name}(slot ${best.slot}) → slot ${slot}。いま持っているのは ${held?.name ?? "なし"}`,
+			);
+		}
 	}
 	/**
 	 * 落ちているアイテムを拾う。
