@@ -68,6 +68,18 @@ const (
 	sprintSpeed = float32(0.2806)
 )
 
+// openContainer は今開いているコンテナ。ContainerOpen で埋まり、
+// ContainerClose で消える。中身は InventoryContent が同じ WindowID で届く。
+type openContainer struct {
+	WindowID byte
+	Type     byte
+	Pos      protocol.BlockPos
+	// 中身。スロット番号をそのまま添字にする。
+	Slots map[int]protocol.ItemInstance
+	// 中身が一度でも届いたか。開いた直後は空と区別が付かない。
+	Filled bool
+}
+
 type entityInfo struct {
 	RuntimeID uint64
 	UniqueID  int64
@@ -122,6 +134,9 @@ type session struct {
 	// ワールドの総経過tick。SetTime はゲーム内時刻ではなく累計を送ってくるので、
 	// 昼夜の判定に使うには 24000 で割った余りを取る必要がある。
 	worldTick int32
+	// 今開いているコンテナ。開いていなければ nil。
+	// チェストもかまども、開いてからでないと中身が届かず操作もできない。
+	container *openContainer
 	controls  map[string]bool
 	entities  map[uint64]*entityInfo
 	unique    map[int64]uint64 // RemoveActor は unique ID で来る
@@ -473,9 +488,44 @@ func (s *session) handle(pk packet.Packet) {
 		s.world.setBlock(int32(v.Position[0]), int32(v.Position[1]), int32(v.Position[2]), name)
 		s.mu.Unlock()
 
+	case *packet.ContainerOpen:
+		s.mu.Lock()
+		s.container = &openContainer{
+			WindowID: byte(v.WindowID),
+			Type:     byte(v.ContainerType),
+			Pos:      v.ContainerPosition,
+			Slots:    map[int]protocol.ItemInstance{},
+		}
+		s.mu.Unlock()
+		emit(event{Event: "container_open", Data: map[string]any{
+			"windowId": v.WindowID,
+			"type":     v.ContainerType,
+			"position": []int32{v.ContainerPosition.X(), v.ContainerPosition.Y(), v.ContainerPosition.Z()},
+		}})
+
+	case *packet.ContainerClose:
+		s.mu.Lock()
+		if s.container != nil && s.container.WindowID == byte(v.WindowID) {
+			s.container = nil
+		}
+		s.mu.Unlock()
+		emit(event{Event: "container_close", Data: map[string]any{"windowId": v.WindowID}})
+
 	case *packet.InventoryContent:
 		// WindowID 0 がプレイヤー自身の持ち物。
+		// それ以外は開いているコンテナの中身。
 		if v.WindowID != 0 {
+			s.mu.Lock()
+			if s.container != nil && s.container.WindowID == byte(v.WindowID) {
+				clear(s.container.Slots)
+				for i, item := range v.Content {
+					if item.Stack.Count > 0 {
+						s.container.Slots[i] = item
+					}
+				}
+				s.container.Filled = true
+			}
+			s.mu.Unlock()
 			return
 		}
 		s.mu.Lock()
@@ -1265,6 +1315,109 @@ func (s *session) dispatch(c command) {
 			s.reply(c.ID, true, "", nil)
 		}
 
+	case "takeAll":
+		// コンテナを開いて中身を持ち物へ移し、閉じる。
+		//
+		// 開くところまでは activate と同じ ClickBlock。そこから先はサーバーが
+		// ContainerOpen を返し、続いて InventoryContent で中身が届く。
+		// 中身が届く前に動かそうとしても、こちらは何があるか知らない。
+		{
+			bx := int32(math.Floor(float64(c.X)))
+			by := int32(math.Floor(float64(c.Y)))
+			bz := int32(math.Floor(float64(c.Z)))
+			s.mu.Lock()
+			reach := s.pos.Sub(mgl32.Vec3{float32(bx) + 0.5, float32(by) + 0.5, float32(bz) + 0.5}).Len()
+			if reach > digReach {
+				s.mu.Unlock()
+				s.reply(c.ID, false, fmt.Sprintf("遠すぎて届きません（%.1f ブロック）", reach), nil)
+				return
+			}
+			face := faceToward(s.pos, bx, by, bz)
+			clicked, _ := s.world.runtimeIDAt(bx, by, bz)
+			held := s.rawSlots[int(s.heldSlot)]
+			s.container = nil
+			s.pendingPlace = &protocol.UseItemTransactionData{
+				ActionType:       protocol.UseItemActionClickBlock,
+				TriggerType:      protocol.TriggerTypePlayerInput,
+				BlockPosition:    protocol.BlockPos{bx, by, bz},
+				BlockFace:        face,
+				HotBarSlot:       s.heldSlot,
+				HeldItem:         held,
+				Position:         s.pos,
+				ClickedPosition:  clickOffset(face),
+				BlockRuntimeID:   uint32(clicked),
+				ClientPrediction: protocol.ClientPredictionSuccess,
+			}
+			s.lookAtLocked(float32(bx)+0.5, float32(by)+0.5, float32(bz)+0.5)
+			s.mu.Unlock()
+
+			// 中身が届くまで待つ。開くのは次のtickに載るので余裕を見る。
+			deadline := time.Now().Add(5 * time.Second)
+			var box *openContainer
+			for time.Now().Before(deadline) {
+				time.Sleep(100 * time.Millisecond)
+				s.mu.Lock()
+				if s.container != nil && s.container.Filled {
+					box = s.container
+					s.mu.Unlock()
+					break
+				}
+				s.mu.Unlock()
+			}
+			if box == nil {
+				s.reply(c.ID, false, "コンテナが開きませんでした", nil)
+				return
+			}
+
+			s.mu.Lock()
+			var actions []protocol.StackRequestAction
+			moved := 0
+			used := map[int]bool{}
+			for slot, item := range box.Slots {
+				dst := firstFreeSlotLocked(s, used)
+				if dst < 0 {
+					// 持ち物が満杯。入る分だけ移す。
+					break
+				}
+				used[dst] = true
+				take := &protocol.TakeStackRequestAction{}
+				take.Count = byte(min(item.Stack.Count, 64))
+				take.Source = protocol.StackRequestSlotInfo{
+					Container:      protocol.FullContainerName{ContainerID: containerIDFor(box.Type)},
+					Slot:           byte(slot),
+					StackNetworkID: item.StackNetworkID,
+				}
+				take.Destination = protocol.StackRequestSlotInfo{
+					Container:      protocol.FullContainerName{ContainerID: protocol.ContainerCombinedHotBarAndInventory},
+					Slot:           byte(dst),
+					StackNetworkID: 0,
+				}
+				actions = append(actions, take)
+				moved++
+			}
+			s.craftReqID -= 2
+			reqID := s.craftReqID
+			windowID := box.WindowID
+			s.mu.Unlock()
+
+			if len(actions) > 0 {
+				if err := s.conn.WritePacket(&packet.ItemStackRequest{
+					Requests: []protocol.ItemStackRequest{{RequestID: reqID, Actions: actions}},
+				}); err != nil {
+					s.reply(c.ID, false, fmt.Sprintf("移送に失敗: %v", err), nil)
+					return
+				}
+				time.Sleep(500 * time.Millisecond)
+			}
+
+			// 開けっ放しにすると次の操作が通らない。必ず閉じる。
+			_ = s.conn.WritePacket(&packet.ContainerClose{WindowID: windowID})
+			s.mu.Lock()
+			s.container = nil
+			s.mu.Unlock()
+			s.reply(c.ID, true, "", map[string]any{"moved": moved})
+		}
+
 	case "activate":
 		// ブロックを開く/使う（かまど・チェスト・ドア）。
 		// 送るものは設置と同じ ClickBlock のトランザクションで、サーバーが
@@ -1747,6 +1900,36 @@ func (s *session) lookAtLocked(x, y, z float32) {
 
 // faceToward はプレイヤーから見て手前になる面を返す。
 // 0=下 1=上 2=北(-Z) 3=南(+Z) 4=西(-X) 5=東(+X)
+// containerIDFor はコンテナの種類から、スロットを指すときの ContainerID を返す。
+// 種類ごとに枠の意味が違うので、どれも同じ ID で指すことはできない。
+func containerIDFor(containerType byte) byte {
+	switch containerType {
+	case byte(protocol.ContainerTypeFurnace),
+		byte(protocol.ContainerTypeBlastFurnace),
+		byte(protocol.ContainerTypeSmoker):
+		return protocol.ContainerFurnaceIngredient
+	default:
+		// チェスト・樽・シュルカーなど、素直な入れ物はこれで足りる。
+		return protocol.ContainerLevelEntity
+	}
+}
+
+// firstFreeSlotLocked は持ち物の空きスロットを1つ返す。無ければ -1。
+// used には同じ要求の中で既に行き先にしたスロットを渡す。1回の
+// ItemStackRequest では持ち物の写しが更新されないので、こちらで避ける。
+// 呼び出し側が mu を持つこと。
+func firstFreeSlotLocked(s *session, used map[int]bool) int {
+	for slot := 0; slot < 36; slot++ {
+		if used[slot] {
+			continue
+		}
+		if it, ok := s.rawSlots[slot]; !ok || it.Stack.Count == 0 {
+			return slot
+		}
+	}
+	return -1
+}
+
 func faceToward(from mgl32.Vec3, bx, by, bz int32) int32 {
 	dx := from[0] - (float32(bx) + 0.5)
 	dy := from[1] - (float32(by) + 0.5)

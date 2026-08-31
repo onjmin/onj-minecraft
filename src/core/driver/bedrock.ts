@@ -9,10 +9,9 @@
  * 通っているのは接続・状態・エンティティ・持ち物・移動・発言・ワールド読み取り・
  * 採掘・設置・クラフト・攻撃。本番 Realm で確認済み。
  *
- * 残っている未実装は次の2つ。いずれも notImplemented() で例外にする。
+ * 残っている未実装は精錬(smelt / canSmelt)だけ。notImplemented() で例外にする。
  * 黙って何もせず成功を装うと、スキル側が「やった」と誤解して先へ進むため。
  *   - smelt / canSmelt: 精錬
- *   - takeAllFromContainer: コンテナからの回収
  */
 import { BlockView } from "./blockview";
 import { BedrockSidecar } from "./sidecar";
@@ -692,8 +691,17 @@ export class BedrockDriver implements BotDriver {
 	async smelt(): Promise<void> {
 		notImplemented("精錬");
 	}
-	async takeAllFromContainer(_signal: AbortSignal, _position: Position): Promise<number> {
-		notImplemented("コンテナからの回収");
+	async takeAllFromContainer(_signal: AbortSignal, position: Position): Promise<number> {
+		// サイドカーが開く・移す・閉じるまでを一続きで行う。途中で放り出すと
+		// コンテナが開いたままになり、次の操作が通らなくなる。
+		const res = await this.sidecar.send(
+			"takeAll",
+			{ x: position.x, y: position.y, z: position.z },
+			20_000,
+		);
+		await sleep(300);
+		await this.refresh();
+		return Number((res as any)?.moved ?? 0);
 	}
 }
 
