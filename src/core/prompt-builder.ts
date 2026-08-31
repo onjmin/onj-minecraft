@@ -38,8 +38,11 @@ export interface ThinkingState {
 	}[];
 
 	chatHistory?: string[];
-	/** 直近に他プレイヤーから話しかけられているか。返答を優先させる判断に使う。 */
-	awaitingReply?: boolean;
+	/**
+	 * 人から受けた作業の依頼。返答そのものは conversation が担当するので、
+	 * ここでは「何を頼まれたか」だけを渡し、行動に落とさせる。
+	 */
+	pendingRequest?: string;
 
 	lastDamageCause?: DamageInfo;
 
@@ -170,19 +173,23 @@ ${state.memorySummary}
 }
 
 function buildChatSection(state: ThinkingState): string {
-	if (!state.chatHistory || state.chatHistory.length === 0) return "";
+	const lines: string[] = [];
 
-	const lines = ["=== RECENT CHAT ===", state.chatHistory.join("\n")];
+	if (state.chatHistory && state.chatHistory.length > 0) {
+		lines.push("=== RECENT CHAT ===", state.chatHistory.join("\n"));
+	}
 
-	// これは本来「次に何をするか」を決めるためのプロンプトなので、
-	// 明示しないと話しかけられていても行動計画を喋り続けてしまう。
-	if (state.awaitingReply) {
+	// 返答は別系統（conversation）が済ませている。ここでの仕事は
+	// 「頼まれたことを行動に変える」ことだけ。喋らせようとしない。
+	if (state.pendingRequest) {
+		if (lines.length > 0) lines.push("");
 		lines.push(
+			"=== PLAYER REQUEST (highest priority) ===",
+			state.pendingRequest,
 			"",
-			"A player is talking to YOU right now.",
-			"Answer them directly in the Chat field. Reply to what they actually said.",
-			"Do NOT narrate your current task instead of replying.",
-			"If they asked for something you cannot do, say so plainly.",
+			"The reply has already been sent by another system. Do NOT answer in words here.",
+			"Pick the skill that actually carries out this request.",
+			"If no available skill can do it, pick the closest useful skill and move on.",
 		);
 	}
 
@@ -193,9 +200,11 @@ function buildOutputFormatSection(state: ThinkingState): string {
 	// Chat だけは人間に読ませるものなので言語を指定できるようにする。
 	// Rationale などは内部用なので英語のままでよい。
 	const lang = state.profile.chatLanguage?.trim();
+	// 話しかけへの返答は conversation が担当するため、ここの Chat は
+	// 自発的な発言（ENABLE_CHAT=1 のとき）にしか使われない。
 	const chatLine = lang
-		? `Chat: (optional, message to send. Write it in ${lang}. Stay in character.)`
-		: "Chat: (optional, message to send)";
+		? `Chat: (optional, spontaneous remark. Write it in ${lang}. Stay in character. Leave empty unless you have something new to say.)`
+		: "Chat: (optional, spontaneous remark. Leave empty unless you have something new to say.)";
 
 	return `
 === OUTPUT FORMAT ===

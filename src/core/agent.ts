@@ -7,9 +7,10 @@ import { exploreLandSkill } from "../skills/exploring/land";
 import { gotoDeathPointSkill } from "../skills/goto/death";
 import { gotoSurfaceSkill } from "../skills/goto/surface";
 import type { SkillResponse } from "../skills/types";
+import { type ChatSituation, Conversation } from "./conversation";
 import { JavaDriver } from "./driver/java";
 import type { BotDriver, Position } from "./driver/types";
-import { llm } from "./llm-client";
+import { chatLlm, llm } from "./llm-client";
 import { parseLlmOutput } from "./llm-output-parser";
 import { createPerceptionSnapshot, type DamageInfo } from "./perception";
 import { buildThinkingPrompt } from "./prompt-builder";
@@ -82,8 +83,19 @@ const ARMOR_SUFFIXES = ["_helmet", "_chestplate", "_leggings", "_boots"];
 const SHELTER_HEALTH = Number(process.env.SHELTER_HEALTH ?? 8);
 /** 埋まっているかを見る高さ。屋根はこの範囲に収まる前提。 */
 const BURIED_SCAN_HEIGHT = 32;
+/** 頭上にこれだけ固いものが積まっていたら「埋まっている」と見なす。
+ *  木の葉や庇は1〜2枚なので、それでは発動しない厚さにする。 */
+const BURIED_THICKNESS = Number(process.env.BURIED_THICKNESS ?? 4);
 /** これだけ続けて一瞬で終わったら、乗り換えの猶予を外す。 */
 const SPIN_LIMIT = Number(process.env.SKILL_SPIN_LIMIT ?? 3);
+
+/**
+ * 人から受けた依頼を追いかける制限時間。
+ *
+ * 依頼は一度受けたら忘れないでほしいが、永久に残すと「もう終わった話」を
+ * 延々と追い続ける。会話の中で新しい依頼が来れば上書きされる。
+ */
+const REQUEST_TTL_MS = Number(process.env.CHAT_REQUEST_TTL_MS ?? 10 * 60_000);
 
 /** 攻撃してくる相手かどうか。名前で判断する。 */
 function isHostileMob(name: string): boolean {
@@ -130,12 +142,6 @@ type ObservationRecord = {
 	message: string;
 };
 
-type ChatLog = {
-	username: string;
-	message: string;
-	timestamp: number;
-};
-
 type StrategicState = {
 	strategies: string[]; // FIFO 3
 	achievements: string[]; // FIFO 3
@@ -169,8 +175,22 @@ export class MinecraftAgent {
 	private shouldStopSkill: boolean = false;
 	private combatTarget: any = null;
 
-	private chatHistory: ChatLog[] = [];
-	private maxChatHistory = 3;
+	/**
+	 * 会話の担当。返答は思考ループとは別経路で作る。
+	 * 詳しい理由は conversation.ts の冒頭に書いてある。
+	 */
+	private conversation: Conversation;
+	/** 返事を作っている最中か。二重に喋らせないための鍵。 */
+	private isReplying = false;
+	/** 返事を作っている間に届いた発言があるか。作り終えたら作り直す。 */
+	private replyAgain = false;
+	/**
+	 * 人から受けた作業の依頼。思考ループに渡して行動へ落とす。
+	 *
+	 * 会話履歴（直近3件）だけでは、少し喋っただけで依頼が押し出されて
+	 * 消える。「木を集めて」と言われたことを覚えておく場所が要る。
+	 */
+	private pendingRequest: { text: string; from: string; at: number } | null = null;
 	/** 他プレイヤーの発言を最後に受け取った時刻。0 は未受信。 */
 	private lastHeardAt = 0;
 	/** 連続失敗回数。待機時間を伸ばして暴走を防ぐのに使う。 */
@@ -255,6 +275,8 @@ export class MinecraftAgent {
 	constructor(profile: AgentProfile, skillList: any[], injectedDriver?: BotDriver) {
 		this.profile = profile;
 		this.skills = new Map(skillList.map((t) => [t.name, t]));
+		this.conversation = new Conversation(profile);
+		console.log(`[Chat] model=${chatLlm.modelName} endpoint=${chatLlm.endpoint}`);
 
 		if (injectedDriver) {
 			this.isJava = false;
@@ -372,17 +394,117 @@ export class MinecraftAgent {
 		const selfNames = [this.profile.minecraftName, this.driver.getState().username].filter(Boolean);
 		if (selfNames.includes(username)) return;
 
-		this.chatHistory.push({ username, message, timestamp: Date.now() });
-		if (this.chatHistory.length > this.maxChatHistory) {
-			this.chatHistory.shift();
-		}
+		this.conversation.record(username, message, false);
 		this.lastHeardAt = Date.now();
 		this.log(`<${username}> ${message}`);
 		appendChatLog("in", username, message);
+		// 返事は思考ループを待たずに、その場で作り始める。
+		void this.replyToChat();
 		// 人の話は次の判断まで30秒待たせない。指示なら尚更で、
 		// 待たせると「聞こえていない」ようにしか見えない。
 		this.humanRequestPending = true;
 		this.requestImmediateThink();
+	}
+
+	/**
+	 * 話しかけに返事をする。行動決定とは独立に動く。
+	 *
+	 * 作っている最中に次の発言が来たら、作り直す。古い発言への返事を
+	 * 出してから新しい方に答えるより、まとめて今の話に答える方がよい。
+	 */
+	private async replyToChat(): Promise<void> {
+		if (this.isReplying) {
+			this.replyAgain = true;
+			return;
+		}
+		this.isReplying = true;
+
+		try {
+			do {
+				this.replyAgain = false;
+				const heardAt = this.lastHeardAt;
+
+				let result: { reply: string; request: string | null };
+				try {
+					result = await this.conversation.respond(this.getChatSituation());
+				} catch (err) {
+					this.log(`Chat error: ${err}`);
+					return;
+				}
+
+				// 待っている間に次の発言が来ていたら、この返事は捨てて作り直す。
+				if (this.lastHeardAt !== heardAt) {
+					this.replyAgain = true;
+					continue;
+				}
+
+				if (result.request) {
+					this.pendingRequest = {
+						text: result.request,
+						from: this.conversation.lastFromOthers()?.speaker ?? "player",
+						at: Date.now(),
+					};
+					this.log(`依頼を受け取った: ${result.request}`);
+					// 依頼が固まった時点でもう一度起こす。行動に移すのを早める。
+					this.humanRequestPending = true;
+					this.requestImmediateThink();
+				}
+
+				if (!result.reply) {
+					this.log("(返事なしと判断した)");
+					continue;
+				}
+
+				this.driver.chat(result.reply);
+				this.conversation.record(this.profile.minecraftName, result.reply, true);
+				appendChatLog("out", this.profile.minecraftName, result.reply);
+				this.log(`-> ${result.reply}`);
+			} while (this.replyAgain);
+		} finally {
+			this.isReplying = false;
+		}
+	}
+
+	/** 返事を書くために渡す「今の状況」。嘘を言わせないための材料。 */
+	private getChatSituation(): ChatSituation {
+		const state = this.driver.getState();
+		const ready = state.isReady;
+		const inventory = this.driver.inventory
+			.items()
+			.map((i) => `${i.name} x${i.count}`)
+			.join(", ");
+
+		return {
+			position: ready ? state.position : undefined,
+			health: ready ? state.health : undefined,
+			hunger: ready ? state.food : undefined,
+			inventorySummary: inventory,
+			currentTask: this.currentTaskName,
+			recentResults: this.observationHistory
+				.slice(-3)
+				.map((h) => `${h.action}: ${h.result} (${h.message})`),
+			skillNames: Array.from(this.skills.keys()),
+			nearbyPlayers: ready ? this.nearbyPlayerNames() : [],
+		};
+	}
+
+	/** 近くにいる人の名前。分からないエディションでは空で返す。 */
+	private nearbyPlayerNames(): string[] {
+		try {
+			return createPerceptionSnapshot(this.driver, this.lastDamageCause).environment.nearbyPlayers;
+		} catch {
+			return [];
+		}
+	}
+
+	/** 依頼が新しいうちだけ返す。古い依頼を延々と追わせない。 */
+	private getPendingRequest(): string | null {
+		if (!this.pendingRequest) return null;
+		if (Date.now() - this.pendingRequest.at > REQUEST_TTL_MS) {
+			this.pendingRequest = null;
+			return null;
+		}
+		return `${this.pendingRequest.from} からの依頼: ${this.pendingRequest.text}`;
 	}
 
 	/** 思考ループの待ちを切り上げて、すぐ考え直させる。 */
@@ -390,11 +512,6 @@ export class MinecraftAgent {
 		const wake = this.wakeThinking;
 		this.wakeThinking = null;
 		if (wake) wake();
-	}
-
-	/** 直近に話しかけられているか。発言してよいかの判断に使う。 */
-	private wasSpokenToRecently(withinMs = 90_000): boolean {
-		return this.lastHeardAt > 0 && Date.now() - this.lastHeardAt < withinMs;
 	}
 
 	public startLoops(): void {
@@ -1076,9 +1193,9 @@ export class MinecraftAgent {
 
 		const heldItem = this.driver.inventory.heldItem()?.name ?? "bare_hands";
 
-		const chatLogContext =
-			this.chatHistory.map((c) => `<${c.username}> ${c.message}`).join("\n") ||
-			"No recent conversations.";
+		// 自分の発言も含めた履歴を渡す。何を約束したかが行動側にも要る。
+		const chatLogContext = this.conversation.lines().join("\n") || "No recent conversations.";
+		const pendingRequest = this.getPendingRequest() ?? undefined;
 
 		// Use perception module
 		const perception = createPerceptionSnapshot(this.driver, this.lastDamageCause);
@@ -1113,7 +1230,7 @@ export class MinecraftAgent {
 				bases: [],
 				skills: skillsContext,
 				chatHistory: [chatLogContext],
-				awaitingReply: this.wasSpokenToRecently(),
+				pendingRequest,
 				lastDamageCause: this.lastDamageCause,
 				memorySummary: historyText,
 			};
@@ -1172,7 +1289,7 @@ export class MinecraftAgent {
 			),
 			skills: skillsContext,
 			chatHistory: [chatLogContext],
-			awaitingReply: this.wasSpokenToRecently(),
+			pendingRequest,
 			lastDamageCause: this.lastDamageCause,
 			memorySummary: historyText,
 		};
@@ -1192,9 +1309,10 @@ export class MinecraftAgent {
 		}
 
 		// この判断で使い切る。次の周からは通常の猶予に戻す。
+		// 以降は this.humanRequestPending ではなくこの控えを見ること。
+		// ここで false に戻すので、後段で参照しても必ず偽になる。
 		const wasHumanRequest = this.humanRequestPending;
 		this.humanRequestPending = false;
-		void wasHumanRequest;
 
 		const rationale = result.memory || "No reasoning.";
 		const foundSkillName = result.action?.name;
@@ -1213,22 +1331,20 @@ export class MinecraftAgent {
 
 		this.log(`${foundSkillName ?? "no-skill"} ${rationale}`);
 
+		// 話しかけへの返答は conversation が担当する。ここで喋るのは
+		// ENABLE_CHAT=1 のときの自発的な発言（複数体で会話させる場合）だけ。
+		// 両方が喋ると、1つの問いかけに2回answerする。
 		const chatMessage = result.speak || "";
-		// 話しかけられているときは、似た返事でも返す。黙るより繰り返す方が
-		// ましで、実測で2つ目の質問に無反応になっていた。
-		const spokenTo = this.wasSpokenToRecently(30_000);
-		const isNewChat =
-			spokenTo || !isSameSimhash(chatMessage, this.profile.minecraftName, this.chatSimhashCache);
-		if (isNewChat && chatMessage && this.updateFIFO(this.strategicState.chats, chatMessage)) {
-			// 自分の計画を一方的に垂れ流すのはやめ、話しかけられたときの返答に限る。
-			// エージェントが1体だけの環境では独り言は誰にも届かず、
-			// 同居している他プレイヤーにとってはノイズにしかならないため。
-			// ENABLE_CHAT=1 にすると従来通り常に発言する（複数体で会話させる場合）。
-			if (process.env.ENABLE_CHAT === "1" || this.wasSpokenToRecently()) {
+		if (process.env.ENABLE_CHAT === "1" && chatMessage) {
+			const isNewChat = !isSameSimhash(
+				chatMessage,
+				this.profile.minecraftName,
+				this.chatSimhashCache,
+			);
+			if (isNewChat && this.updateFIFO(this.strategicState.chats, chatMessage)) {
 				this.driver.chat(chatMessage);
+				this.conversation.record(this.profile.minecraftName, chatMessage, true);
 				appendChatLog("out", this.profile.minecraftName, chatMessage);
-			} else {
-				this.log(`(独り言のため発言せず: ${chatMessage})`);
 			}
 		}
 
@@ -1260,7 +1376,7 @@ export class MinecraftAgent {
 			const spinning = this.instantRepeats >= SPIN_LIMIT;
 			const tooEarlyToSwitch =
 				!isSameTask &&
-				!this.humanRequestPending &&
+				!wasHumanRequest &&
 				!spinning &&
 				this.currentTaskSince > 0 &&
 				owningMs < MIN_UNINTERRUPTED_MS;
@@ -1819,17 +1935,17 @@ export class MinecraftAgent {
 			y: Math.floor(state.position.y),
 			z: Math.floor(state.position.z),
 		};
-		// 頭上に空気以外があれば屋根の下。goto.surface と同じ見方をする。
-		let buried = false;
+		// 頭上に固いものが「何枚あるか」で見る。1枚あるだけで埋まっている
+		// ことにすると、木の下や庇の下でも発動する。実測で goto.surface が
+		// 「もう地上にいる」と即答するのに、この判定だけ埋まっていると言い、
+		// 10分に54回そのスキルを掴まされていた。
+		let solidAbove = 0;
 		for (let y = foot.y + 2; y <= foot.y + 2 + BURIED_SCAN_HEIGHT; y++) {
 			const above = this.driver.world.blockAt({ x: foot.x, y, z: foot.z });
 			if (above === null) break;
-			if (above.name !== "air") {
-				buried = true;
-				break;
-			}
+			if (above.name !== "air") solidAbove++;
 		}
-		if (!buried) return;
+		if (solidAbove < BURIED_THICKNESS) return;
 
 		this.log("[反射] 地下に埋まっている。地上へ戻る");
 		this.currentTaskName = gotoSurfaceSkill.name;

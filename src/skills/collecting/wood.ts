@@ -21,6 +21,8 @@ function isQuadTree(saplingName: string): boolean {
 const FELL_BUDGET_MS = Number(process.env.WOOD_FELL_BUDGET_MS ?? 40_000);
 /** 何ブロック掘るごとに落下物を拾うか。 */
 const PICKUP_EVERY = 5;
+/** 1回の伐採で壊してよい葉の数。通り道を空けるぶんだけ。 */
+const MAX_LEAVES = Number(process.env.WOOD_MAX_LEAVES ?? 6);
 /** 木が見つからないときに移動して探し直す回数。 */
 const SEARCH_HOPS = Number(process.env.WOOD_SEARCH_HOPS ?? 6);
 /** 1回の移動距離。読み込み済みの地形の外へ出る程度。 */
@@ -124,6 +126,7 @@ export const collectWoodSkill = createSkill<void, { felledCount: number; planted
 				// 上限が無いと、3x3x7の範囲(最大63ブロック)を掘り終わるまで
 				// 戻らず、思考ループから見れば永久に終わらない行動になる。
 				const deadline = Date.now() + FELL_BUDGET_MS;
+				let leavesBroken = 0;
 				// 成果は壊した数ではなく増えた持ち物で測る。葉は掘っても
 				// ほとんど何も落とさないので、壊した数だと嘘になる。
 				gainedBefore = snapshotInventory(driver);
@@ -135,6 +138,14 @@ export const collectWoodSkill = createSkill<void, { felledCount: number; planted
 					}
 					const block = driver.world.blockAt(pos);
 					if (block && block.name !== "air" && block.diggable) {
+						// 葉は通り道を空けるためだけに壊す。原木と違って
+						// ほとんど何も落とさないのに、1枚ずつ時間を食う。
+						// 実測で原木7本に対して葉38枚を壊し、予算を葉で
+						// 使い切っていた。
+						if (isLeaves(block.name)) {
+							if (leavesBroken >= MAX_LEAVES) continue;
+							leavesBroken++;
+						}
 						await driver.equipBestTool(pos);
 						try {
 							await driver.dig(signal, pos);
