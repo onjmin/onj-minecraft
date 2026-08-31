@@ -189,6 +189,8 @@ type session struct {
 	// 逃げ始めた tick と、逃げ終えた tick。走りっぱなしを防ぐ。
 	fleeSince uint64
 	fleeUntil uint64
+	// 今サーバーにいる人。UUID -> 表示名。人数制限の判断に使う。
+	online map[string]string
 	// 最後に damage を受けた時刻。撃たれているときは遠くの敵にも反応する。
 	lastHurt time.Time
 	// 殴ってきたプレイヤー。相手にせず逃げるためだけに覚える。
@@ -282,6 +284,7 @@ func newSession(conn *minecraft.Conn, game minecraft.GameData) *session {
 		world:       newWorld(),
 		unique:      map[int64]uint64{},
 		recipes:     map[string][]craftRecipe{},
+		online:      map[string]string{},
 		craftReqID:  1, // 最初の -2 で -1 になる
 		craftWaiter: map[int32]int{},
 		craftEffect: map[int32]craftOutcome{},
@@ -481,6 +484,31 @@ func (s *session) handle(pk packet.Packet) {
 			}
 		}
 		s.mu.Unlock()
+
+	case *packet.PlayerList:
+		// 誰が今いるかの一覧。Realms は10人までなので、混んできたら
+		// ボットは自分から抜ける必要がある。近くのエンティティを数えても
+		// 離れた人は見えないので、この一覧でないと人数が分からない。
+		// 追加か削除かはエントリごとに付いている。
+		s.mu.Lock()
+		for _, e := range v.Entries {
+			if e.ActionType == protocol.PlayerListActionAdd {
+				if e.Username != "" {
+					s.online[e.UUID.String()] = e.Username
+				}
+				continue
+			}
+			delete(s.online, e.UUID.String())
+		}
+		names := make([]string, 0, len(s.online))
+		for _, n := range s.online {
+			names = append(names, n)
+		}
+		s.mu.Unlock()
+		emit(event{Event: "players", Data: map[string]any{
+			"count": len(names),
+			"names": names,
+		}})
 
 	case *packet.AddPlayer:
 		s.mu.Lock()

@@ -99,6 +99,13 @@ export interface InventoryReader {
 	items(): ItemInfo[];
 	heldItem(): ItemInfo | null;
 	emptySlotCount(): number;
+	/**
+	 * 今着ている防具（頭・胴・脚・足の順、空きは null）。
+	 *
+	 * items() には出てこない。どちらのエディションでも防具は持ち物とは別の
+	 * 入れ物にあるため、items() だけを見ると「フル装備なのに丸腰」と判定する。
+	 */
+	armor(): (ItemInfo | null)[];
 }
 
 /** ブロック名・アイテム名の存在確認。Java版の bot.registry 相当。 */
@@ -213,6 +220,8 @@ export interface BotDriver {
 			| "attacked_by_player"
 			// プレイヤーに倒された。キルログから加害者名が分かる
 			| "killed_by_player"
+			// サーバーにいる人の一覧が変わった
+			| "players"
 			| "kicked"
 			| "end",
 		listener: (...args: any[]) => void,

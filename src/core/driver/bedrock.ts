@@ -194,6 +194,9 @@ export class BedrockDriver implements BotDriver {
 	private systemListeners: ((message: string) => void)[] = [];
 	/** 自分を倒したプレイヤーの名前の受け手。 */
 	private attackerListeners: ((name: string) => void)[] = [];
+	/** 今サーバーにいる人の名前。 */
+	private online: string[] = [];
+	private playersListeners: ((names: string[]) => void)[] = [];
 	private endListeners: ((reason: string) => void)[] = [];
 	public disconnectReason: string | null = null;
 
@@ -286,6 +289,12 @@ export class BedrockDriver implements BotDriver {
 	async connect(): Promise<void> {
 		this.sidecar.on("spawn", (d: any) => {
 			if (d?.position) this.state.position = toPos(d.position);
+		});
+		// サーバーにいる人数。Realms は10人までなので、混んできたら
+		// ボットは席を譲る必要がある。
+		this.sidecar.on("players", (d: any) => {
+			this.online = Array.isArray(d?.names) ? d.names.map(String) : [];
+			for (const l of this.playersListeners) l(this.online);
 		});
 		this.sidecar.on("chat", (d: any) => {
 			// 自分の発言もサーバーから返ってくる。自問自答させない。
@@ -473,6 +482,7 @@ export class BedrockDriver implements BotDriver {
 		if (event === "chat") this.chatListeners.push(listener as any);
 		else if (event === "system") this.systemListeners.push(listener as any);
 		else if (event === "killed_by_player") this.attackerListeners.push(listener as any);
+		else if (event === "players") this.playersListeners.push(listener as any);
 		else if (event === "end" || event === "kicked") this.endListeners.push(listener as any);
 		// spawn/death/health は現状 workflow 側で使っていないので受けるだけにしない。
 		else this.sidecar.on(event, listener as any);
@@ -693,6 +703,11 @@ export class BedrockDriver implements BotDriver {
 		await sleep(400);
 		await this.refreshBlocks(true);
 	}
+	/** 今サーバーにいる人の名前。自分も含む。 */
+	onlinePlayers(): string[] {
+		return [...this.online];
+	}
+
 	async pillarUp(_signal: AbortSignal, count: number): Promise<number> {
 		const res = await this.sidecar.send("pillar", { count }, 30_000);
 		await this.refresh();

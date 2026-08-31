@@ -11,7 +11,9 @@
  * 発言・ワールド読み取り・採掘・設置・クラフト・攻撃まで通っている。
  */
 import { MinecraftAgent } from "../core/agent";
+import { isLeaveRequest, shouldYieldSeat } from "./bedrock-session";
 import { BedrockDriver } from "../core/driver/bedrock";
+import { envNum } from "../core/utils/env";
 import { kusabot } from "../profiles/kusabot";
 import { buildingBaseSkill } from "../skills/building/base";
 import { collectDirtSkill } from "../skills/collecting/dirt";
@@ -56,6 +58,9 @@ const bedrockSkills = [
 	buildingBaseSkill,
 ];
 
+/** 席を譲って抜けたときの終了コード。呼び出し側が再入場の判断に使う。 */
+const EXIT_YIELDED = 3;
+
 async function main() {
 	const invite = process.env.REALM_INVITE;
 	if (!invite) throw new Error("REALM_INVITE を指定してください");
@@ -78,6 +83,38 @@ async function main() {
 	// 統合版は接続完了のタイミングを呼び出し側が握っているので明示的に起動する
 	agent.startLoops();
 
+	// Realms は10人まで。ボットが1枠を占め続けると人が入れなくなるので、
+	// 混んできたら自分から抜けて、空いたころに戻る。
+	let yielding = false;
+	const yieldSeat = async (why: string) => {
+		if (yielding) return;
+		yielding = true;
+		console.log(`[bedrock] ${why}。席を譲って抜けます`);
+		try {
+			await driver.chat("混んできたので抜けるね。また来る");
+		} catch {
+			// 言えなくても抜ける方が大事。
+		}
+		agent.cancelAllTasks();
+		await driver.disconnect();
+		// 抜けたあとは、この工程を終える。戻るのは呼び出し側の仕事。
+		process.exit(EXIT_YIELDED);
+	};
+
+	driver.on("players", (names: string[]) => {
+		const self = driver.getState().username;
+		if (shouldYieldSeat(driver, self)) {
+			void yieldSeat(`${names.length}人になった`);
+		}
+	});
+
+	// 「抜けて」と言われたら、次の思考を待たずに抜ける。
+	driver.on("chat", (from: string, message: string) => {
+		if (isLeaveRequest(message)) {
+			void yieldSeat(`${from} に退出を頼まれた`);
+		}
+	});
+
 	// 切断に気づかず空回りし続けるのを防ぐ。
 	// BedrockX は接続断を必ずしもイベントで教えてくれないため、
 	// Driver 側の無通信監視も含めてここで受ける。
@@ -99,7 +136,7 @@ async function main() {
 	process.on("SIGTERM", shutdown);
 
 	// 実行時間の上限。未指定なら回し続ける。
-	const limit = Number(process.env.RUN_SECONDS ?? 0);
+	const limit = envNum("RUN_SECONDS", 0);
 	if (limit > 0) {
 		setTimeout(shutdown, limit * 1000);
 	}

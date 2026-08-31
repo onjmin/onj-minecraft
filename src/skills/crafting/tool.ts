@@ -31,7 +31,8 @@ export const craftToolSkill = createSkill<void, { item: string; material: string
 		}
 
 		// 板材を事前に確保（木ツールの場合は3枚必要）
-		await ensurePlanks(agent, 3);
+		// 道具に3枚、作業台に4枚。まとめて確保する。
+		await ensurePlanks(agent, 7);
 
 		// 1. 次に作るべきツールと素材を判定
 		const target = craftingManager.determineNextSkill(driver);

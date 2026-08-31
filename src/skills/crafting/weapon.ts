@@ -29,7 +29,10 @@ export const craftWeaponSkill = createSkill<void, { item: string; material: stri
 		}
 
 		// 板材を事前に確保（木武器の場合は2枚以上必要）
-		await ensurePlanks(agent, 2);
+		// 剣に2枚、作業台に4枚。まとめて確保する。剣のぶんだけ用意すると、
+		// この直後の ensureCraftingTable が板不足で止まる。実測で
+		// crafting.weapon が28回選ばれて、剣の要求が0回だった。
+		await ensurePlanks(agent, 6);
 
 		// 1. 次に作るべき装備を判定
 		const target = craftingManager.determineNextWeapon(agent);
