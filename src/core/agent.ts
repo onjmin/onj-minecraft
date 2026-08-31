@@ -1716,156 +1716,13 @@ export class MinecraftAgent {
 	 */
 	private async reflexSurvival(signal: AbortSignal): Promise<void> {
 		try {
-			// 溺死が実測で一番多い死因だった。敵より先に見る。
-			await this.escapeLiquid(signal);
 			await this.recoverDeathLootIfAlive();
 			await this.wearBestArmor();
 			if (await this.shelterAtNight(signal)) return;
-			await this.reactToDanger(signal);
 			await this.escapeIfBoxedIn(signal);
 		} catch (e) {
 			// 反射行動で本来の行動を止めない。
 			if (!signal.aborted) this.log(`反射行動でつまずいた: ${e}`);
-		}
-	}
-
-	/**
-	 * 敵が近い、または体力が減っているときの反応。
-	 *
-	 * 統合版には戦闘の処理が無かった。Java版は mineflayer の pvp と
-	 * bot.on("health") に任せており、そのどちらも統合版には無い。
-	 * 結果としてボットは殴られても何もせず、黙って死んで持ち物を全部落として
-	 * いた。集めた物が毎回消えるので、何を積んでも残らない。
-	 */
-	private async reactToDanger(signal: AbortSignal): Promise<void> {
-		const state = this.driver.getState();
-		const hostiles = this.driver
-			.nearbyEntities(16)
-			.filter((e) => isHostileMob(e.name))
-			.sort(
-				(a, b) => distanceTo(state.position, a.position) - distanceTo(state.position, b.position),
-			);
-		if (hostiles.length === 0) return;
-
-		const nearest = hostiles[0];
-		const range = distanceTo(state.position, nearest.position);
-		// クリーパーは殴る間合いが自爆の間合い。近づかない。
-		const mustFlee =
-			state.health <= FLEE_HEALTH || nearest.name.includes("creeper") || !this.hasWeapon();
-
-		if (mustFlee) {
-			if (range > 8) return;
-			this.log(`[反射] ${nearest.name} から離れる（HP ${state.health}、距離 ${range.toFixed(1)}）`);
-			// 敵と反対の方向へ。届かなくても離れられればよい。
-			const dx = state.position.x - nearest.position.x;
-			const dz = state.position.z - nearest.position.z;
-			const len = Math.hypot(dx, dz) || 1;
-			try {
-				await this.driver.goto(signal, {
-					kind: "xz",
-					x: state.position.x + (dx / len) * 12,
-					z: state.position.z + (dz / len) * 12,
-					distance: 3,
-				});
-			} catch {
-				// 逃げ切れなくても、動いただけ距離は稼げている。
-			}
-
-			// 逃げても振り切れず、体力も残り少ないなら潜る。
-			// 走って逃げるだけでは追いつかれる。地面に潜って頭上を塞げば、
-			// 大抵の敵は届かない。装備が無いうちはこれが一番確実。
-			const after = this.driver.getState();
-			const stillNear = this.driver.nearbyEntities(6).some((e) => isHostileMob(e.name));
-			if (stillNear && after.health <= FLEE_HEALTH) {
-				await this.burrow(signal);
-			}
-			return;
-		}
-
-		if (range > 3.5) return;
-		this.log(`[反射] ${nearest.name} を攻撃する（距離 ${range.toFixed(1)}）`);
-		for (let i = 0; i < ATTACK_SWINGS; i++) {
-			if (signal.aborted) return;
-			try {
-				await this.driver.attack(signal, nearest.id);
-			} catch {
-				return;
-			}
-			await new Promise((r) => setTimeout(r, 600));
-		}
-	}
-
-	/**
-	 * 夜、丸腰なら潜ってやり過ごす。
-	 *
-	 * 8分で13回死に、大半が death.attack.mob だった。復帰しては即座に殺され、
-	 * 集めた物も作った道具もその都度消える。武器も防具も無いうちに夜の地上を
-	 * 歩き回るのは、進むどころか積み上げたものを失う行為でしかない。
-	 *
-	 * 戻り値が true なら、この周の他の反射は行わない。
-	 */
-	private async shelterAtNight(signal: AbortSignal): Promise<boolean> {
-		const state = this.driver.getState();
-		// 統合版の時刻はサイドカーが SetTime から拾っている。
-		const night = state.timeOfDay >= 13000 && state.timeOfDay <= 23000;
-		if (!night) return false;
-
-		const armed = this.hasWeapon();
-		const armored = this.driver.inventory
-			.items()
-			.some((i) => ARMOR_SUFFIXES.some((suf) => i.name.endsWith(suf)));
-		if (armed || armored) return false;
-
-		// 既に囲まれている(＝潜れている)なら、そのまま待つ。
-		const pos = state.position;
-		const foot = { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) };
-		const above = this.driver.world.blockAt({ ...foot, y: foot.y + 2 });
-		if (above && above.name !== "air") return true;
-
-		this.log("[反射] 夜で丸腰。潜ってやり過ごす");
-		await this.burrow(signal);
-		return true;
-	}
-
-	/**
-	 * 水や溶岩から出る。
-	 *
-	 * 本番で8分回して4回死に、うち3回が溺死だった。敵に殺されるより多い。
-	 * Java版は ensureOnLand が水から出してくれるが、あれは mineflayer の
-	 * ブロック読み取りに直接触るため統合版では素通りしていた。
-	 */
-	private async escapeLiquid(signal: AbortSignal): Promise<void> {
-		const { driver } = this;
-		const pos = driver.getState().position;
-		const foot = { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) };
-		const at = driver.world.blockAt(foot)?.name ?? "";
-		const head = driver.world.blockAt({ ...foot, y: foot.y + 1 })?.name ?? "";
-		const inLiquid = (n: string) => n === "water" || n === "lava" || n === "flowing_water";
-		if (!inLiquid(at) && !inLiquid(head)) return;
-
-		this.log(`[反射] ${at || head} から出る`);
-
-		// 近くで立てて、液体に浸かっていない場所を探す。
-		for (let r = 1; r <= 12; r++) {
-			for (let dx = -r; dx <= r; dx++) {
-				for (let dz = -r; dz <= r; dz++) {
-					if (Math.max(Math.abs(dx), Math.abs(dz)) !== r) continue;
-					for (let dy = -1; dy <= 3; dy++) {
-						const cand = { x: foot.x + dx, y: foot.y + dy, z: foot.z + dz };
-						const here = driver.world.blockAt(cand)?.name;
-						const above = driver.world.blockAt({ ...cand, y: cand.y + 1 })?.name;
-						const below = driver.world.blockAt({ ...cand, y: cand.y - 1 })?.name;
-						if (here !== "air" || above !== "air") continue;
-						if (!below || below === "air" || inLiquid(below)) continue;
-						try {
-							await driver.goto(signal, { kind: "near", position: cand, distance: 1.5 });
-							return;
-						} catch {
-							// この足場は駄目。次を試す。
-						}
-					}
-				}
-			}
 		}
 	}
 
@@ -1884,6 +1741,41 @@ export class MinecraftAgent {
 		this.currentTaskName = gotoDeathPointSkill.name;
 		this.currentTaskSince = Date.now();
 		this.instantRepeats = 0;
+	}
+
+	/**
+	 * 夜、丸腰なら潜ってやり過ごす。
+	 *
+	 * 8分で13回死に、大半が death.attack.mob だった。復帰しては即座に殺され、
+	 * 集めた物も作った道具もその都度消える。武器も防具も無いうちに夜の地上を
+	 * 歩き回るのは、進むどころか積み上げたものを失う行為でしかない。
+	 *
+	 * 逃走と反撃はサイドカーが毎tick行うが、あれは目の前の敵をしのぐだけで、
+	 * 夜通し追われ続ける状況は変えられない。こちらは「そもそも出歩かない」
+	 * 判断で、頻度も低いのでこの層でよい。
+	 *
+	 * 戻り値が true なら、この周の他の反射は行わない。
+	 */
+	private async shelterAtNight(signal: AbortSignal): Promise<boolean> {
+		const state = this.driver.getState();
+		const night = state.timeOfDay >= 13000 && state.timeOfDay <= 23000;
+		if (!night) return false;
+
+		const armed = this.hasWeapon();
+		const armored = this.driver.inventory
+			.items()
+			.some((i) => ARMOR_SUFFIXES.some((suf) => i.name.endsWith(suf)));
+		if (armed || armored) return false;
+
+		// 既に囲まれている(＝潜れている)なら、そのまま待つ。
+		const pos = state.position;
+		const foot = { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) };
+		const above = this.driver.world.blockAt({ ...foot, y: foot.y + 2 });
+		if (above && above.name !== "air") return true;
+
+		this.log("[反射] 夜で丸腰。潜ってやり過ごす");
+		await this.burrow(signal);
+		return true;
 	}
 
 	/**

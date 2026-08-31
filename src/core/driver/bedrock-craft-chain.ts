@@ -186,6 +186,81 @@ async function main() {
 		step("作業台が用意できた", false, "置けず、近くにも無い");
 	}
 
+	// 6. ツルハシで石を掘り、かまどを作って精錬まで通す。
+	//    ここが通れば「木しか無い」状態から鉄まで手が届く。
+	if (count("wooden_pickaxe") > 0 || count("stone_pickaxe") > 0) {
+		const stones = driver.world.findBlocksMatching(
+			(n) => n === "stone" || n === "cobblestone" || n === "deepslate",
+			8,
+			10,
+		);
+		for (const b of stones) {
+			if (count("cobblestone") >= 8) break;
+			try {
+				await driver.equipBestTool(b.position);
+				await driver.dig(new AbortController().signal, b.position);
+				await driver.pickupNearbyItems(new AbortController().signal);
+			} catch {
+				// 届かない石は飛ばす。
+			}
+		}
+		step("丸石を8個そろえる", count("cobblestone") >= 8, `${count("cobblestone")}個`);
+		show();
+	}
+
+	if (count("furnace") === 0 && count("cobblestone") >= 8 && tablePos) {
+		try {
+			await driver.craft("furnace", 1, tablePos);
+			await sleep(800);
+			step("かまどを作れる", count("furnace") > 0);
+		} catch (e) {
+			step("かまどを作れる", false, String(e));
+		}
+		show();
+	}
+
+	if (count("furnace") > 0) {
+		const st2 = driver.getState();
+		const ref = {
+			x: Math.floor(st2.position.x) - 1,
+			y: Math.floor(st2.position.y) - 1,
+			z: Math.floor(st2.position.z),
+		};
+		let furnacePos: { x: number; y: number; z: number } | null = null;
+		if (driver.world.blockAt(ref)?.solid) {
+			try {
+				await driver.equip("furnace", "hand");
+				await driver.placeBlock(new AbortController().signal, ref, { x: 0, y: 1, z: 0 });
+				await sleep(800);
+				const placed = driver.world.blockAt({ ...ref, y: ref.y + 1 });
+				furnacePos = placed?.name === "furnace" ? { ...ref, y: ref.y + 1 } : null;
+				step("かまどを置ける", furnacePos !== null, placed?.name ?? "不明");
+			} catch (e) {
+				step("かまどを置ける", false, String(e));
+			}
+		}
+		if (furnacePos) {
+			const fuel = driver.inventory
+				.items()
+				.find((i) => i.name.endsWith("_planks") || i.name.endsWith("_log") || i.name === "coal");
+			if (!fuel || count("cobblestone") === 0) {
+				step(
+					"精錬の材料がある",
+					false,
+					`燃料 ${fuel?.name ?? "なし"} / 丸石 ${count("cobblestone")}`,
+				);
+			} else {
+				try {
+					await driver.smelt(furnacePos, "cobblestone", 1, fuel.name, 1);
+					step("かまどに投入できる", true, `${fuel.name} で丸石を焼く`);
+				} catch (e) {
+					step("かまどに投入できる", false, String(e));
+				}
+				show();
+			}
+		}
+	}
+
 	await driver.disconnect();
 	console.log(failures === 0 ? "\n連鎖は最後まで通りました" : `\n${failures}件で止まりました`);
 	process.exit(failures === 0 ? 0 : 1);

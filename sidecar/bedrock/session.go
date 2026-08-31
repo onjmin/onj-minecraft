@@ -59,6 +59,26 @@ const eyeHeight = float32(1.62)
 // 攻撃が届く距離。バニラのプレイヤーは3ブロックほど。
 const attackReach = float32(3.5)
 
+// 敵に反応し始める距離。
+//
+// 広すぎると、敵が視界にいる限り逃げ続けて何もできない。実測で 10 にしたとき、
+// 8分の試運転で死亡が 3回から 28回に増えた。逃げっぱなしで別の敵に突っ込み、
+// 潜って隠れることもできなくなる。実際に届く間合いの少し外にとどめる。
+const defendRange = float32(5)
+
+// 一度に逃げ続ける上限(tick)。これを過ぎたら本来の行動へ戻す。
+// 戻ってまだ危なければまた逃げる。走りっぱなしにしないための区切り。
+const fleeMaxTicks = uint64(60)
+
+// 逃げたあと、次に逃げるまで置く間隔(tick)。
+const fleeCooldownTicks = uint64(60)
+
+// これを下回ったら戦わずに逃げる。
+const defendFleeHealth = float32(10)
+
+// 攻撃の間隔(tick)。バニラの剣は概ね0.6秒。
+const attackIntervalTicks = uint64(12)
+
 // 採掘が届く距離。サバイバルは概ね5ブロック。少し余裕を持たせる。
 const digReach = float32(6)
 
@@ -145,6 +165,11 @@ type session struct {
 	// ワールドの総経過tick。SetTime はゲーム内時刻ではなく累計を送ってくるので、
 	// 昼夜の判定に使うには 24000 で割った余りを取る必要がある。
 	worldTick int32
+	// 最後に殴った tick。連打を防ぐ。0 なら戦っていない。
+	fighting uint64
+	// 逃げ始めた tick と、逃げ終えた tick。走りっぱなしを防ぐ。
+	fleeSince uint64
+	fleeUntil uint64
 	// 今開いているコンテナ。開いていなければ nil。
 	// チェストもかまども、開いてからでないと中身が届かず操作もできない。
 	container *openContainer
@@ -785,7 +810,12 @@ func (s *session) buildInput(n uint64) *packet.PlayerAuthInput {
 	move := mgl32.Vec2{}
 	delta := mgl32.Vec3{}
 
-	s.steerLocked(n)
+	// 危険への反応は目標より先。逃げるか殴るかは毎tick決める。
+	// スキルの合間に見るのでは間に合わない。Java版が mineflayer-pvp に
+	// 任せていたのと同じ層をここに置く。
+	if !s.defendLocked(n) {
+		s.steerLocked(n)
+	}
 
 	if s.controls["forward"] {
 		flags.Set(packet.InputFlagUp)
@@ -803,9 +833,21 @@ func (s *session) buildInput(n uint64) *packet.PlayerAuthInput {
 		flags.Set(packet.InputFlagRight)
 		move[0] += 1
 	}
-	if s.controls["jump"] {
+	// 水に浸かっている間は跳び続ける。実プレイヤーは水中でジャンプを押し
+	// っぱなしにして水面に浮き、呼吸を確保している。ボットはそれをしないので
+	// 沈んだまま溺れる。実測で死因の筆頭が death.attack.drown だった。
+	//
+	// スキルの合間に見るのでは遅い。息が続くのは十数秒で、その間に何度も
+	// 判断が挟まる保証が無い。毎tickここで見る。
+	swimming := s.inLiquidLocked()
+	if s.controls["jump"] || swimming {
 		flags.Set(packet.InputFlagJumping)
 		flags.Set(packet.InputFlagStartJumping)
+	}
+	if swimming {
+		// 水中は地面を蹴らないので上の跳躍計算に乗らない。浮き上がるぶんを
+		// ここで足す。バニラの水中上昇はおよそ 0.04/tick。
+		s.pos[1] += 0.04
 	}
 	if s.controls["sneak"] {
 		flags.Set(packet.InputFlagSneaking)
@@ -998,6 +1040,131 @@ func (s *session) steerLocked(n uint64) {
 		g.lastPos = s.pos
 	}
 	s.controls["jump"] = stepUp || g.stalledTicks >= 2
+}
+
+// defendLocked は敵が近いときの反応。処理したなら true を返し、
+// その tick は通常の移動を行わない。
+//
+// 逃げるか殴るかはここで決める。判断を上位へ投げると、スキルの切れ目まで
+// 何も起きない。息継ぎと同じで、間に合わなければ意味が無い。
+// 呼び出し側が mu を持つこと。
+func (s *session) defendLocked(n uint64) bool {
+	feet := s.feetLocked()
+	var target *entityInfo
+	best := float32(defendRange)
+	for _, e := range s.entities {
+		if !hostileName(e.Name) {
+			continue
+		}
+		d := e.Pos.Sub(feet).Len()
+		if d < best {
+			best = d
+			target = e
+		}
+	}
+	if target == nil {
+		s.fighting = 0
+		s.fleeSince = 0
+		return false
+	}
+
+	// 逃げる条件。体力が減っている、武器が無い、相手がクリーパー。
+	// クリーパーを殴る間合いは自爆の間合いなので近づかない。
+	flee := s.health <= defendFleeHealth ||
+		!s.hasWeaponLocked() ||
+		strings.Contains(target.Name, "creeper")
+
+	dx := target.Pos[0] - s.pos[0]
+	dz := target.Pos[2] - s.pos[2]
+	if flee {
+		// 既に潜って蓋をしているなら、走り出さない。せっかくの隠れ場所から
+		// 出ていくことになる。
+		fx := int32(math.Floor(float64(feet[0])))
+		fy := int32(math.Floor(float64(feet[1])))
+		fz := int32(math.Floor(float64(feet[2])))
+		if name, ok := s.world.blockAt(fx, fy+2, fz); ok && name != "air" {
+			s.fighting = 0
+			return false
+		}
+		// 逃げるのは一定時間まで。過ぎたら本来の行動へ戻し、まだ危なければ
+		// 間隔を置いてまた逃げる。走りっぱなしだと何も進まない。
+		if s.fleeSince == 0 {
+			if n < s.fleeUntil+fleeCooldownTicks {
+				return false
+			}
+			s.fleeSince = n
+		}
+		if n-s.fleeSince > fleeMaxTicks {
+			s.fleeSince = 0
+			s.fleeUntil = n
+			s.controls["sprint"] = false
+			return false
+		}
+		// 背を向けて走る。向きは逃げる方向に合わせる。
+		s.yaw = float32(math.Atan2(float64(dx), float64(-dz)) * 180 / math.Pi)
+		s.controls["forward"] = true
+		s.controls["sprint"] = true
+		s.controls["jump"] = false
+		s.fighting = 0
+		return true
+	}
+	s.fleeSince = 0
+
+	// 殴る。間合いの外なら詰める。
+	s.lookAtLocked(target.Pos[0], target.Pos[1], target.Pos[2])
+	if best > attackReach {
+		s.controls["forward"] = true
+		s.controls["sprint"] = false
+		return true
+	}
+	s.controls["forward"] = false
+	s.controls["sprint"] = false
+	// 振る間隔。連打してもサーバーに弾かれるだけ。
+	if n-s.fighting >= attackIntervalTicks || s.fighting == 0 {
+		s.fighting = n
+		_ = s.conn.WritePacket(&packet.InventoryTransaction{
+			TransactionData: &protocol.UseItemOnEntityTransactionData{
+				TargetEntityRuntimeID: target.RuntimeID,
+				ActionType:            protocol.UseItemOnEntityActionAttack,
+				HotBarSlot:            s.heldSlot,
+				HeldItem:              s.rawSlots[int(s.heldSlot)],
+				Position:              s.pos,
+			},
+		})
+	}
+	return true
+}
+
+// hasWeaponLocked はホットバーに殴れる物があるか。
+// 素手で向かうのは逃げるより悪い。
+func (s *session) hasWeaponLocked() bool {
+	for slot := 0; slot <= 8; slot++ {
+		it, ok := s.rawSlots[slot]
+		if !ok || it.Stack.Count == 0 {
+			continue
+		}
+		if name, ok := s.itemNames[it.Stack.ItemType.NetworkID]; ok {
+			if strings.HasSuffix(name, "_sword") || strings.HasSuffix(name, "_axe") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hostileName は襲ってくる相手か。名前で判断する。
+func hostileName(name string) bool {
+	for _, h := range []string{
+		"zombie", "skeleton", "creeper", "spider", "enderman", "witch", "drowned",
+		"husk", "stray", "phantom", "slime", "magma_cube", "pillager", "vindicator",
+		"ravager", "evocation_illager", "blaze", "piglin", "hoglin", "wither",
+		"guardian", "silverfish", "endermite", "vex",
+	} {
+		if strings.Contains(name, h) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *session) finishGoalLocked(ok bool, errMsg string) {
@@ -2272,6 +2439,25 @@ func (s *session) openContainerAt(x, y, z float32) (*openContainer, error) {
 		}
 	}
 	return nil, fmt.Errorf("コンテナが開きませんでした")
+}
+
+// inLiquidLocked は水や溶岩に浸かっているか。頭の高さで見る。
+// 呼び出し側が mu を持つこと。
+func (s *session) inLiquidLocked() bool {
+	feet := s.feetLocked()
+	fx := int32(math.Floor(float64(feet[0])))
+	fy := int32(math.Floor(float64(feet[1])))
+	fz := int32(math.Floor(float64(feet[2])))
+	for _, dy := range []int32{0, 1} {
+		name, ok := s.world.blockAt(fx, fy+dy, fz)
+		if !ok {
+			continue
+		}
+		if name == "water" || name == "flowing_water" {
+			return true
+		}
+	}
+	return false
 }
 
 // containerIDFor はコンテナの種類から、スロットを指すときの ContainerID を返す。

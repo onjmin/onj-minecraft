@@ -21,6 +21,10 @@ function isQuadTree(saplingName: string): boolean {
 const FELL_BUDGET_MS = Number(process.env.WOOD_FELL_BUDGET_MS ?? 40_000);
 /** 何ブロック掘るごとに落下物を拾うか。 */
 const PICKUP_EVERY = 5;
+/** 木が見つからないときに移動して探し直す回数。 */
+const SEARCH_HOPS = Number(process.env.WOOD_SEARCH_HOPS ?? 3);
+/** 1回の移動距離。読み込み済みの地形の外へ出る程度。 */
+const SEARCH_HOP_DISTANCE = 28;
 
 export const collectWoodSkill = createSkill<void, { felledCount: number; plantedCount: number }>({
 	name: "collecting.wood",
@@ -35,7 +39,27 @@ export const collectWoodSkill = createSkill<void, { felledCount: number; planted
 		const state = driver.getState();
 		if (!state.isReady) return skillResult.fail("Bot entity not loaded");
 
-		const logs = woodScanner.findNearbyLogs(driver);
+		// 近くに木が無ければ移動して探し直す。その場で諦めると、木の無い
+		// 場所に降りた時点で連鎖が止まり、材料が一生手に入らない。
+		// 見えるのは読み込み済みの地形だけなので、動けば候補も増える。
+		let logs = woodScanner.findNearbyLogs(driver);
+		for (let hop = 0; logs.length === 0 && hop < SEARCH_HOPS; hop++) {
+			const from = driver.getState().position;
+			const angle = Math.random() * Math.PI * 2;
+			agent.log(`[collecting.wood] 近くに木が無い。${SEARCH_HOP_DISTANCE}ブロック移動して探す`);
+			try {
+				await driver.goto(signal, {
+					kind: "xz",
+					x: from.x + Math.cos(angle) * SEARCH_HOP_DISTANCE,
+					z: from.z + Math.sin(angle) * SEARCH_HOP_DISTANCE,
+					distance: 4,
+				});
+			} catch (moveErr) {
+				if (signal.aborted) throw moveErr;
+				// 届かなくても、動いたぶんは地形が読み込まれている。
+			}
+			logs = woodScanner.findNearbyLogs(driver);
+		}
 
 		let felledCount = 0;
 		let plantedCount = 0;
