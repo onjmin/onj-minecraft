@@ -92,6 +92,8 @@ When a strategy is stalled, move somewhere new once, then try a DIFFERENT kind o
 
 Prefer the task that unblocks the most other tasks. With empty hands that is usually gathering wood, then crafting a tool. Exploration is only worth it when you have looked and there is nothing to gather where you are.
 
+Order matters for survival. Once you have wood, craft a SWORD before anything else. Unarmed you cannot fight back, so you spend the whole time running or hiding and lose everything you carry each time you die. A wooden sword is cheap and changes that.
+
 Never repeat a skill that failed twice in the same environment unless the environment has changed.
 `.trim();
 }
