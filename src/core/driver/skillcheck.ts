@@ -50,6 +50,8 @@ const VIA_WSL = (process.env.BEDROCK_WSL ?? (process.platform === "win32" ? "1" 
 
 // 1スキルあたりの上限。設置系は tryPlaceBlock が候補ごとに待機を挟むため長めが要る。
 const PER_SKILL_TIMEOUT_MS = Number(process.env.SKILLCHECK_TIMEOUT_MS ?? 25_000);
+/** 中断を投げたあと、そのスキルが実際に止まるのを待つ上限。 */
+const SETTLE_TIMEOUT_MS = Number(process.env.SKILLCHECK_SETTLE_MS ?? 20_000);
 
 // SKILLCHECK_ONLY にカンマ区切りでスキル名を指定すると、そのスキルだけ実行する。
 // 一部だけ追試したいときに全部回さずに済む。
@@ -88,9 +90,7 @@ async function main() {
 			onMsaCode: (m) => console.log("要サインイン:", m),
 		});
 		agent = new MinecraftAgent(profile, [], driver);
-		console.log(
-			`[skillcheck] 統合版 ${REALM_INVITE ? "本番 Realm" : BEDROCK_ADDRESS} へ接続中...`,
-		);
+		console.log(`[skillcheck] 統合版 ${REALM_INVITE ? "本番 Realm" : BEDROCK_ADDRESS} へ接続中...`);
 		await driver.connect();
 	} else {
 		agent = new MinecraftAgent(profile, []);
@@ -157,10 +157,19 @@ async function main() {
 		const t0 = Date.now();
 		let outcome: Outcome;
 
+		// 打ち切っても handler は走り続ける。放置したまま次のスキルへ進むと、
+		// 前のスキルの採掘が後のスキルの採掘を奪い、後続が
+		// 「新しい採掘で置き換えられた」で巻き添えに失敗する。実際に
+		// collecting.wood のタイムアウト後、dirt と stone がそれで潰れていた。
+		// 参照を持っておき、打ち切ったあと実際に止まるまで待つ。
+		const running = skill.handler({ agent, signal: controller.signal, args: args ?? {} });
+		// 待つ前に例外が出ると未処理拒否になるので、先に受け皿を付ける。
+		running.catch(() => {});
+
 		try {
 			const timer = setTimeout(() => controller.abort(), PER_SKILL_TIMEOUT_MS);
 			const res = await Promise.race([
-				skill.handler({ agent, signal: controller.signal, args: args ?? {} }),
+				running,
 				new Promise((_, rej) =>
 					setTimeout(() => rej(new Error("__TIMEOUT__")), PER_SKILL_TIMEOUT_MS + 5000),
 				),
@@ -181,6 +190,22 @@ async function main() {
 				detail: msg,
 				ms: Date.now() - t0,
 			};
+		}
+
+		if (outcome.verdict === "timeout") {
+			// 中断を投げたあと、実際に手を止めるまで待つ。
+			const settled = await Promise.race([
+				running.then(
+					() => true,
+					() => true,
+				),
+				new Promise<boolean>((r) => setTimeout(() => r(false), SETTLE_TIMEOUT_MS)),
+			]);
+			if (!settled) {
+				console.log(
+					`     ${skill.name} は中断しても ${SETTLE_TIMEOUT_MS / 1000}秒 止まらなかった。以降の結果は信用しないこと。`,
+				);
+			}
 		}
 
 		results.push(outcome);
@@ -211,7 +236,9 @@ async function main() {
 	}
 
 	// 統合版は mineflayer のボットを持たないので、ドライバ側で切る。
-	if (BEDROCK_ADDRESS) {
+	// 接続の判定と揃えること。BEDROCK_ADDRESS だけを見ていたため、
+	// 本番 Realm で回すと agent.bot が undefined で落ちていた。
+	if (REALM_INVITE || BEDROCK_ADDRESS) {
 		await agent.driver.disconnect();
 	} else {
 		agent.bot.quit();

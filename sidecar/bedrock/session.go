@@ -118,10 +118,13 @@ type session struct {
 	airborne bool
 	health   float32
 	food     float32
-	controls map[string]bool
-	entities map[uint64]*entityInfo
-	unique   map[int64]uint64 // RemoveActor は unique ID で来る
-	goal     *target
+	// ワールドの総経過tick。SetTime はゲーム内時刻ではなく累計を送ってくるので、
+	// 昼夜の判定に使うには 24000 で割った余りを取る必要がある。
+	worldTick int32
+	controls  map[string]bool
+	entities  map[uint64]*entityInfo
+	unique    map[int64]uint64 // RemoveActor は unique ID で来る
+	goal      *target
 
 	// 送った位置の履歴。補正は数tick前のものが返ってくるので、その時点の
 	// 自分の予測と突き合わせて「ずれ」だけを求めるために要る。
@@ -329,6 +332,11 @@ func (s *session) handle(pk packet.Packet) {
 		} else {
 			s.updateEntityPos(v.EntityRuntimeID, v.Position)
 		}
+
+	case *packet.SetTime:
+		s.mu.Lock()
+		s.worldTick = v.Time
+		s.mu.Unlock()
 
 	case *packet.SetHealth:
 		s.mu.Lock()
@@ -1014,6 +1022,9 @@ func (s *session) dispatch(c command) {
 			"onGround": s.onGround,
 			"health":   s.health,
 			"food":     s.food,
+			// 0〜23999 のゲーム内時刻。SetTime は累計tickなので余りを取る。
+			// 負になることがあるので折り返す。
+			"timeOfDay": ((s.worldTick % 24000) + 24000) % 24000,
 			// 移動が伸びない原因を切り分けるための診断値。
 			"corrections": s.corrections,
 			"driftTotal":  s.driftTotal,

@@ -15,7 +15,6 @@
  *   - smelt / canSmelt: 精錬
  *   - takeAllFromContainer: コンテナからの回収
  *   - equip の hand 以外: 防具の装備
- * また timeOfDay をサイドカーが拾っておらず、常に昼(6000)を返す。
  */
 import { BlockView } from "./blockview";
 import { BedrockSidecar } from "./sidecar";
@@ -89,6 +88,9 @@ export class BedrockDriver implements BotDriver {
 		pitch: 0,
 		health: 20,
 		food: 20,
+		// 0〜23999 のゲーム内時刻。サイドカーが SetTime から拾う。
+		// 届く前は昼として扱う。夜だと誤認して拠点に籠るより害が小さい。
+		timeOfDay: 6000,
 	};
 	/** サイドカーから引いた持ち物の写し。items() が同期メソッドなので保持する。 */
 	private items: ItemInfo[] = [];
@@ -262,6 +264,7 @@ export class BedrockDriver implements BotDriver {
 		this.state.pitch = Number(st.pitch ?? 0);
 		this.state.health = Number(st.health ?? 20);
 		this.state.food = Number(st.food ?? 20);
+		this.state.timeOfDay = Number(st.timeOfDay ?? 6000);
 		this.lastDiagnostics = {
 			corrections: Number(st.corrections ?? 0),
 			driftTotal: Number(st.driftTotal ?? 0),
@@ -344,8 +347,7 @@ export class BedrockDriver implements BotDriver {
 			yaw: this.state.yaw,
 			health: this.state.health,
 			food: this.state.food,
-			// 統合版の時刻はサイドカーがまだ拾っていない。昼として扱う。
-			timeOfDay: 6000,
+			timeOfDay: this.state.timeOfDay,
 			isRaining: false,
 			dimension: "overworld",
 			isReady: this.spawned,
