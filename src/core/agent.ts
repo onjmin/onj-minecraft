@@ -132,6 +132,8 @@ export class MinecraftAgent {
 	private currentExecutionStartedAt = 0;
 	/** 今のスキルを担当し始めた時刻。乗り換えてよいかの判断に使う。 */
 	private currentTaskSince = 0;
+	/** 一瞬で終わる行動が続いた回数。空回りの間隔を空けるのに使う。 */
+	private instantRepeats = 0;
 
 	private bases: {
 		id: string;
@@ -719,6 +721,7 @@ export class MinecraftAgent {
 					let result: SkillResponse | undefined;
 
 					const args = this.currentSkillArgs[skill.name] || {};
+					let executionBeganAt = 0;
 					// 実行に入れた時点で暴走カウンタは戻す（結果の成否は下で扱う）
 					if (this.consecutiveFailures > 0 && this.currentTaskName !== this.lastFailedTask) {
 						this.consecutiveFailures = 0;
@@ -729,6 +732,7 @@ export class MinecraftAgent {
 							`${skill.name} start${Object.keys(args).length > 0 ? ` with args: ${JSON.stringify(args)}` : ""}`,
 						);
 						this.currentExecutionStartedAt = Date.now();
+						executionBeganAt = this.currentExecutionStartedAt;
 						result = await skill.handler({
 							agent: this,
 							signal: controller.signal,
@@ -756,6 +760,13 @@ export class MinecraftAgent {
 						message: result.summary,
 					});
 					if (!result.success) await new Promise((r) => setTimeout(r, 2000));
+
+					// 一瞬で終わる行動を全速力で回し続けない。
+					// goto.surface のように「既に条件を満たしている」と即座に返すものは、
+					// 次の思考まで秒1回近い頻度で呼ばれ、ログを埋めるだけになる。
+					// 実際に5分で98回叩いていた。
+					const elapsed = executionBeganAt > 0 ? Date.now() - executionBeganAt : Infinity;
+					this.instantRepeats = elapsed < 1000 ? this.instantRepeats + 1 : 0;
 				} catch (e) {
 					const errorMsg = e instanceof Error ? e.message : String(e);
 					this.log(`Reflex Error: ${errorMsg}`);
@@ -783,7 +794,10 @@ export class MinecraftAgent {
 				this.currentTaskName = fallback;
 			}
 
-			await new Promise((r) => setTimeout(r, 1000 + Math.random() * 500));
+			// 空回りしているぶんだけ間隔を空ける。思考ループが次の行動を決めれば
+			// そこで 0 に戻るので、待ちが積み上がったままにはならない。
+			const idleBackoff = Math.min(8000, this.instantRepeats * 1000);
+			await new Promise((r) => setTimeout(r, 1000 + Math.random() * 500 + idleBackoff));
 		}
 	}
 
@@ -1065,6 +1079,7 @@ export class MinecraftAgent {
 			if (this.currentTaskName !== foundSkillName) {
 				this.currentTaskName = foundSkillName;
 				this.currentTaskSince = Date.now();
+				this.instantRepeats = 0;
 				this.latestRationale = rationale;
 
 				const now = Date.now();
