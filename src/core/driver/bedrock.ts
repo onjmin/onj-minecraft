@@ -9,9 +9,8 @@
  * 通っているのは接続・状態・エンティティ・持ち物・移動・発言・ワールド読み取り・
  * 採掘・設置・クラフト・攻撃。本番 Realm で確認済み。
  *
- * 残っている未実装は次の4つ。いずれも notImplemented() で例外にする。
+ * 残っている未実装は次の3つ。いずれも notImplemented() で例外にする。
  * 黙って何もせず成功を装うと、スキル側が「やった」と誤解して先へ進むため。
- *   - activateBlock: かまど・チェスト・ドアを開く
  *   - smelt / canSmelt: 精錬
  *   - takeAllFromContainer: コンテナからの回収
  *   - equip の hand 以外: 防具の装備
@@ -113,8 +112,13 @@ export class BedrockDriver implements BotDriver {
 			realmInvite: options.realmInvite,
 			address: options.address,
 			name: options.name,
-			tokenCache: options.tokenCache,
-			onMsaCode: options.onMsaCode,
+			// 使うアカウントはトークンキャッシュの置き場所で決まる。環境変数で
+			// 差し替えられるようにしておくと、検証を管理者アカウントではなく
+			// 一般アカウントで回せる。管理者の権限で世界を壊す事故を避ける。
+			tokenCache: options.tokenCache ?? process.env.BEDROCK_TOKEN_CACHE ?? undefined,
+			// 受け手を渡していない呼び出し元でも、サインインが要ることは伝わるべき。
+			// 黙って待たせると「繋がらない」としか見えない。
+			onMsaCode: options.onMsaCode ?? ((m: string) => console.log("要サインイン:", m)),
 			binaryPath: options.binaryPath,
 			viaWsl: options.viaWsl,
 			wslDistro: options.wslDistro,
@@ -519,8 +523,16 @@ export class BedrockDriver implements BotDriver {
 		await sleep(400);
 		await this.refreshBlocks(true);
 	}
-	async activateBlock(_position: Position): Promise<void> {
-		notImplemented("ブロックの操作");
+	async activateBlock(position: Position): Promise<void> {
+		// face に -1 を渡すと、サイドカーがプレイヤー側の面を選ぶ。
+		await this.sidecar.send("activate", {
+			x: position.x,
+			y: position.y,
+			z: position.z,
+			face: -1,
+		});
+		// サーバーが開くまでの間。すぐ次を送ると取りこぼす。
+		await sleep(400);
 	}
 	/**
 	 * 相手を殴る。

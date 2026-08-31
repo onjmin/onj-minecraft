@@ -1,4 +1,10 @@
+import { describeGain, gainedSince, snapshotInventory, totalGain } from "../inventory-delta";
 import { createSkill, type SkillResponse, skillResult } from "../types";
+
+/** 1回の採集にかける上限。 */
+const DIRT_BUDGET_MS = Number(process.env.DIRT_BUDGET_MS ?? 40_000);
+/** 何ブロック掘るごとに落下物を拾いに行くか。 */
+const PICKUP_EVERY = 5;
 
 export const collectDirtSkill = createSkill<void, { count: number }>({
 	name: "collecting.dirt",
@@ -18,9 +24,16 @@ export const collectDirtSkill = createSkill<void, { count: number }>({
 
 		let collected = 0;
 		const maxCollect = 16;
+		// 成果は増えた持ち物で測る。壊した数を返すと、拾えていなくても
+		// 「集めた」ことになってしまう。
+		const before = snapshotInventory(driver);
+		// 1回の採集にかける上限。土16個を追いかけて90秒使うと、
+		// 思考ループから見て終わらない行動になる。
+		const deadline = Date.now() + DIRT_BUDGET_MS;
 
 		for (const block of dirtBlocks) {
 			if (collected >= maxCollect) break;
+			if (Date.now() > deadline) break;
 			if (agent.checkAbort(signal)) break;
 
 			if (!block.diggable) continue;
@@ -33,12 +46,25 @@ export const collectDirtSkill = createSkill<void, { count: number }>({
 				await driver.equipBestTool(block.position);
 				await driver.dig(signal, block.position);
 				collected++;
-				await driver.pickupNearbyItems(signal);
+				// 回収は毎回ではなく数個おきに。pickupNearbyItems は落下物が
+				// 出るのを待つので、1個ごとに挟むと待ちで時間が尽きる。
+				if (collected % PICKUP_EVERY === 0) {
+					await driver.pickupNearbyItems(signal);
+				}
 			}
 		}
+		await driver.pickupNearbyItems(signal);
 
-		agent.log(`[collecting.dirt] Collected ${collected} dirt blocks`);
+		const gained = gainedSince(driver, before);
+		agent.log(`[collecting.dirt] ${collected}ブロック掘り、${describeGain(gained) || "何も"}得た`);
 
-		return skillResult.ok(`Collected ${collected} dirt blocks.`, { count: collected });
+		if (totalGain(gained) === 0) {
+			return skillResult.fail(
+				collected > 0
+					? `Broke ${collected} blocks but picked nothing up.`
+					: "Could not dig any dirt.",
+			);
+		}
+		return skillResult.ok(`Collected ${describeGain(gained)}.`, { count: totalGain(gained) });
 	},
 });

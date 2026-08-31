@@ -1,5 +1,11 @@
 import type { BlockInfo, BotDriver } from "../../core/driver/types";
+import { describeGain, gainedSince, snapshotInventory, totalGain } from "../inventory-delta";
 import { createSkill, type SkillResponse, skillResult } from "../types";
+
+/** 1回の採集にかける上限。長すぎると思考ループから見て終わらない行動になる。 */
+const STONE_BUDGET_MS = Number(process.env.STONE_BUDGET_MS ?? 40_000);
+/** 何ブロック掘るごとに落下物を拾いに行くか。 */
+const PICKUP_EVERY = 4;
 
 export const collectStoneSkill = createSkill<void, { minedCount: number }>({
 	name: "collecting.stone",
@@ -16,10 +22,15 @@ export const collectStoneSkill = createSkill<void, { minedCount: number }>({
 		}
 
 		let minedCount = 0;
+		// 成果は壊した数ではなく増えた持ち物で測る。ツルハシ無しで石を掘っても
+		// 何も落ちないので、壊した数を返すと「集めた」と嘘をつくことになる。
+		const before = snapshotInventory(driver);
+		const deadline = Date.now() + STONE_BUDGET_MS;
 
 		try {
 			// 石は数が必要なので、上位10個をターゲットにする
 			for (const stone of stonePositions) {
+				if (Date.now() > deadline) break;
 				await driver.goto(signal, { kind: "near", position: stone.position, distance: 2 });
 
 				const block = driver.world.blockAt(stone.position);
@@ -29,11 +40,26 @@ export const collectStoneSkill = createSkill<void, { minedCount: number }>({
 					await driver.equipBestTool(block.position);
 					await driver.dig(signal, block.position);
 					minedCount++;
+					// 落下物は足元に落ちるとは限らない。数個おきに拾いに行く。
+					if (minedCount % PICKUP_EVERY === 0) {
+						await driver.pickupNearbyItems(signal);
+					}
 				}
 			}
+			await driver.pickupNearbyItems(signal);
 
-			return skillResult.ok(`Successfully collected ${minedCount} stone-type blocks.`, {
-				minedCount,
+			const gained = gainedSince(driver, before);
+			if (totalGain(gained) === 0) {
+				// 壊せたのに何も手に入らないのは、ほぼツルハシが無いから。
+				// 成功として返すと、持っていない石を前提に次の行動が組まれる。
+				return skillResult.fail(
+					minedCount > 0
+						? `Broke ${minedCount} stone blocks but obtained nothing. Stone requires a pickaxe to drop; craft one first.`
+						: "No stone could be mined.",
+				);
+			}
+			return skillResult.ok(`Collected ${describeGain(gained)}.`, {
+				minedCount: totalGain(gained),
 			});
 		} catch (err) {
 			const errorMsg = err instanceof Error ? err.message : String(err);

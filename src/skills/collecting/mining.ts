@@ -1,4 +1,5 @@
 import type { BlockInfo, BotDriver } from "../../core/driver/types";
+import { describeGain, gainedSince, snapshotInventory, totalGain } from "../inventory-delta";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
 export const mineOresSkill = createSkill<void, { minedCount: number }>({
@@ -18,6 +19,10 @@ export const mineOresSkill = createSkill<void, { minedCount: number }>({
 		}
 
 		let minedCount = 0;
+		// 成果は壊した数ではなく増えた持ち物で測る。素手で鉱石を割っても
+		// 何も落ちないので、壊した数を返すと持っていない鉱石を前提に
+		// 次の行動が組まれてしまう。
+		const before = snapshotInventory(driver);
 
 		try {
 			for (const ore of orePositions.slice(0, 3)) {
@@ -31,9 +36,18 @@ export const mineOresSkill = createSkill<void, { minedCount: number }>({
 					minedCount++;
 				}
 			}
+			await driver.pickupNearbyItems(signal);
 
-			return skillResult.ok(`Successfully extracted ${minedCount} ore blocks from the area.`, {
-				minedCount,
+			const gained = gainedSince(driver, before);
+			if (totalGain(gained) === 0) {
+				return skillResult.fail(
+					minedCount > 0
+						? `Broke ${minedCount} ore blocks but obtained nothing. Ores need a pickaxe to drop; craft one first.`
+						: "No ores could be mined.",
+				);
+			}
+			return skillResult.ok(`Extracted ${describeGain(gained)}.`, {
+				minedCount: totalGain(gained),
 			});
 		} catch (err) {
 			const errorMsg = err instanceof Error ? err.message : String(err);

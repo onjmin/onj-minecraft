@@ -16,6 +16,11 @@ function isQuadTree(saplingName: string): boolean {
 	return QUAD_SAPLING_TREES.includes(base);
 }
 
+/** 木を1本片付けるのにかける上限。超えたら手持ちのぶんで切り上げる。 */
+const FELL_BUDGET_MS = Number(process.env.WOOD_FELL_BUDGET_MS ?? 40_000);
+/** 何ブロック掘るごとに落下物を拾うか。 */
+const PICKUP_EVERY = 5;
+
 export const collectWoodSkill = createSkill<void, { felledCount: number; plantedCount: number }>({
 	name: "collecting.wood",
 	description:
@@ -63,15 +68,34 @@ export const collectWoodSkill = createSkill<void, { felledCount: number; planted
 					return distA - distB;
 				});
 
+				// 1本あたりの時間を区切る。この木を丸ごと片付けることより、
+				// 原木を何本か手に入れて次の行動に移れることの方が大事。
+				// 上限が無いと、3x3x7の範囲(最大63ブロック)を掘り終わるまで
+				// 戻らず、思考ループから見れば永久に終わらない行動になる。
+				const deadline = Date.now() + FELL_BUDGET_MS;
+
 				for (const pos of blocksToRemove) {
+					if (Date.now() > deadline) {
+						agent.log(`[collecting.wood] 時間切れ。${felledCount}ブロックで切り上げる`);
+						break;
+					}
 					const block = driver.world.blockAt(pos);
 					if (block && block.name !== "air" && block.diggable) {
 						await driver.equipBestTool(pos);
 						await driver.dig(signal, pos);
 						felledCount++;
-						await driver.pickupNearbyItems(signal);
+						// 回収は1ブロックごとではなく数ブロックおきにする。
+						// pickupNearbyItems は落下物が出るのを待つため、何も落ちて
+						// いなくても3秒近く使う。葉を1枚掘るたびにこれを挟むと、
+						// 時間のほとんどが待ちに消える。
+						// 落下物は数分残るので、まとめて拾って構わない。
+						if (felledCount % PICKUP_EVERY === 0) {
+							await driver.pickupNearbyItems(signal);
+						}
 					}
 				}
+				// 取りこぼしを最後にまとめて回収する。
+				await driver.pickupNearbyItems(signal);
 			} catch (err) {
 				const errorMsg = err instanceof Error ? err.message : String(err);
 				if (errorMsg.includes("Cancelled") || errorMsg.includes("stop")) {

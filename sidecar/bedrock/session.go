@@ -1205,6 +1205,50 @@ func (s *session) dispatch(c command) {
 		s.mu.Unlock()
 		s.reply(c.ID, true, "", nil)
 
+	case "activate":
+		// ブロックを開く/使う（かまど・チェスト・ドア）。
+		// 送るものは設置と同じ ClickBlock のトランザクションで、サーバーが
+		// 対象ブロックを見て「開く」か「置く」かを決める。違うのは手ぶらを
+		// 許す点だけ。設置は手に持っていないと成立しないが、ドアを開くのに
+		// 持ち物は要らない。
+		//
+		// 手に置けるブロックを持ったまま使うと、サーバーがそちらを優先して
+		// 設置してしまうことがある。呼び出し側が必要なら先に持ち替えること。
+		{
+			bx := int32(math.Floor(float64(c.X)))
+			by := int32(math.Floor(float64(c.Y)))
+			bz := int32(math.Floor(float64(c.Z)))
+			s.mu.Lock()
+			reach := s.pos.Sub(mgl32.Vec3{float32(bx) + 0.5, float32(by) + 0.5, float32(bz) + 0.5}).Len()
+			if reach > digReach {
+				s.mu.Unlock()
+				s.reply(c.ID, false, fmt.Sprintf("遠すぎて届きません（%.1f ブロック）", reach), nil)
+				return
+			}
+			face := c.Face
+			if face < 0 {
+				face = faceToward(s.pos, bx, by, bz)
+			}
+			s.lookAtLocked(float32(bx)+0.5, float32(by)+0.5, float32(bz)+0.5)
+			clicked, _ := s.world.runtimeIDAt(bx, by, bz)
+			// 手ぶらでも成立させる。空のスロットは空の ItemInstance で送る。
+			held := s.rawSlots[int(s.heldSlot)]
+			s.pendingPlace = &protocol.UseItemTransactionData{
+				ActionType:       protocol.UseItemActionClickBlock,
+				TriggerType:      protocol.TriggerTypePlayerInput,
+				BlockPosition:    protocol.BlockPos{bx, by, bz},
+				BlockFace:        face,
+				HotBarSlot:       s.heldSlot,
+				HeldItem:         held,
+				Position:         s.pos,
+				ClickedPosition:  clickOffset(face),
+				BlockRuntimeID:   uint32(clicked),
+				ClientPrediction: protocol.ClientPredictionSuccess,
+			}
+			s.mu.Unlock()
+			s.reply(c.ID, true, "", nil)
+		}
+
 	case "craft":
 		want := ""
 		if len(c.Names) > 0 {
