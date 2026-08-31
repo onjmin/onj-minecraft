@@ -134,6 +134,14 @@ export class MinecraftAgent {
 	private currentTaskSince = 0;
 	/** 一瞬で終わる行動が続いた回数。空回りの間隔を空けるのに使う。 */
 	private instantRepeats = 0;
+	/**
+	 * スキルごとの成否の記録。
+	 *
+	 * 「成功と報告するが何も得ていない」スキルを、実績で落とすために持つ。
+	 * 本番では collecting.stone が「10個収集」と返しながら持ち物が空だった。
+	 * ああいうものを人が気付くまで選ばせ続けるのは無駄が大きい。
+	 */
+	private skillStats = new Map<string, { ok: number; fail: number }>();
 
 	private bases: {
 		id: string;
@@ -675,6 +683,28 @@ export class MinecraftAgent {
 		}
 	}
 
+	private recordSkillOutcome(name: string, ok: boolean) {
+		const st = this.skillStats.get(name) ?? { ok: 0, fail: 0 };
+		if (ok) st.ok++;
+		else st.fail++;
+		this.skillStats.set(name, st);
+	}
+
+	/**
+	 * そのスキルを見限ってよいか。
+	 *
+	 * 試行が十分あって、ほとんど成功しないもの。材料不足のような一時的な
+	 * 失敗と区別できないので、外すのではなくプロンプトで注意を促すに留める。
+	 * 完全に外すと、材料が揃った後も二度と選ばれなくなる。
+	 */
+	private skillReliability(name: string): { tried: number; rate: number } | null {
+		const st = this.skillStats.get(name);
+		if (!st) return null;
+		const tried = st.ok + st.fail;
+		if (tried === 0) return null;
+		return { tried, rate: st.ok / tried };
+	}
+
 	private pushHistory(record: ObservationRecord) {
 		this.observationHistory.push(record);
 		if (this.observationHistory.length > this.maxHistory) this.observationHistory.shift();
@@ -717,6 +747,7 @@ export class MinecraftAgent {
 					this.currentAbort = controller;
 
 					await this.ensureOnLand(controller.signal);
+					await this.reflexSurvival(controller.signal);
 
 					let result: SkillResponse | undefined;
 
@@ -753,6 +784,7 @@ export class MinecraftAgent {
 						continue;
 					}
 
+					this.recordSkillOutcome(skill.name, result.success);
 					this.pushHistory({
 						action: this.currentTaskName,
 						rationale: this.latestRationale || "Continuing task",
@@ -876,9 +908,17 @@ export class MinecraftAgent {
 						.map(([k, v]) => `${k}: ${(v as any).description}`)
 						.join(", ")
 				: "";
+			// これまでの実績を添える。うまくいっていない手段を避けられる。
+			const rel = this.skillReliability(t.name);
+			const note =
+				rel && rel.tried >= 3
+					? ` [これまで ${rel.tried} 回試して成功率 ${Math.round(rel.rate * 100)}%${
+							rel.rate < 0.2 ? "。ほぼ失敗している。別の手を先に試すこと" : ""
+						}]`
+					: "";
 			return {
 				name: t.name,
-				description: t.description,
+				description: t.description + note,
 				args: argsInfo,
 			};
 		});
@@ -1543,6 +1583,98 @@ export class MinecraftAgent {
 				pickedUp++;
 			} catch {
 				break;
+			}
+		}
+	}
+
+	/**
+	 * LLM の判断を待たずに済ませる生存行動。
+	 *
+	 * 防具を着る・囲まれたら掘って出る、といった「考えるまでもないが、
+	 * やらないと詰む」もの。思考ループは30秒に1回しか回らないので、
+	 * ここに置かないと判断待ちの間ずっと不利なままになる。
+	 * 本番のスポーン地点は壁に囲まれており、実際にそこで動けなくなっていた。
+	 */
+	private async reflexSurvival(signal: AbortSignal): Promise<void> {
+		try {
+			await this.wearBestArmor();
+			await this.escapeIfBoxedIn(signal);
+		} catch (e) {
+			// 反射行動で本来の行動を止めない。
+			if (!signal.aborted) this.log(`反射行動でつまずいた: ${e}`);
+		}
+	}
+
+	/** 持っている中で一番良い防具を着る。既に着ているものは触らない。 */
+	private async wearBestArmor(): Promise<void> {
+		const ranks = ["netherite", "diamond", "iron", "chainmail", "golden", "leather"];
+		const slots: [string, string][] = [
+			["_helmet", "head"],
+			["_chestplate", "torso"],
+			["_leggings", "legs"],
+			["_boots", "feet"],
+		];
+		const items = this.driver.inventory.items();
+		for (const [suffix, destination] of slots) {
+			const owned = items
+				.filter((i) => i.name.endsWith(suffix))
+				.sort((a, b) => {
+					const ra = ranks.findIndex((m) => a.name.startsWith(m));
+					const rb = ranks.findIndex((m) => b.name.startsWith(m));
+					return (ra < 0 ? 99 : ra) - (rb < 0 ? 99 : rb);
+				});
+			const best = owned[0];
+			// 着けたものは持ち物から消えるので、次の周では候補に挙がらない。
+			// 同じものを何度も着せ直す心配は要らない。
+			if (best) await this.driver.equip(best.name, destination as any);
+		}
+	}
+
+	/**
+	 * 四方を塞がれていたら掘って出る。
+	 *
+	 * 経路探索は掘って抜ける手も持っているが、それは目標がある時の話で、
+	 * 「どこへ行けばいいか分からないが動けない」状態は自力で解けない。
+	 */
+	private async escapeIfBoxedIn(signal: AbortSignal): Promise<void> {
+		const { driver } = this;
+		const pos = driver.getState().position;
+		const foot = { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) };
+		const dirs = [
+			{ x: 1, z: 0 },
+			{ x: -1, z: 0 },
+			{ x: 0, z: 1 },
+			{ x: 0, z: -1 },
+		];
+
+		const open = (dx: number, dz: number) => {
+			const f = driver.world.blockAt({ x: foot.x + dx, y: foot.y, z: foot.z + dz });
+			const h = driver.world.blockAt({ x: foot.x + dx, y: foot.y + 1, z: foot.z + dz });
+			// 未取得(null)は「塞がれている」と決めつけない。掘る理由にしない。
+			if (f === null || h === null) return true;
+			return f.name === "air" && h.name === "air";
+		};
+
+		if (dirs.some((d) => open(d.x, d.z))) return;
+
+		// 全方向が塞がっている。壊せるものを1つ選んで抜ける。
+		for (const d of dirs) {
+			const target = { x: foot.x + d.x, y: foot.y, z: foot.z + d.z };
+			const block = driver.world.blockAt(target);
+			if (!block || !block.diggable) continue;
+			this.log(`[反射] 四方を塞がれているので ${block.name} を掘って出る`);
+			try {
+				await driver.equipBestTool(target);
+				await driver.dig(signal, target);
+				// 頭の高さも空けないと通れない。
+				const head = { ...target, y: target.y + 1 };
+				const above = driver.world.blockAt(head);
+				if (above && above.name !== "air" && above.diggable) {
+					await driver.dig(signal, head);
+				}
+				return;
+			} catch {
+				// この方向は駄目だった。次を試す。
 			}
 		}
 	}

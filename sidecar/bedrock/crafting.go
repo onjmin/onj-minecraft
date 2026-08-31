@@ -364,12 +364,21 @@ func (s *session) craftRequestLocked(rec craftRecipe, requestID int32) (*protoco
 				continue
 			}
 			use := min(avail, remaining)
+			// 同じスロットから2回目以降を取り出すときは、元の識別子では指せない。
+			// 1回目の取り出しでそのスタックの識別子が変わるため、古いものを
+			// 送ると FailedToValidateSrcSlot(55) になる。同一要求の中で
+			// 変化したスタックはリクエストIDで指す決まり。
+			// 木のツルハシは板3枚を同じスロットから取るので必ず踏む。
+			srcID := item.StackNetworkID
+			if spent[slot] > 0 {
+				srcID = requestID
+			}
 			place := &protocol.PlaceStackRequestAction{}
 			place.Count = byte(use)
 			place.Source = protocol.StackRequestSlotInfo{
 				Container:      protocol.FullContainerName{ContainerID: protocol.ContainerCombinedHotBarAndInventory},
 				Slot:           byte(slot),
-				StackNetworkID: item.StackNetworkID,
+				StackNetworkID: srcID,
 			}
 			place.Destination = protocol.StackRequestSlotInfo{
 				Container:      protocol.FullContainerName{ContainerID: protocol.ContainerCraftingInput},
@@ -436,7 +445,7 @@ func (s *session) craftRequestLocked(rec craftRecipe, requestID int32) (*protoco
 		})
 	}
 
-	dest, ok := s.freeSlotLocked()
+	dest, destStackID, ok := s.outputSlotLocked(rec.Output)
 	if !ok {
 		return nil, nil, fmt.Errorf("持ち物に空きがありません")
 	}
@@ -453,7 +462,7 @@ func (s *session) craftRequestLocked(rec craftRecipe, requestID int32) (*protoco
 	take.Destination = protocol.StackRequestSlotInfo{
 		Container:      protocol.FullContainerName{ContainerID: protocol.ContainerCombinedHotBarAndInventory},
 		Slot:           byte(dest),
-		StackNetworkID: 0,
+		StackNetworkID: destStackID,
 	}
 	actions = append(actions, take)
 
@@ -464,9 +473,35 @@ func (s *session) craftRequestLocked(rec craftRecipe, requestID int32) (*protoco
 // 同じ物が既にある枠へ足す方が自然だが、上限の判定が要るので空きを優先する。
 func (s *session) freeSlotLocked() (int, bool) {
 	for i := 0; i < 36; i++ {
-		if _, used := s.rawSlots[i]; !used {
+		// 中身が空になったスロットは写しに残ることがある。鍵の有無だけで
+		// 判定すると、実際は空いている枠を使えず「持ち物に空きがありません」
+		// になる。数まで見る。
+		if it, used := s.rawSlots[i]; !used || it.Stack.Count == 0 {
 			return i, true
 		}
 	}
 	return 0, false
+}
+
+// outputSlotLocked は出来上がりの行き先を選ぶ。
+//
+// 同じ物が既にある枠へ重ねるのを優先する。空き枠だけを狙うと、写しが
+// 古いときに埋まっている枠を指してしまい FailedToValidateDstSlot(50) で
+// 拒否される。板を続けて作ると2回目で必ず起きていた。
+func (s *session) outputSlotLocked(outputName string) (int, int32, bool) {
+	for i := 0; i < 36; i++ {
+		it, ok := s.rawSlots[i]
+		if !ok || it.Stack.Count == 0 {
+			continue
+		}
+		name, ok := s.itemNames[it.Stack.ItemType.NetworkID]
+		if ok && name == outputName && int(it.Stack.Count) < 64 {
+			// 既にある山へ重ねるときは、その山の識別子を載せる必要がある。
+			// 0 のままだと「空き枠へ置く」ことになり、実際は埋まっているので
+			// FailedToValidateDstSlot(50) で拒否される。
+			return i, it.StackNetworkID, true
+		}
+	}
+	slot, ok := s.freeSlotLocked()
+	return slot, 0, ok
 }

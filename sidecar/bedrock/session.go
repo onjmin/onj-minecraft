@@ -588,6 +588,34 @@ func (s *session) handle(pk packet.Packet) {
 
 	case *packet.ItemStackResponse:
 		for _, r := range v.Responses {
+			// 応答には変わったスロットの新しい識別子が入っている。これを
+			// 取り込まないと、次の要求で古い StackNetworkID を送ることになり
+			// FailedToValidateSrcSlot(55) で拒否される。作業台を置いたあと
+			// 3x3 のクラフトが通らなかったのがこれ。
+			s.mu.Lock()
+			for _, info := range r.ContainerInfo {
+				if info.Container.ContainerID != protocol.ContainerCombinedHotBarAndInventory &&
+					info.Container.ContainerID != protocol.ContainerInventory &&
+					info.Container.ContainerID != protocol.ContainerHotBar {
+					continue
+				}
+				for _, si := range info.SlotInfo {
+					slot := int(si.Slot)
+					it, ok := s.rawSlots[slot]
+					if !ok {
+						continue
+					}
+					it.StackNetworkID = si.StackNetworkID
+					it.Stack.Count = uint16(si.Count)
+					if si.Count == 0 {
+						delete(s.rawSlots, slot)
+						continue
+					}
+					s.rawSlots[slot] = it
+				}
+			}
+			s.mu.Unlock()
+
 			s.mu.Lock()
 			id, waiting := s.craftWaiter[r.RequestID]
 			if waiting {
@@ -1493,7 +1521,12 @@ func (s *session) dispatch(c command) {
 			s.craftReqID -= 2
 			r, used, err := s.craftRequestLocked(list[i], s.craftReqID)
 			if err != nil {
-				lastErr = err
+				// 素材不足はレシピの亜種ごとに必ず出る(別の木のレシピなど)。
+				// それで上書きすると、本当の失敗理由が最後の亜種の
+				// 「◯◯が足りません」に隠れる。素材不足以外を優先して残す。
+				if lastErr == nil || strings.Contains(lastErr.Error(), "足りません") {
+					lastErr = err
+				}
 				continue
 			}
 			chosen = &list[i]
@@ -1556,6 +1589,29 @@ func (s *session) dispatch(c command) {
 			s.mu.Unlock()
 			// 開くのは次のtickに載る。サーバーが受理するまで少し待つ。
 			time.Sleep(500 * time.Millisecond)
+		}
+
+		if os.Getenv("BEDROCK_TRACE_CRAFT") == "1" {
+			// 何を送ったのかが分からないと、拒否コードだけでは詰められない。
+			fmt.Fprintf(os.Stderr, "craft %s reqID=%d needsTable=%v cells=%d\n",
+				chosen.Output, req.RequestID, chosen.NeedsTable, len(chosen.Cells))
+			for _, a := range req.Actions {
+				switch t := a.(type) {
+				case *protocol.PlaceStackRequestAction:
+					fmt.Fprintf(os.Stderr, "  place n=%d src(c=%d slot=%d id=%d) dst(c=%d slot=%d id=%d)\n",
+						t.Count, t.Source.Container.ContainerID, t.Source.Slot, t.Source.StackNetworkID,
+						t.Destination.Container.ContainerID, t.Destination.Slot, t.Destination.StackNetworkID)
+				case *protocol.ConsumeStackRequestAction:
+					fmt.Fprintf(os.Stderr, "  consume n=%d src(c=%d slot=%d id=%d)\n",
+						t.Count, t.Source.Container.ContainerID, t.Source.Slot, t.Source.StackNetworkID)
+				case *protocol.CraftRecipeStackRequestAction:
+					fmt.Fprintf(os.Stderr, "  recipe net=%d\n", t.RecipeNetworkID)
+				case *protocol.TakeStackRequestAction:
+					fmt.Fprintf(os.Stderr, "  take n=%d src(c=%d slot=%d id=%d) dst(c=%d slot=%d id=%d)\n",
+						t.Count, t.Source.Container.ContainerID, t.Source.Slot, t.Source.StackNetworkID,
+						t.Destination.Container.ContainerID, t.Destination.Slot, t.Destination.StackNetworkID)
+				}
+			}
 		}
 
 		if err := s.conn.WritePacket(&packet.ItemStackRequest{

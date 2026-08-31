@@ -570,12 +570,18 @@ export class BedrockDriver implements BotDriver {
 		const want = stripNamespace(itemName);
 
 		if (destination === "hand") {
+			// 直前のクラフトや採掘で持ち物が変わっている。写しが古いまま
+			// スロットを選ぶと、空になった枠を持って「手に何も持っていません」
+			// になる。作業台を作った直後の設置で実際に起きた。
+			await this.refresh();
 			// ホットバー(スロット0-8)にあるものしか持てない。
 			const slot = this.items.find((i) => i.name === want && i.slot >= 0 && i.slot <= 8);
 			if (!slot) {
 				throw new Error(`${itemName} がホットバーにありません`);
 			}
 			await this.sidecar.send("hold", { count: slot.slot });
+			// サーバーが持ち替えを反映するまでの間。すぐ設置すると取りこぼす。
+			await sleep(200);
 			return;
 		}
 

@@ -85,17 +85,21 @@ async function main() {
 		anyLog()?.name ?? anyPlanks()?.name ?? "",
 	);
 
-	// 2. 板。2x2 のレシピ。
-	if (!anyPlanks() && anyLog()) {
+	// 2. 板。2x2 のレシピ。作業台(4)と道具(3+棒)に要るので多めに作る。
+	if (anyLog()) {
 		const log = anyLog()!;
 		const planksName = log.name.replace("_log", "_planks");
-		try {
-			await driver.craft(planksName, 1);
-			await sleep(600);
-			step(`${planksName} を作れる`, count(planksName) > 0, `${count(planksName)}枚`);
-		} catch (e) {
-			step(`${planksName} を作れる`, false, String(e));
+		const want = 12;
+		while (count(planksName) < want && anyLog()) {
+			try {
+				await driver.craft(planksName, 1);
+				await sleep(400);
+			} catch (e) {
+				step(`${planksName} を作れる`, false, String(e));
+				break;
+			}
 		}
+		step(`${planksName} を ${want} 枚そろえる`, count(planksName) >= 4, `${count(planksName)}枚`);
 		show();
 	}
 
@@ -113,7 +117,7 @@ async function main() {
 	}
 
 	// 4. 作業台。2x2 だが板が4枚要る。
-	if (count("crafting_table") === 0 && (anyPlanks()?.count ?? 0) >= 4) {
+	if (count("crafting_table") === 0) {
 		try {
 			await driver.craft("crafting_table", 1);
 			await sleep(600);
