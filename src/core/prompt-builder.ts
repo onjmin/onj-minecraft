@@ -85,7 +85,9 @@ function buildAgentRulesSection(): string {
 === AGENT RULES ===
 If the same skill fails repeatedly or produces no progress for 3 consecutive steps, treat the strategy as stalled and update it instead of repeating the same action.
 
-When a strategy is stalled, prioritize movement or exploration skills to change the environment (e.g., explore_land, goto.player, goto.surface, explore_underground) before attempting the same resource task again.
+When a strategy is stalled, move somewhere new once, then try a DIFFERENT kind of task there. Moving again and again is itself a stalled strategy: exploring without ever gathering, crafting, or building makes no progress.
+
+Prefer the task that unblocks the most other tasks. With empty hands that is usually gathering wood, then crafting a tool. Exploration is only worth it when you have looked and there is nothing to gather where you are.
 
 Never repeat a skill that failed twice in the same environment unless the environment has changed.
 `.trim();

@@ -902,6 +902,12 @@ export class MinecraftAgent {
 					this.instantRepeats = elapsed < 1000 ? this.instantRepeats + 1 : 0;
 				} catch (e) {
 					const errorMsg = e instanceof Error ? e.message : String(e);
+					// 中断は異常ではない。思考ループが別の行動へ乗り換えたときや、
+					// 反射が割り込んだときに必ず出る。これを失敗として数えると
+					// 暴走カウンタが上がり、意味の無い待機が積み上がる。
+					if (errorMsg.includes("中断された") || errorMsg === "Aborted") {
+						continue;
+					}
 					this.log(`Reflex Error: ${errorMsg}`);
 					this.lastFailedTask = this.currentTaskName;
 					// 同じ失敗を即座に繰り返すとログを埋め尽くして CPU も食う。
