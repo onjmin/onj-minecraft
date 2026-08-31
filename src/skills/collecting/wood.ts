@@ -1,4 +1,5 @@
 import type { BlockInfo, BotDriver, Position } from "../../core/driver/types";
+import { envNum } from "../../core/utils/env";
 import { describeGain, gainedSince, snapshotInventory, totalGain } from "../inventory-delta";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
@@ -18,13 +19,13 @@ function isQuadTree(saplingName: string): boolean {
 }
 
 /** 木を1本片付けるのにかける上限。超えたら手持ちのぶんで切り上げる。 */
-const FELL_BUDGET_MS = Number(process.env.WOOD_FELL_BUDGET_MS ?? 40_000);
+const FELL_BUDGET_MS = envNum("WOOD_FELL_BUDGET_MS", 40_000);
 /** 何ブロック掘るごとに落下物を拾うか。 */
 const PICKUP_EVERY = 5;
 /** 1回の伐採で壊してよい葉の数。通り道を空けるぶんだけ。 */
-const MAX_LEAVES = Number(process.env.WOOD_MAX_LEAVES ?? 6);
+const MAX_LEAVES = envNum("WOOD_MAX_LEAVES", 6);
 /** 木が見つからないときに移動して探し直す回数。 */
-const SEARCH_HOPS = Number(process.env.WOOD_SEARCH_HOPS ?? 6);
+const SEARCH_HOPS = envNum("WOOD_SEARCH_HOPS", 6);
 /** 1回の移動距離。読み込み済みの地形の外へ出る程度。 */
 const SEARCH_HOP_DISTANCE = 28;
 
@@ -77,7 +78,11 @@ export const collectWoodSkill = createSkill<void, { felledCount: number; planted
 		let treeTypeToPlant: string | null = null;
 		if (logs.length > 0) {
 			try {
-				const target = logs[0].position;
+				// 幹の根元を狙う。見つけた原木は樹冠の高い位置のことがあり、
+				// その隣に立てる場所は無い。実測で木から10ブロック離れたまま
+				// 近づけず、採掘の届く6ブロックに一度も入れなかった。
+				// 根元なら地面に接しているので、必ず隣に立てる。
+				const target = trunkBase(driver, logs[0].position);
 
 				treeTypeToPlant = getSaplingTypeFromLog(logs[0].name);
 
@@ -127,6 +132,7 @@ export const collectWoodSkill = createSkill<void, { felledCount: number; planted
 				// 戻らず、思考ループから見れば永久に終わらない行動になる。
 				const deadline = Date.now() + FELL_BUDGET_MS;
 				let leavesBroken = 0;
+				let firstDigError = "";
 				// 成果は壊した数ではなく増えた持ち物で測る。葉は掘っても
 				// ほとんど何も落とさないので、壊した数だと嘘になる。
 				gainedBefore = snapshotInventory(driver);
@@ -154,6 +160,10 @@ export const collectWoodSkill = createSkill<void, { felledCount: number; planted
 							// 届かないなら近づいてもう一度。飛ばすだけだと、
 							// 木は見つかっているのに1本も伐れないまま終わる。
 							const msg = digErr instanceof Error ? digErr.message : String(digErr);
+							if (!firstDigError) {
+								firstDigError = msg;
+								agent.log(`[collecting.wood] 掘れない理由: ${msg}`);
+							}
 							if (!msg.includes("遠すぎて")) continue;
 							try {
 								await driver.goto(signal, { kind: "near", position: pos, distance: 2 });
@@ -284,6 +294,22 @@ export const collectWoodSkill = createSkill<void, { felledCount: number; planted
 		});
 	},
 });
+
+/**
+ * その原木と同じ列を下へ辿って、幹の根元を返す。
+ *
+ * 木を切りに行くなら根元へ向かうのが自然で、経路探索も解ける。
+ * 樹冠の1本を目標にすると、その隣に立てる場所が無くて詰む。
+ */
+function trunkBase(driver: BotDriver, from: Position): Position {
+	let y = from.y;
+	for (let i = 0; i < 24; i++) {
+		const below = driver.world.blockAt({ x: from.x, y: y - 1, z: from.z });
+		if (!below || !isLog(below.name)) break;
+		y -= 1;
+	}
+	return { x: from.x, y, z: from.z };
+}
 
 function isLog(name: string): boolean {
 	return (
