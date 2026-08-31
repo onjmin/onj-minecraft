@@ -9,6 +9,13 @@ export const gotoPlayerSkill = createSkill<void, { target: string; distance: num
 		agent,
 		signal,
 	}): Promise<SkillResponse<{ target: string; distance: number }>> => {
+		// 殴られた直後に人へ近づくのは自殺行為。実測で10分に17回死に、
+		// うち14回がプレイヤーによるものだった。その間もこのスキルが
+		// 19回選ばれ、殺してくる相手に自分から歩いて行っていた。
+		if (agent.wasAttackedByPlayerRecently()) {
+			return skillResult.fail("A player attacked you recently. Stay away from players for now.");
+		}
+
 		const { driver } = agent;
 		const state = driver.getState();
 		if (!state.isReady) return skillResult.fail("Bot entity not loaded");

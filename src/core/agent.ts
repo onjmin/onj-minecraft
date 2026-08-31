@@ -73,6 +73,8 @@ const FLEE_HEALTH = Number(process.env.FLEE_HEALTH ?? 10);
 const DEATH_LOOT_WINDOW_MS = Number(process.env.DEATH_LOOT_WINDOW_MS ?? 240_000);
 /** 回収に戻って返り討ちに遭ったあと、次に試すまで置く間隔。 */
 const RECOVER_COOLDOWN_MS = Number(process.env.RECOVER_COOLDOWN_MS ?? 45_000);
+/** プレイヤーに殴られてから、人に近づかないでおく時間。 */
+const PLAYER_HOSTILITY_MS = Number(process.env.PLAYER_HOSTILITY_MS ?? 120_000);
 /** 一度の反射で振る回数。振り続けて本来の行動を止めない程度に。 */
 const ATTACK_SWINGS = 4;
 /** 頭上の蓋に使える物。何でもよいが、貴重な物を使わないよう絞る。 */
@@ -219,6 +221,8 @@ export class MinecraftAgent {
 	 * 落下物は5分ほどで消えるため、古くなったら捨てる。
 	 */
 	private deathPoint: { position: Position; at: number; retryAfter?: number } | null = null;
+	/** 最後にプレイヤーから殴られた時刻。人に近づいてよいかの判断に使う。 */
+	private attackedByPlayerAt = 0;
 	/** 人から話しかけられて、次の判断を急ぎたいときに立てる。 */
 	private humanRequestPending = false;
 	/** 思考ループの待ちを途中で切り上げるための呼び出し口。 */
@@ -293,6 +297,7 @@ export class MinecraftAgent {
 			// ここでは記録だけ。人に殴られたことは覚えておく価値がある。
 			this.driver.on("attacked_by_player", (d: any) => {
 				this.handleSystemMessage(`${d?.name ?? "誰か"} に攻撃された`);
+				this.attackedByPlayerAt = Date.now();
 			});
 			// 死んだ場所を控える。持ち物は全部そこに落ちている。
 			this.driver.on("death", () => {
@@ -927,6 +932,17 @@ export class MinecraftAgent {
 		if (oxygen !== undefined && oxygen <= 0) {
 			this.lastDamageCause = { type: "drowning" };
 		}
+	}
+
+	/**
+	 * 直近でプレイヤーに殴られたか。
+	 *
+	 * 殴られた直後に人へ近づくのは自殺行為。実測で10分に17回死に、
+	 * うち14回がプレイヤーによるもので、その間 goto.player が19回選ばれて
+	 * いた。殺してくる相手に自分から歩いて行っていた。
+	 */
+	public wasAttackedByPlayerRecently(withinMs = PLAYER_HOSTILITY_MS): boolean {
+		return this.attackedByPlayerAt > 0 && Date.now() - this.attackedByPlayerAt < withinMs;
 	}
 
 	/** 死んだ場所。取りに行く価値があるうちだけ返す。 */
