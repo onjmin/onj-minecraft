@@ -1714,6 +1714,9 @@ export class MinecraftAgent {
 	 */
 	private async reflexSurvival(signal: AbortSignal): Promise<void> {
 		try {
+			// 溺死が実測で一番多い死因だった。敵より先に見る。
+			await this.escapeLiquid(signal);
+			await this.recoverDeathLootIfAlive();
 			await this.wearBestArmor();
 			await this.reactToDanger(signal);
 			await this.escapeIfBoxedIn(signal);
@@ -1787,6 +1790,65 @@ export class MinecraftAgent {
 			}
 			await new Promise((r) => setTimeout(r, 600));
 		}
+	}
+
+	/**
+	 * 水や溶岩から出る。
+	 *
+	 * 本番で8分回して4回死に、うち3回が溺死だった。敵に殺されるより多い。
+	 * Java版は ensureOnLand が水から出してくれるが、あれは mineflayer の
+	 * ブロック読み取りに直接触るため統合版では素通りしていた。
+	 */
+	private async escapeLiquid(signal: AbortSignal): Promise<void> {
+		const { driver } = this;
+		const pos = driver.getState().position;
+		const foot = { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) };
+		const at = driver.world.blockAt(foot)?.name ?? "";
+		const head = driver.world.blockAt({ ...foot, y: foot.y + 1 })?.name ?? "";
+		const inLiquid = (n: string) => n === "water" || n === "lava" || n === "flowing_water";
+		if (!inLiquid(at) && !inLiquid(head)) return;
+
+		this.log(`[反射] ${at || head} から出る`);
+
+		// 近くで立てて、液体に浸かっていない場所を探す。
+		for (let r = 1; r <= 12; r++) {
+			for (let dx = -r; dx <= r; dx++) {
+				for (let dz = -r; dz <= r; dz++) {
+					if (Math.max(Math.abs(dx), Math.abs(dz)) !== r) continue;
+					for (let dy = -1; dy <= 3; dy++) {
+						const cand = { x: foot.x + dx, y: foot.y + dy, z: foot.z + dz };
+						const here = driver.world.blockAt(cand)?.name;
+						const above = driver.world.blockAt({ ...cand, y: cand.y + 1 })?.name;
+						const below = driver.world.blockAt({ ...cand, y: cand.y - 1 })?.name;
+						if (here !== "air" || above !== "air") continue;
+						if (!below || below === "air" || inLiquid(below)) continue;
+						try {
+							await driver.goto(signal, { kind: "near", position: cand, distance: 1.5 });
+							return;
+						} catch {
+							// この足場は駄目。次を試す。
+						}
+					}
+				}
+			}
+		}
+	}
+
+	/**
+	 * 生き返っていて落とし物が残っているなら、取りに行く手配をする。
+	 *
+	 * サーバーが復帰の通知を返さないことがあるので、イベントに頼らず
+	 * 「死亡地点を控えている・体力がある」で判断する。
+	 */
+	private async recoverDeathLootIfAlive(): Promise<void> {
+		if (!this.getDeathPoint()) return;
+		if (this.driver.getState().health <= 0) return;
+		if (this.currentTaskName === gotoDeathPointSkill.name) return;
+		if (!this.skills.has(gotoDeathPointSkill.name)) return;
+		this.log("[反射] 落とし物を取りに戻る");
+		this.currentTaskName = gotoDeathPointSkill.name;
+		this.currentTaskSince = Date.now();
+		this.instantRepeats = 0;
 	}
 
 	/**
