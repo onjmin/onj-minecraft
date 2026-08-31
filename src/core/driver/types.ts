@@ -195,7 +195,7 @@ export interface BotDriver {
 	connect(): Promise<void>;
 	disconnect(): Promise<void>;
 	on(
-		event: "spawn" | "death" | "health" | "chat" | "kicked" | "end",
+		event: "spawn" | "death" | "respawn" | "health" | "chat" | "kicked" | "end",
 		listener: (...args: any[]) => void,
 	): void;
 	off(event: string, listener: (...args: any[]) => void): void;

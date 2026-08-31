@@ -4,9 +4,10 @@ import mineflayer, { type ControlState } from "mineflayer";
 import { goals, Movements, pathfinder } from "mineflayer-pathfinder";
 import type { AgentProfile } from "../profiles/types";
 import { exploreLandSkill } from "../skills/exploring/land";
+import { gotoDeathPointSkill } from "../skills/goto/death";
 import type { SkillResponse } from "../skills/types";
 import { JavaDriver } from "./driver/java";
-import type { BotDriver } from "./driver/types";
+import type { BotDriver, Position } from "./driver/types";
 import { llm } from "./llm-client";
 import { parseLlmOutput } from "./llm-output-parser";
 import { createPerceptionSnapshot, type DamageInfo } from "./perception";
@@ -62,6 +63,51 @@ const MAX_UNINTERRUPTED_MS = Number(process.env.SKILL_MAX_RUN_MS ?? 300_000);
  * 戦闘や体力低下の割り込みも別経路なので影響しない。
  */
 const MIN_UNINTERRUPTED_MS = Number(process.env.SKILL_MIN_RUN_MS ?? 60_000);
+
+/** これを下回ったら戦わずに逃げる。 */
+const FLEE_HEALTH = Number(process.env.FLEE_HEALTH ?? 10);
+/** 死亡地点の落とし物を追いかける制限時間。落下物は5分ほどで消える。 */
+const DEATH_LOOT_WINDOW_MS = Number(process.env.DEATH_LOOT_WINDOW_MS ?? 240_000);
+/** 一度の反射で振る回数。振り続けて本来の行動を止めない程度に。 */
+const ATTACK_SWINGS = 4;
+
+/** 攻撃してくる相手かどうか。名前で判断する。 */
+function isHostileMob(name: string): boolean {
+	const hostile = [
+		"zombie",
+		"skeleton",
+		"creeper",
+		"spider",
+		"enderman",
+		"witch",
+		"drowned",
+		"husk",
+		"stray",
+		"phantom",
+		"slime",
+		"magma_cube",
+		"pillager",
+		"vindicator",
+		"ravager",
+		"evocation_illager",
+		"blaze",
+		"piglin",
+		"hoglin",
+		"wither",
+		"guardian",
+		"silverfish",
+		"endermite",
+		"vex",
+	];
+	return hostile.some((h) => name.includes(h));
+}
+
+function distanceTo(
+	a: { x: number; y: number; z: number },
+	b: { x: number; y: number; z: number },
+) {
+	return Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+}
 
 type ObservationRecord = {
 	action: string;
@@ -135,6 +181,15 @@ export class MinecraftAgent {
 	/** 一瞬で終わる行動が続いた回数。空回りの間隔を空けるのに使う。 */
 	private instantRepeats = 0;
 	/**
+	 * 死んだ場所と時刻。持ち物はそこに落ちているので、取りに戻る手掛かり。
+	 * 落下物は5分ほどで消えるため、古くなったら捨てる。
+	 */
+	private deathPoint: { position: Position; at: number } | null = null;
+	/** 人から話しかけられて、次の判断を急ぎたいときに立てる。 */
+	private humanRequestPending = false;
+	/** 思考ループの待ちを途中で切り上げるための呼び出し口。 */
+	private wakeThinking: (() => void) | null = null;
+	/**
 	 * スキルごとの成否の記録。
 	 *
 	 * 「成功と報告するが何も得ていない」スキルを、実績で落とすために持つ。
@@ -194,6 +249,20 @@ export class MinecraftAgent {
 			this.driver.on("chat", (username: string, message: string) =>
 				this.handleIncomingChat(username, message),
 			);
+			// 死んだ場所を控える。持ち物は全部そこに落ちている。
+			this.driver.on("death", () => {
+				this.deathPoint = { position: { ...this.driver.getState().position }, at: Date.now() };
+				this.log(
+					`死亡地点を記録: (${this.deathPoint.position.x.toFixed(0)}, ${this.deathPoint.position.y.toFixed(0)}, ${this.deathPoint.position.z.toFixed(0)})`,
+				);
+			});
+			// 復帰したら、まず落とし物を取りに行かせる。放っておくと消える。
+			this.driver.on("respawn", () => {
+				if (!this.deathPoint) return;
+				this.currentTaskName = gotoDeathPointSkill.name;
+				this.currentTaskSince = Date.now();
+				this.requestImmediateThink();
+			});
 			// mineflayer 固有の初期化（プラグイン・経路探索設定・イベント配線）は行わない。
 			// ループの起動は接続完了後に startLoops() を呼び出す側の責務とする。
 			return;
@@ -284,6 +353,17 @@ export class MinecraftAgent {
 		}
 		this.lastHeardAt = Date.now();
 		this.log(`<${username}> ${message}`);
+		// 人の話は次の判断まで30秒待たせない。指示なら尚更で、
+		// 待たせると「聞こえていない」ようにしか見えない。
+		this.humanRequestPending = true;
+		this.requestImmediateThink();
+	}
+
+	/** 思考ループの待ちを切り上げて、すぐ考え直させる。 */
+	private requestImmediateThink(): void {
+		const wake = this.wakeThinking;
+		this.wakeThinking = null;
+		if (wake) wake();
 	}
 
 	/** 直近に話しかけられているか。発言してよいかの判断に使う。 */
@@ -683,6 +763,21 @@ export class MinecraftAgent {
 		}
 	}
 
+	/** 死んだ場所。取りに行く価値があるうちだけ返す。 */
+	public getDeathPoint(): Position | null {
+		if (!this.deathPoint) return null;
+		if (Date.now() - this.deathPoint.at > DEATH_LOOT_WINDOW_MS) {
+			// 落下物はもう消えている。追いかけるだけ無駄。
+			this.deathPoint = null;
+			return null;
+		}
+		return this.deathPoint.position;
+	}
+
+	public clearDeathPoint(): void {
+		this.deathPoint = null;
+	}
+
 	private recordSkillOutcome(name: string, ok: boolean) {
 		const st = this.skillStats.get(name) ?? { ok: 0, fail: 0 };
 		if (ok) st.ok++;
@@ -896,7 +991,17 @@ export class MinecraftAgent {
 				this.log(`Thinking error: ${err}`);
 			}
 
-			await new Promise((r) => setTimeout(r, 30000));
+			// 途中で起こされたら待たずに次を考える。
+			await new Promise<void>((resolve) => {
+				const timer = setTimeout(() => {
+					this.wakeThinking = null;
+					resolve();
+				}, 30000);
+				this.wakeThinking = () => {
+					clearTimeout(timer);
+					resolve();
+				};
+			});
 		}
 	}
 
@@ -1047,6 +1152,11 @@ export class MinecraftAgent {
 			this.updateFIFO(this.strategicState.achievements, achievementMatch[1].trim());
 		}
 
+		// この判断で使い切る。次の周からは通常の猶予に戻す。
+		const wasHumanRequest = this.humanRequestPending;
+		this.humanRequestPending = false;
+		void wasHumanRequest;
+
 		const rationale = result.memory || "No reasoning.";
 		const foundSkillName = result.action?.name;
 		const parsedArgs = this.nameParsedArgs(
@@ -1101,8 +1211,13 @@ export class MinecraftAgent {
 			// 実行ごとに測ると、16秒で終わって再実行される exploring.explore_land の
 			// ような短い行動が常に猶予内に入り、永久に乗り換えられなくなる。
 			const owningMs = this.currentTaskSince > 0 ? Date.now() - this.currentTaskSince : 0;
+			// 人に話しかけられた直後の判断は待たせない。指示に従うのが遅れると
+			// 何度も言い直させることになる。
 			const tooEarlyToSwitch =
-				!isSameTask && this.currentTaskSince > 0 && owningMs < MIN_UNINTERRUPTED_MS;
+				!isSameTask &&
+				!this.humanRequestPending &&
+				this.currentTaskSince > 0 &&
+				owningMs < MIN_UNINTERRUPTED_MS;
 			if (tooEarlyToSwitch && !ranTooLong) {
 				this.log(
 					`${this.currentTaskName} を継続します（担当 ${Math.round(owningMs / 1000)}秒、${foundSkillName} への切り替えは保留）`,
@@ -1598,11 +1713,76 @@ export class MinecraftAgent {
 	private async reflexSurvival(signal: AbortSignal): Promise<void> {
 		try {
 			await this.wearBestArmor();
+			await this.reactToDanger(signal);
 			await this.escapeIfBoxedIn(signal);
 		} catch (e) {
 			// 反射行動で本来の行動を止めない。
 			if (!signal.aborted) this.log(`反射行動でつまずいた: ${e}`);
 		}
+	}
+
+	/**
+	 * 敵が近い、または体力が減っているときの反応。
+	 *
+	 * 統合版には戦闘の処理が無かった。Java版は mineflayer の pvp と
+	 * bot.on("health") に任せており、そのどちらも統合版には無い。
+	 * 結果としてボットは殴られても何もせず、黙って死んで持ち物を全部落として
+	 * いた。集めた物が毎回消えるので、何を積んでも残らない。
+	 */
+	private async reactToDanger(signal: AbortSignal): Promise<void> {
+		const state = this.driver.getState();
+		const hostiles = this.driver
+			.nearbyEntities(16)
+			.filter((e) => isHostileMob(e.name))
+			.sort(
+				(a, b) => distanceTo(state.position, a.position) - distanceTo(state.position, b.position),
+			);
+		if (hostiles.length === 0) return;
+
+		const nearest = hostiles[0];
+		const range = distanceTo(state.position, nearest.position);
+		// クリーパーは殴る間合いが自爆の間合い。近づかない。
+		const mustFlee =
+			state.health <= FLEE_HEALTH || nearest.name.includes("creeper") || !this.hasWeapon();
+
+		if (mustFlee) {
+			if (range > 8) return;
+			this.log(`[反射] ${nearest.name} から離れる（HP ${state.health}、距離 ${range.toFixed(1)}）`);
+			// 敵と反対の方向へ。届かなくても離れられればよい。
+			const dx = state.position.x - nearest.position.x;
+			const dz = state.position.z - nearest.position.z;
+			const len = Math.hypot(dx, dz) || 1;
+			try {
+				await this.driver.goto(signal, {
+					kind: "xz",
+					x: state.position.x + (dx / len) * 12,
+					z: state.position.z + (dz / len) * 12,
+					distance: 3,
+				});
+			} catch {
+				// 逃げ切れなくても、動いただけ距離は稼げている。
+			}
+			return;
+		}
+
+		if (range > 3.5) return;
+		this.log(`[反射] ${nearest.name} を攻撃する（距離 ${range.toFixed(1)}）`);
+		for (let i = 0; i < ATTACK_SWINGS; i++) {
+			if (signal.aborted) return;
+			try {
+				await this.driver.attack(signal, nearest.id);
+			} catch {
+				return;
+			}
+			await new Promise((r) => setTimeout(r, 600));
+		}
+	}
+
+	/** 殴れる物を持っているか。素手で敵に向かうのは逃げるより悪い。 */
+	private hasWeapon(): boolean {
+		return this.driver.inventory
+			.items()
+			.some((i) => i.name.endsWith("_sword") || i.name.endsWith("_axe"));
 	}
 
 	/** 持っている中で一番良い防具を着る。既に着ているものは触らない。 */

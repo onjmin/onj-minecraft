@@ -26,6 +26,7 @@ import { craftWeaponSkill } from "../skills/crafting/weapon";
 import { exploreLandSkill } from "../skills/exploring/land";
 import { gotoBaseSkill } from "../skills/goto/base";
 import { gotoCoordsSkill } from "../skills/goto/coords";
+import { gotoDeathPointSkill } from "../skills/goto/death";
 import { gotoPlayerSkill } from "../skills/goto/player";
 import { gotoSurfaceSkill } from "../skills/goto/surface";
 
@@ -35,6 +36,9 @@ import { gotoSurfaceSkill } from "../skills/goto/surface";
 // collecting.stealing だけ外している。中身を漁るのは他プレイヤーのチェストで、
 // 本番の Realm では壊してよいものの範囲外だから。破壊や設置は許可されている。
 const bedrockSkills = [
+	// 死んだあとの回収を最優先で選べるようにしておく。持ち物は全部その場に
+	// 落ち、5分ほどで消える。取りに戻らないと何を積んでも残らない。
+	gotoDeathPointSkill,
 	exploreLandSkill,
 	gotoSurfaceSkill,
 	gotoCoordsSkill,
