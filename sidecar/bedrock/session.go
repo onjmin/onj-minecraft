@@ -2240,29 +2240,15 @@ func (s *session) dispatch(c command) {
 
 		// 作業台が要るレシピは、その作業台を実際に開く。持ち物の画面のままだと
 		// 3x3 の枠(32..40)が存在しないので置き先が不正になる。
+		//
+		// 開いた確認を取ること。以前は500ミリ秒待つだけで、開いていなくても
+		// 送っていた。サーバーは受理を返すのに何も作られない、という形で
+		// 失敗する。実測で木の剣を17回試して1本もできなかった。
 		if chosen.NeedsTable && c.Value {
-			s.mu.Lock()
-			bx := int32(math.Floor(float64(c.X)))
-			by := int32(math.Floor(float64(c.Y)))
-			bz := int32(math.Floor(float64(c.Z)))
-			face := faceToward(s.pos, bx, by, bz)
-			clicked, _ := s.world.runtimeIDAt(bx, by, bz)
-			held := s.rawSlots[int(s.heldSlot)]
-			s.pendingPlace = &protocol.UseItemTransactionData{
-				ActionType:       protocol.UseItemActionClickBlock,
-				TriggerType:      protocol.TriggerTypePlayerInput,
-				BlockPosition:    protocol.BlockPos{bx, by, bz},
-				BlockFace:        face,
-				HotBarSlot:       s.heldSlot,
-				HeldItem:         held,
-				Position:         s.pos,
-				ClickedPosition:  clickOffset(face),
-				BlockRuntimeID:   uint32(clicked),
-				ClientPrediction: protocol.ClientPredictionSuccess,
+			if _, err := s.openContainerAt(c.X, c.Y, c.Z); err != nil {
+				s.reply(c.ID, false, fmt.Sprintf("作業台を開けません: %v", err), nil)
+				return
 			}
-			s.mu.Unlock()
-			// 開くのは次のtickに載る。サーバーが受理するまで少し待つ。
-			time.Sleep(500 * time.Millisecond)
 		}
 
 		if os.Getenv("BEDROCK_TRACE_CRAFT") == "1" {
