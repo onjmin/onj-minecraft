@@ -1071,10 +1071,17 @@ func (s *session) defendLocked(n uint64) bool {
 			continue
 		}
 		d := e.Pos.Sub(feet).Len()
-		if d < best {
-			best = d
-			target = e
+		if d >= best {
+			continue
 		}
+		// 壁の向こうの敵には反応しない。見えていない相手から逃げ続けると、
+		// 安全な場所にいるのに動き回って別の危険に当たる。
+		// mindcraft も self_defense / cowardice の両方で isClearPath を見ている。
+		if !s.clearPathLocked(feet, e.Pos) {
+			continue
+		}
+		best = d
+		target = e
 	}
 	if target == nil {
 		s.fighting = 0
@@ -1124,6 +1131,9 @@ func (s *session) defendLocked(n uint64) bool {
 	}
 	s.fleeSince = 0
 
+	// 殴る前に一番強い武器へ持ち替える。手に持っている物のまま殴ると、
+	// 剣を持っていてもツルハシで殴ることになる。
+	s.holdBestWeaponLocked()
 	// 殴る。間合いの外なら詰める。
 	s.lookAtLocked(target.Pos[0], target.Pos[1], target.Pos[2])
 	if best > attackReach {
@@ -1147,6 +1157,77 @@ func (s *session) defendLocked(n uint64) bool {
 		})
 	}
 	return true
+}
+
+// clearPathLocked は from から to まで、固いブロックに遮られていないか。
+// 目線の高さから相手の胴あたりへ、粗く辿って見る。
+// 呼び出し側が mu を持つこと。
+func (s *session) clearPathLocked(from, to mgl32.Vec3) bool {
+	eye := mgl32.Vec3{from[0], from[1] + eyeHeight, from[2]}
+	aim := mgl32.Vec3{to[0], to[1] + 1, to[2]}
+	d := aim.Sub(eye)
+	dist := d.Len()
+	if dist < 0.5 {
+		return true
+	}
+	steps := int(dist * 2)
+	for i := 1; i < steps; i++ {
+		t := float32(i) / float32(steps)
+		p := eye.Add(d.Mul(t))
+		name, ok := s.world.blockAt(
+			int32(math.Floor(float64(p[0]))),
+			int32(math.Floor(float64(p[1]))),
+			int32(math.Floor(float64(p[2]))),
+		)
+		if !ok {
+			continue
+		}
+		if !passableBlocks[name] {
+			return false
+		}
+	}
+	return true
+}
+
+// holdBestWeaponLocked はホットバーで一番強い武器を手に持つ。
+// 呼び出し側が mu を持つこと。
+func (s *session) holdBestWeaponLocked() {
+	rank := []string{"netherite", "diamond", "iron", "stone", "golden", "wooden"}
+	bestSlot := -1
+	bestRank := len(rank)
+	for _, it := range s.slots {
+		if it.Slot < 0 || it.Slot > 8 {
+			continue
+		}
+		if !strings.HasSuffix(it.Name, "_sword") && !strings.HasSuffix(it.Name, "_axe") {
+			continue
+		}
+		r := len(rank)
+		for i, m := range rank {
+			if strings.HasPrefix(it.Name, m) {
+				r = i
+				break
+			}
+		}
+		// 同じ素材なら剣を優先する。
+		if strings.HasSuffix(it.Name, "_axe") {
+			r++
+		}
+		if r < bestRank {
+			bestRank = r
+			bestSlot = it.Slot
+		}
+	}
+	if bestSlot < 0 || int32(bestSlot) == s.heldSlot {
+		return
+	}
+	s.heldSlot = int32(bestSlot)
+	_ = s.conn.WritePacket(&packet.MobEquipment{
+		EntityRuntimeID: s.game.EntityRuntimeID,
+		NewItem:         s.rawSlots[bestSlot],
+		InventorySlot:   byte(bestSlot),
+		HotBarSlot:      byte(bestSlot),
+	})
 }
 
 // hasWeaponLocked はホットバーに殴れる物があるか。

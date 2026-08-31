@@ -14,6 +14,7 @@ import { parseLlmOutput } from "./llm-output-parser";
 import { createPerceptionSnapshot, type DamageInfo } from "./perception";
 import { buildThinkingPrompt } from "./prompt-builder";
 import type { SafeBot } from "./types";
+import { appendChatLog } from "./utils/chat-log";
 import { emitDiscordWebhook, translateWithRoleplay } from "./utils/discord-webhook";
 import { isSameSimhash } from "./utils/simhash";
 
@@ -364,6 +365,7 @@ export class MinecraftAgent {
 		}
 		this.lastHeardAt = Date.now();
 		this.log(`<${username}> ${message}`);
+		appendChatLog("in", username, message);
 		// 人の話は次の判断まで30秒待たせない。指示なら尚更で、
 		// 待たせると「聞こえていない」ようにしか見えない。
 		this.humanRequestPending = true;
@@ -1209,6 +1211,7 @@ export class MinecraftAgent {
 			// ENABLE_CHAT=1 にすると従来通り常に発言する（複数体で会話させる場合）。
 			if (process.env.ENABLE_CHAT === "1" || this.wasSpokenToRecently()) {
 				this.driver.chat(chatMessage);
+				appendChatLog("out", this.profile.minecraftName, chatMessage);
 			} else {
 				this.log(`(独り言のため発言せず: ${chatMessage})`);
 			}
