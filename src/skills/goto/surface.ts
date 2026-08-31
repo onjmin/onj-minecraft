@@ -186,7 +186,16 @@ export const gotoSurfaceSkill = createSkill<void, { y: number; method: string }>
 				return partial() ?? skillResult.fail("Dig-up aborted or failed");
 			}
 
-			currentDigY++;
+			// 掘っただけでは登れない。縦穴が伸びるだけでボットは底に残る。
+			// 実測で100回掘って高さが1も変わらなかった。跳んで足元に置く。
+			const climbedNow = await driver.pillarUp(signal, 1);
+			if (climbedNow === 0) {
+				// 置ける物が尽きたか、上がれない。掘った穴は残るので、
+				// 次の機会に続きから登れる。
+				return partial() ?? skillResult.fail("Could not climb: nothing to stand on.");
+			}
+
+			currentDigY = Math.floor(driver.getState().position.y);
 		}
 
 		return partial() ?? skillResult.fail("Could not reach surface.");

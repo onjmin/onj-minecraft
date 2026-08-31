@@ -1862,6 +1862,83 @@ func (s *session) dispatch(c command) {
 			s.reply(c.ID, true, "", map[string]any{"moved": moved})
 		}
 
+	case "pillar":
+		// 柱を積んで登る。跳んで、浮いている間に足元へブロックを置く。
+		//
+		// 頭上を掘るだけでは登れない。縦穴が伸びるだけでボットは底に残る。
+		// 実測で100回掘り上がって高さが1も変わらなかった。実プレイヤーは
+		// この置き方で上がっている。
+		{
+			want := max(1, c.Count)
+			placed := 0
+			for i := 0; i < want; i++ {
+				s.mu.Lock()
+				// 置ける物を手に持つ。無ければそこで終わり。
+				if !s.holdPlaceableLocked() {
+					s.mu.Unlock()
+					break
+				}
+				feet := s.feetLocked()
+				fx := int32(math.Floor(float64(feet[0])))
+				fy := int32(math.Floor(float64(feet[1])))
+				fz := int32(math.Floor(float64(feet[2])))
+				// 頭上が塞がっていたら跳べない。先に掘ってもらう必要がある。
+				if name, ok := s.world.blockAt(fx, fy+2, fz); ok && name != "air" {
+					s.mu.Unlock()
+					s.reply(c.ID, false, fmt.Sprintf("頭上が塞がっています(%s)", name), nil)
+					return
+				}
+				// 跳ぶ。縦速度は buildInput の予測に乗る。
+				s.controls["jump"] = true
+				s.mu.Unlock()
+
+				// 頂点あたりまで待つ。0.42/tick で上がり 0.08 ずつ減速するので
+				// 5tick ほどで一番高くなる。
+				time.Sleep(250 * time.Millisecond)
+
+				s.mu.Lock()
+				s.controls["jump"] = false
+				// 足元の1つ下を支えにして、自分がいたマスへ置く。
+				ref := protocol.BlockPos{fx, fy - 1, fz}
+				clicked, _ := s.world.runtimeIDAt(ref[0], ref[1], ref[2])
+				held := s.rawSlots[int(s.heldSlot)]
+				s.pendingPlace = &protocol.UseItemTransactionData{
+					ActionType:       protocol.UseItemActionClickBlock,
+					TriggerType:      protocol.TriggerTypePlayerInput,
+					BlockPosition:    ref,
+					BlockFace:        1, // 上面
+					HotBarSlot:       s.heldSlot,
+					HeldItem:         held,
+					Position:         s.pos,
+					ClickedPosition:  clickOffset(1),
+					BlockRuntimeID:   uint32(clicked),
+					ClientPrediction: protocol.ClientPredictionSuccess,
+				}
+				s.mu.Unlock()
+
+				// 置いた結果が返るのを待つ。
+				time.Sleep(500 * time.Millisecond)
+				s.mu.Lock()
+				after := int32(math.Floor(float64(s.feetLocked()[1])))
+				s.mu.Unlock()
+				if after > fy {
+					placed++
+					continue
+				}
+				// 上がれていない。これ以上繰り返しても同じ。
+				break
+			}
+			s.mu.Lock()
+			s.controls["jump"] = false
+			y := s.feetLocked()[1]
+			s.mu.Unlock()
+			if placed == 0 {
+				s.reply(c.ID, false, "柱を積めませんでした（置ける物が無いか、上がれない）", nil)
+				return
+			}
+			s.reply(c.ID, true, "", map[string]any{"placed": placed, "y": y})
+		}
+
 	case "activate":
 		// ブロックを開く/使う（かまど・チェスト・ドア）。
 		// 送るものは設置と同じ ClickBlock のトランザクションで、サーバーが

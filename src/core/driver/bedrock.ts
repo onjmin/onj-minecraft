@@ -590,6 +590,12 @@ export class BedrockDriver implements BotDriver {
 		await sleep(400);
 		await this.refreshBlocks(true);
 	}
+	async pillarUp(_signal: AbortSignal, count: number): Promise<number> {
+		const res = await this.sidecar.send("pillar", { count }, 30_000);
+		await this.refresh();
+		return Number((res as any)?.placed ?? 0);
+	}
+
 	async activateBlock(position: Position): Promise<void> {
 		// face に -1 を渡すと、サイドカーがプレイヤー側の面を選ぶ。
 		await this.sidecar.send("activate", {

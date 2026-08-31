@@ -56,7 +56,13 @@ export const llm = {
 						}
 
 						const json = await response.json();
-						const content = json.choices[0].message.content || "";
+						const message = json.choices?.[0]?.message ?? {};
+						// 推論型のモデルは思考を reasoning_content に出し、上限に
+						// 当たると content が空のまま返ってくる。空を掴んで
+						// 「Empty LLM output」で落ちるより、思考の中身から拾って
+						// 先へ進める方がよい。モデルを差し替えたときに黙って
+						// 壊れないための保険。
+						const content: string = message.content || message.reasoning_content || "";
 
 						// ローカルLLMへの負荷軽減のため、少しだけ待機（冷却期間）
 						await new Promise((r) => setTimeout(r, 200));

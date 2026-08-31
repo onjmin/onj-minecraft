@@ -150,6 +150,12 @@ export interface BotDriver {
 	 * エディション固有の Block オブジェクトを skills/ 側に持ち回らせないため。
 	 */
 	dig(signal: AbortSignal, position: Position): Promise<void>;
+	/**
+	 * 柱を積んで登る。跳んで、浮いている間に足元へブロックを置く。
+	 * 頭上を掘るだけでは登れない(縦穴が伸びるだけ)ので、上がるにはこれが要る。
+	 * 実際に上がれた段数を返す。
+	 */
+	pillarUp(signal: AbortSignal, count: number): Promise<number>;
 	/** reference ブロックの face 方向の面にブロックを設置する。 */
 	placeBlock(signal: AbortSignal, reference: Position, face: Position): Promise<void>;
 	activateBlock(position: Position): Promise<void>;

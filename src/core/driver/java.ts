@@ -208,6 +208,35 @@ export class JavaDriver implements BotDriver {
 		await this.agent.abortableDig(signal, block);
 	}
 
+	async pillarUp(_signal: AbortSignal, count: number): Promise<number> {
+		// Java版は mineflayer-pathfinder が登りも面倒を見るので、ここは
+		// 素直な実装で足りる。跳んで、浮いている間に足元へ置く。
+		const bot: any = this.agent.bot;
+		let placed = 0;
+		for (let i = 0; i < count; i++) {
+			const before = Math.floor(bot.entity.position.y);
+			const item = bot.inventory
+				.items()
+				.find((it: any) => /dirt|cobblestone|stone|planks|netherrack/.test(it.name));
+			if (!item) break;
+			try {
+				await bot.equip(item, "hand");
+				bot.setControlState("jump", true);
+				await new Promise((r) => setTimeout(r, 250));
+				bot.setControlState("jump", false);
+				const below = bot.blockAt(bot.entity.position.offset(0, -1, 0));
+				if (!below) break;
+				await bot.placeBlock(below, { x: 0, y: 1, z: 0 });
+				await new Promise((r) => setTimeout(r, 300));
+			} catch {
+				break;
+			}
+			if (Math.floor(bot.entity.position.y) <= before) break;
+			placed++;
+		}
+		return placed;
+	}
+
 	async placeBlock(signal: AbortSignal, reference: Position, face: Position): Promise<void> {
 		if (this.agent.checkAbort(signal)) throw new Error("Aborted");
 		const block = this.bot.blockAt(toVec3(reference));

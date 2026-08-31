@@ -5,6 +5,7 @@ import { goals, Movements, pathfinder } from "mineflayer-pathfinder";
 import type { AgentProfile } from "../profiles/types";
 import { exploreLandSkill } from "../skills/exploring/land";
 import { gotoDeathPointSkill } from "../skills/goto/death";
+import { gotoSurfaceSkill } from "../skills/goto/surface";
 import type { SkillResponse } from "../skills/types";
 import { JavaDriver } from "./driver/java";
 import type { BotDriver, Position } from "./driver/types";
@@ -76,6 +77,8 @@ const PLACEABLE_COVER = ["dirt", "cobblestone", "stone", "_planks", "gravel", "s
 const ARMOR_SUFFIXES = ["_helmet", "_chestplate", "_leggings", "_boots"];
 /** この体力を下回ったら、昼でも潜って回復を待つ。 */
 const SHELTER_HEALTH = Number(process.env.SHELTER_HEALTH ?? 8);
+/** 埋まっているかを見る高さ。屋根はこの範囲に収まる前提。 */
+const BURIED_SCAN_HEIGHT = 32;
 
 /** 攻撃してくる相手かどうか。名前で判断する。 */
 function isHostileMob(name: string): boolean {
@@ -1730,6 +1733,7 @@ export class MinecraftAgent {
 	private async reflexSurvival(signal: AbortSignal): Promise<void> {
 		try {
 			await this.recoverDeathLootIfAlive();
+			this.returnToSurfaceIfBuried();
 			await this.wearBestArmor();
 			if (await this.shelterAtNight(signal)) return;
 			await this.escapeIfBoxedIn(signal);
@@ -1752,6 +1756,47 @@ export class MinecraftAgent {
 		if (!this.skills.has(gotoDeathPointSkill.name)) return;
 		this.log("[反射] 落とし物を取りに戻る");
 		this.currentTaskName = gotoDeathPointSkill.name;
+		this.currentTaskSince = Date.now();
+		this.instantRepeats = 0;
+	}
+
+	/**
+	 * 地下に埋まっているなら、地上へ戻ることを最優先にする。
+	 *
+	 * 木も動物も地上にある。地下で探索や狩りを繰り返しても永久に何も得られ
+	 * ない。実測で Y=34 に落ちたまま10分間、exploring.explore_land 63回と
+	 * collecting.hunting 23回を空振りし続けた。どちらもその場では成立しない。
+	 *
+	 * これは判断ではなく前提条件なので、LLM に選ばせない。ただし採集中は
+	 * 邪魔しない。地下を掘っているのは正しい行動でありうる。
+	 */
+	private returnToSurfaceIfBuried(): void {
+		if (!this.skills.has(gotoSurfaceSkill.name)) return;
+		if (this.currentTaskName === gotoSurfaceSkill.name) return;
+		// 採集や設置の最中は割り込まない。地下にいるのが目的のことがある。
+		if (this.currentTaskName.startsWith("collecting.")) return;
+		if (this.currentTaskName.startsWith("building.")) return;
+
+		const state = this.driver.getState();
+		const foot = {
+			x: Math.floor(state.position.x),
+			y: Math.floor(state.position.y),
+			z: Math.floor(state.position.z),
+		};
+		// 頭上に空気以外があれば屋根の下。goto.surface と同じ見方をする。
+		let buried = false;
+		for (let y = foot.y + 2; y <= foot.y + 2 + BURIED_SCAN_HEIGHT; y++) {
+			const above = this.driver.world.blockAt({ x: foot.x, y, z: foot.z });
+			if (above === null) break;
+			if (above.name !== "air") {
+				buried = true;
+				break;
+			}
+		}
+		if (!buried) return;
+
+		this.log("[反射] 地下に埋まっている。地上へ戻る");
+		this.currentTaskName = gotoSurfaceSkill.name;
 		this.currentTaskSince = Date.now();
 		this.instantRepeats = 0;
 	}
