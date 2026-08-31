@@ -9,11 +9,10 @@
  * 通っているのは接続・状態・エンティティ・持ち物・移動・発言・ワールド読み取り・
  * 採掘・設置・クラフト・攻撃。本番 Realm で確認済み。
  *
- * 残っている未実装は次の3つ。いずれも notImplemented() で例外にする。
+ * 残っている未実装は次の2つ。いずれも notImplemented() で例外にする。
  * 黙って何もせず成功を装うと、スキル側が「やった」と誤解して先へ進むため。
  *   - smelt / canSmelt: 精錬
  *   - takeAllFromContainer: コンテナからの回収
- *   - equip の hand 以外: 防具の装備
  */
 import { BlockView } from "./blockview";
 import { BedrockSidecar } from "./sidecar";
@@ -52,6 +51,14 @@ export interface BedrockDriverOptions {
 	/** WSL のディストリビューション名。 */
 	wslDistro?: string;
 }
+
+/** 防具コンテナのスロット番号。Java版の destination 名に合わせる。 */
+const ARMOR_SLOTS: Record<string, number> = {
+	head: 0,
+	torso: 1,
+	legs: 2,
+	feet: 3,
+};
 
 function notImplemented(what: string): never {
 	throw new Error(`統合版では${what}がまだ使えません`);
@@ -561,16 +568,30 @@ export class BedrockDriver implements BotDriver {
 		throw new Error(`攻撃対象(${entityId})に近づけませんでした`);
 	}
 	async equip(itemName: string, destination: string): Promise<void> {
-		if (destination !== "hand") {
+		const want = stripNamespace(itemName);
+
+		if (destination === "hand") {
+			// ホットバー(スロット0-8)にあるものしか持てない。
+			const slot = this.items.find((i) => i.name === want && i.slot >= 0 && i.slot <= 8);
+			if (!slot) {
+				throw new Error(`${itemName} がホットバーにありません`);
+			}
+			await this.sidecar.send("hold", { count: slot.slot });
+			return;
+		}
+
+		// 防具は持ち替えでは着られない。防具コンテナへ移す必要がある。
+		const armorSlot = ARMOR_SLOTS[destination];
+		if (armorSlot === undefined) {
 			notImplemented(`${destination} への装備`);
 		}
-		const want = stripNamespace(itemName);
-		// ホットバー(スロット0-8)にあるものしか持てない。
-		const slot = this.items.find((i) => i.name === want && i.slot >= 0 && i.slot <= 8);
-		if (!slot) {
-			throw new Error(`${itemName} がホットバーにありません`);
+		const item = this.items.find((i) => i.name === want && i.slot >= 0);
+		if (!item) {
+			throw new Error(`${itemName} を持っていません`);
 		}
-		await this.sidecar.send("hold", { count: slot.slot });
+		await this.sidecar.send("wear", { names: [String(item.slot)], count: armorSlot });
+		await sleep(300);
+		await this.refresh();
 	}
 
 	/**

@@ -18,6 +18,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1204,6 +1205,65 @@ func (s *session) dispatch(c command) {
 		}
 		s.mu.Unlock()
 		s.reply(c.ID, true, "", nil)
+
+	case "wear":
+		// 防具を着る。手に持つのと違い、選択スロットを変えるだけでは着られない。
+		// 防具コンテナの該当スロットへ ItemStackRequest で移す必要がある。
+		// コンテナを開く操作は要らない。自分の防具は常に触れる。
+		//
+		// Names[0] に移したい持ち物のスロット番号、Count に防具スロット
+		// (0=頭 1=胴 2=脚 3=足) を入れて呼ぶ。
+		{
+			if len(c.Names) == 0 {
+				s.reply(c.ID, false, "移す持ち物のスロットを指定してください", nil)
+				return
+			}
+			fromSlot, err := strconv.Atoi(c.Names[0])
+			if err != nil || fromSlot < 0 {
+				s.reply(c.ID, false, fmt.Sprintf("持ち物のスロットが不正です: %s", c.Names[0]), nil)
+				return
+			}
+			armorSlot := c.Count
+			if armorSlot < 0 || armorSlot > 3 {
+				s.reply(c.ID, false, "防具スロットは 0..3 です", nil)
+				return
+			}
+			s.mu.Lock()
+			item, ok := s.rawSlots[fromSlot]
+			if !ok || item.Stack.Count == 0 {
+				s.mu.Unlock()
+				s.reply(c.ID, false, fmt.Sprintf("スロット %d は空です", fromSlot), nil)
+				return
+			}
+			// クラフトと同じく、リクエストIDは負の奇数を順に減らす。
+			s.craftReqID -= 2
+			reqID := s.craftReqID
+			move := &protocol.PlaceStackRequestAction{}
+			// 防具は1つずつしか着けない。スタック数がbyteに収まらないことも無い。
+			move.Count = byte(min(item.Stack.Count, 1))
+			move.Source = protocol.StackRequestSlotInfo{
+				Container:      protocol.FullContainerName{ContainerID: protocol.ContainerCombinedHotBarAndInventory},
+				Slot:           byte(fromSlot),
+				StackNetworkID: item.StackNetworkID,
+			}
+			move.Destination = protocol.StackRequestSlotInfo{
+				Container:      protocol.FullContainerName{ContainerID: protocol.ContainerArmor},
+				Slot:           byte(armorSlot),
+				StackNetworkID: 0,
+			}
+			s.mu.Unlock()
+
+			if err := s.conn.WritePacket(&packet.ItemStackRequest{
+				Requests: []protocol.ItemStackRequest{{
+					RequestID: reqID,
+					Actions:   []protocol.StackRequestAction{move},
+				}},
+			}); err != nil {
+				s.reply(c.ID, false, fmt.Sprintf("装備の送信に失敗: %v", err), nil)
+				return
+			}
+			s.reply(c.ID, true, "", nil)
+		}
 
 	case "activate":
 		// ブロックを開く/使う（かまど・チェスト・ドア）。
