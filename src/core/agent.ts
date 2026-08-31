@@ -17,6 +17,7 @@ import { buildThinkingPrompt } from "./prompt-builder";
 import type { SafeBot } from "./types";
 import { appendChatLog } from "./utils/chat-log";
 import { emitDiscordWebhook, translateWithRoleplay } from "./utils/discord-webhook";
+import { envNum } from "./utils/env";
 import { isSameSimhash } from "./utils/simhash";
 
 const tryLoad = (bot: any, name: string, mod: any) => {
@@ -51,7 +52,7 @@ let lastDiscordEmitAt = 0;
  * それだけだとハングしたスキルに永久に居座られる。以前は30秒ごとの無条件中断が
  * 結果的にその番人を兼ねていたので、代わりの上限をここで持つ。
  */
-const MAX_UNINTERRUPTED_MS = Number(process.env.SKILL_MAX_RUN_MS ?? 300_000);
+const MAX_UNINTERRUPTED_MS = envNum("SKILL_MAX_RUN_MS", 300_000);
 
 /**
  * 実行中の行動を、別の行動に乗り換えるために中断してよくなるまでの時間。
@@ -65,31 +66,50 @@ const MAX_UNINTERRUPTED_MS = Number(process.env.SKILL_MAX_RUN_MS ?? 300_000);
  * この判定より前で処理されるので、話しかけへの返答は遅れない。
  * 戦闘や体力低下の割り込みも別経路なので影響しない。
  */
-const MIN_UNINTERRUPTED_MS = Number(process.env.SKILL_MIN_RUN_MS ?? 60_000);
+const MIN_UNINTERRUPTED_MS = envNum("SKILL_MIN_RUN_MS", 60_000);
 
 /** これを下回ったら戦わずに逃げる。 */
-const FLEE_HEALTH = Number(process.env.FLEE_HEALTH ?? 10);
+const FLEE_HEALTH = envNum("FLEE_HEALTH", 10);
 /** 死亡地点の落とし物を追いかける制限時間。落下物は5分ほどで消える。 */
-const DEATH_LOOT_WINDOW_MS = Number(process.env.DEATH_LOOT_WINDOW_MS ?? 240_000);
+const DEATH_LOOT_WINDOW_MS = envNum("DEATH_LOOT_WINDOW_MS", 240_000);
 /** 回収に戻って返り討ちに遭ったあと、次に試すまで置く間隔。 */
-const RECOVER_COOLDOWN_MS = Number(process.env.RECOVER_COOLDOWN_MS ?? 45_000);
+const RECOVER_COOLDOWN_MS = envNum("RECOVER_COOLDOWN_MS", 45_000);
 /** プレイヤーに殴られてから、人に近づかないでおく時間。 */
-const PLAYER_HOSTILITY_MS = Number(process.env.PLAYER_HOSTILITY_MS ?? 120_000);
+const PLAYER_HOSTILITY_MS = envNum("PLAYER_HOSTILITY_MS", 120_000);
 /** 一度の反射で振る回数。振り続けて本来の行動を止めない程度に。 */
 const ATTACK_SWINGS = 4;
 /** 頭上の蓋に使える物。何でもよいが、貴重な物を使わないよう絞る。 */
 const PLACEABLE_COVER = ["dirt", "cobblestone", "stone", "_planks", "gravel", "sand", "netherrack"];
 /** 防具かどうかの判定に使う。 */
 const ARMOR_SUFFIXES = ["_helmet", "_chestplate", "_leggings", "_boots"];
+/**
+ * 防具の部位と装備先。並びは driver.inventory.armor() が返す順（頭・胴・脚・足）
+ * と一致させること。突き合わせに添字を使っている。
+ */
+const ARMOR_PIECES: { suffix: string; destination: string }[] = [
+	{ suffix: "_helmet", destination: "head" },
+	{ suffix: "_chestplate", destination: "torso" },
+	{ suffix: "_leggings", destination: "legs" },
+	{ suffix: "_boots", destination: "feet" },
+];
+/** 素材の等級。小さいほど良い。表に無いものは最下位に置く。 */
+const ARMOR_MATERIALS = ["netherite", "diamond", "iron", "chainmail", "golden", "leather"];
+
+function armorRank(itemName: string): number {
+	const i = ARMOR_MATERIALS.findIndex((m) => itemName.startsWith(m));
+	return i < 0 ? 99 : i;
+}
 /** この体力を下回ったら、昼でも潜って回復を待つ。 */
-const SHELTER_HEALTH = Number(process.env.SHELTER_HEALTH ?? 8);
+const SHELTER_HEALTH = envNum("SHELTER_HEALTH", 8);
+/** 一度潜ったら、次に潜り直すまで置く間隔。掘り進み続けないための歯止め。 */
+const BURROW_COOLDOWN_MS = envNum("BURROW_COOLDOWN_MS", 60_000);
 /** 埋まっているかを見る高さ。屋根はこの範囲に収まる前提。 */
 const BURIED_SCAN_HEIGHT = 32;
 /** 頭上にこれだけ固いものが積まっていたら「埋まっている」と見なす。
  *  木の葉や庇は1〜2枚なので、それでは発動しない厚さにする。 */
-const BURIED_THICKNESS = Number(process.env.BURIED_THICKNESS ?? 4);
+const BURIED_THICKNESS = envNum("BURIED_THICKNESS", 4);
 /** これだけ続けて一瞬で終わったら、乗り換えの猶予を外す。 */
-const SPIN_LIMIT = Number(process.env.SKILL_SPIN_LIMIT ?? 3);
+const SPIN_LIMIT = envNum("SKILL_SPIN_LIMIT", 3);
 
 /**
  * 人から受けた依頼を追いかける制限時間。
@@ -97,7 +117,7 @@ const SPIN_LIMIT = Number(process.env.SKILL_SPIN_LIMIT ?? 3);
  * 依頼は一度受けたら忘れないでほしいが、永久に残すと「もう終わった話」を
  * 延々と追い続ける。会話の中で新しい依頼が来れば上書きされる。
  */
-const REQUEST_TTL_MS = Number(process.env.CHAT_REQUEST_TTL_MS ?? 10 * 60_000);
+const REQUEST_TTL_MS = envNum("CHAT_REQUEST_TTL_MS", 10 * 60_000);
 
 /** 攻撃してくる相手かどうか。名前で判断する。 */
 function isHostileMob(name: string): boolean {
@@ -223,6 +243,8 @@ export class MinecraftAgent {
 	private deathPoint: { position: Position; at: number; retryAfter?: number } | null = null;
 	/** 最後にプレイヤーから殴られた時刻。人に近づいてよいかの判断に使う。 */
 	private attackedByPlayerAt = 0;
+	/** 最後に潜った時刻。掘り進み続けるのを止めるために見る。 */
+	private lastBurrowAt = 0;
 	/** 人から話しかけられて、次の判断を急ぎたいときに立てる。 */
 	private humanRequestPending = false;
 	/** 思考ループの待ちを途中で切り上げるための呼び出し口。 */
@@ -413,7 +435,7 @@ export class MinecraftAgent {
 		const selfNames = [this.profile.minecraftName, this.driver.getState().username].filter(Boolean);
 		if (selfNames.includes(username)) return;
 
-		this.conversation.record(username, message, false);
+		this.conversation.record(username, message, "player");
 		this.lastHeardAt = Date.now();
 		this.log(`<${username}> ${message}`);
 		appendChatLog("in", username, message);
@@ -475,7 +497,7 @@ export class MinecraftAgent {
 				}
 
 				this.driver.chat(result.reply);
-				this.conversation.record(this.profile.minecraftName, result.reply, true);
+				this.conversation.record(this.profile.minecraftName, result.reply, "self");
 				appendChatLog("out", this.profile.minecraftName, result.reply);
 				this.log(`-> ${result.reply}`);
 			} while (this.replyAgain);
@@ -504,6 +526,8 @@ export class MinecraftAgent {
 				.map((h) => `${h.action}: ${h.result} (${h.message})`),
 			skillNames: Array.from(this.skills.keys()),
 			nearbyPlayers: ready ? this.nearbyPlayerNames() : [],
+			// 通知は会話の列ではなくこちらで渡す。返事の宛先にはさせない。
+			recentEvents: this.conversation.recentEvents(),
 		};
 	}
 
@@ -537,7 +561,7 @@ export class MinecraftAgent {
 		appendChatLog("in", "サーバー", message);
 		// 会話の列には積むが、話しかけられた扱いにはしない。
 		// lastHeardAt を動かさないので、これで喋り出すことはない。
-		this.conversation.record("サーバー", message, false);
+		this.conversation.record("サーバー", message, "system");
 	}
 
 	/** 思考ループの待ちを切り上げて、すぐ考え直させる。 */
@@ -967,6 +991,32 @@ export class MinecraftAgent {
 		this.deathPoint = null;
 	}
 
+	/**
+	 * いま提示する価値があるスキルか。
+	 *
+	 * 前提が明らかに満たせないものを一覧から外す。LLM に選ばせて即失敗
+	 * させるのは、思考を1周まるごと捨てるのと同じ。
+	 */
+	private skillIsWorthOffering(name: string): boolean {
+		switch (name) {
+			case gotoDeathPointSkill.name:
+				// 落とし物が無いなら行き先が無い。
+				return this.getDeathPoint() !== null;
+			case "collecting.hunting": {
+				// 動物が見えないなら狩れない。
+				const prey = ["cow", "pig", "sheep", "chicken", "rabbit"];
+				return this.driver.nearbyEntities(32).some((e) => prey.includes(e.name));
+			}
+			case "goto.player": {
+				// 殴られた直後は近づかない。誰もいないなら行き先が無い。
+				if (this.wasAttackedByPlayerRecently()) return false;
+				return this.driver.nearbyEntities(64).some((e) => e.kind === "player");
+			}
+			default:
+				return true;
+		}
+	}
+
 	private recordSkillOutcome(name: string, ok: boolean) {
 		const st = this.skillStats.get(name) ?? { ok: 0, fail: 0 };
 		if (ok) st.ok++;
@@ -1058,9 +1108,16 @@ export class MinecraftAgent {
 						if (err instanceof Error && err?.message !== "Aborted") {
 							throw err;
 						}
+					} finally {
+						// 終わったものを「長く走っている」と誤判定しないよう戻す。
+						//
+						// finally でないと駄目。ここを try の外に置くと、スキルが
+						// 中断以外の例外を投げて上の catch へ抜けた場合に素通りし、
+						// 開始時刻が残り続ける。残ったまま MAX_UNINTERRUPTED_MS を
+						// 過ぎると ranTooLong が永久に真になり、乗り換えの猶予
+						// (MIN_UNINTERRUPTED_MS) が二度と効かなくなる。
+						this.currentExecutionStartedAt = 0;
 					}
-					// 終わったものを「長く走っている」と誤判定しないよう戻す。
-					this.currentExecutionStartedAt = 0;
 					this.log(`${skill.name} end`);
 
 					if (!result) {
@@ -1202,10 +1259,11 @@ export class MinecraftAgent {
 
 	private getAgentStateForThinking() {
 		const skillsContext = Array.from(this.skills.values())
-			// 落とし物の回収は、落とし物があるときだけ見せる。無いときに見せると
-			// LLM が選んで即失敗する。実測で15分に20回選ばれ、そのぶん他の
-			// 行動が選ばれなかった。これは反射で扱うもので、判断の対象ではない。
-			.filter((t) => t.name !== gotoDeathPointSkill.name || this.getDeathPoint() !== null)
+			// いま成立しないものは見せない。見せれば LLM は選び、即失敗して
+			// 枠を1つ潰す。実測で collecting.hunting が周りに動物がいないのに
+			// 20回選ばれ、goto.death_point が落とし物も無いのに20回選ばれた。
+			// 前提が満たせるかどうかは、こちらで分かるものはこちらで判断する。
+			.filter((t) => this.skillIsWorthOffering(t.name))
 			.map((t) => {
 				const hasArgs = t.inputSchema && Object.keys(t.inputSchema).length > 0;
 				const argsInfo = hasArgs
@@ -1387,7 +1445,7 @@ export class MinecraftAgent {
 			);
 			if (isNewChat && this.updateFIFO(this.strategicState.chats, chatMessage)) {
 				this.driver.chat(chatMessage);
-				this.conversation.record(this.profile.minecraftName, chatMessage, true);
+				this.conversation.record(this.profile.minecraftName, chatMessage, "self");
 				appendChatLog("out", this.profile.minecraftName, chatMessage);
 			}
 		}
@@ -2025,23 +2083,56 @@ export class MinecraftAgent {
 		if (!night && !hurt) return false;
 
 		const armed = this.hasWeapon();
-		const armored = this.driver.inventory
-			.items()
-			.some((i) => ARMOR_SUFFIXES.some((suf) => i.name.endsWith(suf)));
+		// 着ている防具は items() に出てこない。持ち物だけを見ると、
+		// 直前の wearBestArmor() が着せたぶんが丸ごと消えて、
+		// フル装備でも「丸腰」と判定され毎晩潜ることになる。
+		const armored =
+			this.driver.inventory.armor().some((i) => i !== null) ||
+			this.driver.inventory.items().some((i) => ARMOR_SUFFIXES.some((suf) => i.name.endsWith(suf)));
 		// 傷ついているときは装備の有無に関わらず退く。
 		if (!hurt && (armed || armored)) return false;
 
-		// 既に囲まれている(＝潜れている)なら、そのまま待つ。
+		// 既に潜れているなら、そのまま待つ。
 		const pos = state.position;
 		const foot = { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) };
-		const above = this.driver.world.blockAt({ ...foot, y: foot.y + 2 });
-		if (above && above.name !== "air") return true;
+		if (this.isSheltered(foot)) return true;
+
+		// 掘り進み続けないための最後の歯止め。判定を読み違えても、
+		// 最悪この間隔で1マスしか掘れない。
+		if (Date.now() - this.lastBurrowAt < BURROW_COOLDOWN_MS) return true;
 
 		this.log(
 			hurt ? `[反射] 体力 ${state.health}。潜って回復を待つ` : "[反射] 夜で丸腰。潜ってやり過ごす",
 		);
+		this.lastBurrowAt = Date.now();
 		await this.burrow(signal);
 		return true;
+	}
+
+	/**
+	 * もう身を隠せているか。
+	 *
+	 * 頭上の蓋だけを見ると足りない。蓋を置けずに1マス掘っただけで終わった場合、
+	 * 落ちたぶん基準がずれて、頭上に見えるのは「さっきまで頭があった空気」に
+	 * なる。それを「まだ地上にいる」と読むので、反射のたびに掘り直して
+	 * 夜通し真下へ掘り進んでしまう。穴に入れているかどうかも併せて見る。
+	 */
+	private isSheltered(foot: Position): boolean {
+		// 蓋がある。これが本来の潜れた形。
+		const above = this.driver.world.blockAt({ ...foot, y: foot.y + 2 });
+		if (above && above.name !== "air") return true;
+
+		// 蓋が無くても、足元の高さが四方とも塞がっていれば穴の中にいる。
+		// 地上に立っているときはここが空くので、掘る前と後を取り違えない。
+		const sides = [
+			{ x: 1, z: 0 },
+			{ x: -1, z: 0 },
+			{ x: 0, z: 1 },
+			{ x: 0, z: -1 },
+		];
+		return sides.every(
+			(d) => this.driver.world.blockAt({ x: foot.x + d.x, y: foot.y, z: foot.z + d.z })?.solid,
+		);
 	}
 
 	/**
@@ -2094,28 +2185,31 @@ export class MinecraftAgent {
 			.some((i) => i.name.endsWith("_sword") || i.name.endsWith("_axe"));
 	}
 
-	/** 持っている中で一番良い防具を着る。既に着ているものは触らない。 */
+	/**
+	 * 持っている中で一番良い防具を着る。今着ている物より良いときだけ着替える。
+	 *
+	 * 着替えると外れた方が持ち物へ戻る。そのため「持ち物で一番良い物」だけを
+	 * 見て無条件に着せると、ダイヤを着ている状態で革を拾っただけで
+	 *   革を着る → ダイヤが持ち物に戻る → ダイヤを着る → 革が戻る
+	 * と反射のたびに入れ替わり続け、半分の時間は劣った方を着ることになる。
+	 * 着ている物と比べて、良くなるときだけ手を出す。
+	 */
 	private async wearBestArmor(): Promise<void> {
-		const ranks = ["netherite", "diamond", "iron", "chainmail", "golden", "leather"];
-		const slots: [string, string][] = [
-			["_helmet", "head"],
-			["_chestplate", "torso"],
-			["_leggings", "legs"],
-			["_boots", "feet"],
-		];
 		const items = this.driver.inventory.items();
-		for (const [suffix, destination] of slots) {
-			const owned = items
-				.filter((i) => i.name.endsWith(suffix))
-				.sort((a, b) => {
-					const ra = ranks.findIndex((m) => a.name.startsWith(m));
-					const rb = ranks.findIndex((m) => b.name.startsWith(m));
-					return (ra < 0 ? 99 : ra) - (rb < 0 ? 99 : rb);
-				});
-			const best = owned[0];
-			// 着けたものは持ち物から消えるので、次の周では候補に挙がらない。
-			// 同じものを何度も着せ直す心配は要らない。
-			if (best) await this.driver.equip(best.name, destination as any);
+		const worn = this.driver.inventory.armor();
+
+		for (let i = 0; i < ARMOR_PIECES.length; i++) {
+			const { suffix, destination } = ARMOR_PIECES[i];
+			const best = items
+				.filter((it) => it.name.endsWith(suffix))
+				.sort((a, b) => armorRank(a.name) - armorRank(b.name))[0];
+			if (!best) continue;
+
+			// 着ていなければ着る。着ているなら、等級が上がるときだけ着替える。
+			const current = worn[i];
+			if (current && armorRank(current.name) <= armorRank(best.name)) continue;
+
+			await this.driver.equip(best.name, destination as any);
 		}
 	}
 
