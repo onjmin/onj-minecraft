@@ -263,6 +263,16 @@ export class MinecraftAgent {
 			);
 			// 死んだ場所を控える。持ち物は全部そこに落ちている。
 			this.driver.on("death", () => {
+				// 回収に戻った先で殺されたなら、そこは罠。二度と行かない。
+				// 実測で90秒に4回、ほぼ同じ座標で死に続けた。戻るたびに
+				// 拾い直した物をまた落とすので、往復するほど損をする。
+				if (this.currentTaskName === gotoDeathPointSkill.name) {
+					this.log("[反射] 回収に戻った先で死んだ。その地点は諦める");
+					this.deathPoint = null;
+					this.currentTaskName = exploreLandSkill.name;
+					this.currentTaskSince = Date.now();
+					return;
+				}
 				this.deathPoint = { position: { ...this.driver.getState().position }, at: Date.now() };
 				this.log(
 					`死亡地点を記録: (${this.deathPoint.position.x.toFixed(0)}, ${this.deathPoint.position.y.toFixed(0)}, ${this.deathPoint.position.z.toFixed(0)})`,
@@ -1199,11 +1209,11 @@ export class MinecraftAgent {
 		this.log(`${foundSkillName ?? "no-skill"} ${rationale}`);
 
 		const chatMessage = result.speak || "";
-		const isNewChat = !isSameSimhash(
-			chatMessage,
-			this.profile.minecraftName,
-			this.chatSimhashCache,
-		);
+		// 話しかけられているときは、似た返事でも返す。黙るより繰り返す方が
+		// ましで、実測で2つ目の質問に無反応になっていた。
+		const spokenTo = this.wasSpokenToRecently(30_000);
+		const isNewChat =
+			spokenTo || !isSameSimhash(chatMessage, this.profile.minecraftName, this.chatSimhashCache);
 		if (isNewChat && chatMessage && this.updateFIFO(this.strategicState.chats, chatMessage)) {
 			// 自分の計画を一方的に垂れ流すのはやめ、話しかけられたときの返答に限る。
 			// エージェントが1体だけの環境では独り言は誰にも届かず、
@@ -1761,8 +1771,18 @@ export class MinecraftAgent {
 	 * 「死亡地点を控えている・体力がある」で判断する。
 	 */
 	private async recoverDeathLootIfAlive(): Promise<void> {
-		if (!this.getDeathPoint()) return;
+		const point = this.getDeathPoint();
+		if (!point) return;
 		if (this.driver.getState().health <= 0) return;
+		// 死んだ場所の近くにまだ敵がいるなら戻らない。殺した相手はたいてい
+		// その場に留まっている。丸腰で戻れば同じことが起きる。
+		const dangerNear = this.driver
+			.nearbyEntities(24)
+			.some(
+				(e) =>
+					isHostileMob(e.name) && Math.hypot(e.position.x - point.x, e.position.z - point.z) < 8,
+			);
+		if (dangerNear) return;
 		if (this.currentTaskName === gotoDeathPointSkill.name) return;
 		if (!this.skills.has(gotoDeathPointSkill.name)) return;
 		this.log("[反射] 落とし物を取りに戻る");
