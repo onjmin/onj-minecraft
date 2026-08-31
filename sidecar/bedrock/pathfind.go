@@ -25,6 +25,7 @@ const (
 	stepFall          // 落ちる
 	stepDig           // 塞いでいるブロックを壊してから進む
 	stepBridge        // 足場が無いので置いてから進む
+	stepTower         // 跳んで足元に置き、1段上がる（柱積み）
 )
 
 type step struct {
@@ -293,6 +294,25 @@ func (w *world) moves(p blockPos, c caps) []move {
 		}
 	}
 
+	// 柱を積んで真上へ上がる。
+	//
+	// 掘るだけでは登れない。頭上を壊しても縦穴が伸びるだけで、ボットは底に
+	// 残る。実測で100回掘って高さが1も変わらなかった。実プレイヤーと同じく、
+	// 跳んで足元にブロックを置いて上がる。
+	//
+	// mineflayer-pathfinder の allow1by1towers と同じ手。あちらも経路探索の
+	// move として持っており、スキル側に専用処理は置いていない。
+	if c.Blocks > 0 {
+		up := blockPos{p.X, p.Y + 1, p.Z}
+		head := blockPos{p.X, p.Y + 2, p.Z}
+		if w.passable(up) && w.passable(head) {
+			out = append(out, move{
+				step{Pos: up, Action: stepTower, Fill: p},
+				costJump + costBridge,
+			})
+		}
+	}
+
 	// 真下を掘って降りる。縦穴を掘るときに要る。
 	if c.CanDig {
 		below := blockPos{p.X, p.Y - 1, p.Z}
@@ -320,6 +340,8 @@ func stepName(action int) string {
 		return "dig"
 	case stepBridge:
 		return "bridge"
+	case stepTower:
+		return "tower"
 	default:
 		return "unknown"
 	}

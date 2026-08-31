@@ -132,8 +132,12 @@ type target struct {
 	// 水平だけで判定すると、掘った穴の真上に立った時点で「着いた」ことに
 	// なる。落ちているアイテムを拾いに行くときにこれで詰まり、距離2の
 	// ままいくら待っても拾えなかった。
-	y         float32
-	hasY      bool
+	y    float32
+	hasY bool
+	// noDig なら掘って進む手を使わない。落ちている物を拾いに行くだけの
+	// ために地形を掘るのは無駄で、他人の世界も壊す。
+	// mineflayer-pathfinder の回収も canDig=false で引いている。
+	noDig     bool
 	tolerance float32
 	deadline  time.Time
 	// 進んでいないことを検出して自動ジャンプするための記録
@@ -996,7 +1000,11 @@ func (s *session) steerLocked(n uint64) {
 			// 中間地点なので、そこにぴったり着く必要はない。
 			tol = 1
 		}
-		g.path = s.world.findPath(from, to, tol, planMaxNodes, s.capsLocked())
+		caps := s.capsLocked()
+		if g.noDig {
+			caps.CanDig = false
+		}
+		g.path = s.world.findPath(from, to, tol, planMaxNodes, caps)
 	}
 
 	// 次の通過点。着いたら捨てて次へ。
@@ -1266,7 +1274,7 @@ func (s *session) dispatch(c command) {
 		}
 		s.goal = &target{
 			id: c.ID, x: c.X, z: c.Z, tolerance: tol,
-			y: c.Y, hasY: c.Value,
+			y: c.Y, hasY: c.Value, noDig: c.Face == 1,
 			deadline: time.Now().Add(time.Duration(timeout) * time.Millisecond),
 			lastPos:  s.pos,
 		}
@@ -2764,6 +2772,45 @@ func (s *session) prepareStepLocked(st step) bool {
 			return false
 		}
 		return true
+
+	case stepTower:
+		// 足元に置いて1段上がる。跳んでいる間に置く必要があるので、
+		// 跳躍を仕掛けてから置く。上がれたかは次のtickで位置を見る。
+		if s.world.solidFloor(st.Fill) {
+			return true
+		}
+		if s.pendingPlace != nil {
+			return false
+		}
+		if held, ok := s.rawSlots[int(s.heldSlot)]; !ok || held.Stack.Count == 0 {
+			if !s.holdPlaceableLocked() {
+				s.goal.path = nil
+				return false
+			}
+			return false
+		}
+		if !s.airborne {
+			// まだ地面にいる。跳んでから置く。
+			s.controls["jump"] = true
+			return false
+		}
+		{
+			ref := protocol.BlockPos{st.Fill.X, st.Fill.Y - 1, st.Fill.Z}
+			clicked, _ := s.world.runtimeIDAt(ref[0], ref[1], ref[2])
+			s.pendingPlace = &protocol.UseItemTransactionData{
+				ActionType:       protocol.UseItemActionClickBlock,
+				TriggerType:      protocol.TriggerTypePlayerInput,
+				BlockPosition:    ref,
+				BlockFace:        1,
+				HotBarSlot:       s.heldSlot,
+				HeldItem:         s.rawSlots[int(s.heldSlot)],
+				Position:         s.pos,
+				ClickedPosition:  clickOffset(1),
+				BlockRuntimeID:   uint32(clicked),
+				ClientPrediction: protocol.ClientPredictionSuccess,
+			}
+		}
+		return false
 
 	case stepBridge:
 		if s.world.solidFloor(st.Fill) {

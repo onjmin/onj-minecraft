@@ -79,6 +79,8 @@ const ARMOR_SUFFIXES = ["_helmet", "_chestplate", "_leggings", "_boots"];
 const SHELTER_HEALTH = Number(process.env.SHELTER_HEALTH ?? 8);
 /** 埋まっているかを見る高さ。屋根はこの範囲に収まる前提。 */
 const BURIED_SCAN_HEIGHT = 32;
+/** これだけ続けて一瞬で終わったら、乗り換えの猶予を外す。 */
+const SPIN_LIMIT = Number(process.env.SKILL_SPIN_LIMIT ?? 3);
 
 /** 攻撃してくる相手かどうか。名前で判断する。 */
 function isHostileMob(name: string): boolean {
@@ -1233,9 +1235,15 @@ export class MinecraftAgent {
 			const owningMs = this.currentTaskSince > 0 ? Date.now() - this.currentTaskSince : 0;
 			// 人に話しかけられた直後の判断は待たせない。指示に従うのが遅れると
 			// 何度も言い直させることになる。
+			// 空振りを繰り返しているものは猶予で守らない。猶予は「時間のかかる
+			// 行動を最後までやらせる」ためのもので、一瞬で失敗し続ける行動を
+			// 抱え込むためではない。実測で collecting.hunting が10分に149回
+			// 即失敗し、その間ほかの行動が一切選ばれなかった。
+			const spinning = this.instantRepeats >= SPIN_LIMIT;
 			const tooEarlyToSwitch =
 				!isSameTask &&
 				!this.humanRequestPending &&
+				!spinning &&
 				this.currentTaskSince > 0 &&
 				owningMs < MIN_UNINTERRUPTED_MS;
 			if (tooEarlyToSwitch && !ranTooLong) {

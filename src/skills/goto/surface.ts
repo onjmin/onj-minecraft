@@ -187,11 +187,15 @@ export const gotoSurfaceSkill = createSkill<void, { y: number; method: string }>
 			}
 
 			// 掘っただけでは登れない。縦穴が伸びるだけでボットは底に残る。
-			// 実測で100回掘って高さが1も変わらなかった。跳んで足元に置く。
-			const climbedNow = await driver.pillarUp(signal, 1);
-			if (climbedNow === 0) {
-				// 置ける物が尽きたか、上がれない。掘った穴は残るので、
-				// 次の機会に続きから登れる。
+			// 経路探索が柱積み(stepTower)を持つので、そちらに登らせる。
+			// スキル側で登り方を持つと、経路探索の持つ手と二重になる。
+			try {
+				await driver.goto(signal, {
+					kind: "near",
+					position: { x: checkPos.x, y: checkPos.y, z: checkPos.z },
+					distance: 1,
+				});
+			} catch {
 				return partial() ?? skillResult.fail("Could not climb: nothing to stand on.");
 			}
 

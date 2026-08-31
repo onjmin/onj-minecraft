@@ -431,6 +431,9 @@ export class BedrockDriver implements BotDriver {
 					// 掘った穴の真上に立った時点で到達扱いになる。
 					y: target.y ?? 0,
 					value: target.y !== undefined,
+					// 掘らずに行きたいときは face に 1 を載せる。専用の欄が
+					// 無いので流用している。
+					face: target.noDig ? 1 : 0,
 					timeoutMs: 30_000,
 				},
 				35_000,
@@ -446,7 +449,7 @@ export class BedrockDriver implements BotDriver {
 	 */
 	private resolveGoal(
 		goal: MoveGoal,
-	): { x: number; z: number; distance: number; y?: number } | null {
+	): { x: number; z: number; distance: number; y?: number; noDig?: boolean } | null {
 		switch (goal.kind) {
 			case "near": {
 				// 目標が固いブロックなら、その中心には立てない。隣の立てる場所を狙う。
@@ -463,6 +466,9 @@ export class BedrockDriver implements BotDriver {
 					z: goal.position.z,
 					y: goal.position.y,
 					distance: goal.distance,
+					// 固くない目標＝落ちている物などを拾いに行く場面。
+					// そのために地形を掘るのは無駄で、他人の世界も壊す。
+					noDig: true,
 				};
 			}
 			case "block":
