@@ -22,7 +22,7 @@ const FELL_BUDGET_MS = Number(process.env.WOOD_FELL_BUDGET_MS ?? 40_000);
 /** 何ブロック掘るごとに落下物を拾うか。 */
 const PICKUP_EVERY = 5;
 /** 木が見つからないときに移動して探し直す回数。 */
-const SEARCH_HOPS = Number(process.env.WOOD_SEARCH_HOPS ?? 3);
+const SEARCH_HOPS = Number(process.env.WOOD_SEARCH_HOPS ?? 6);
 /** 1回の移動距離。読み込み済みの地形の外へ出る程度。 */
 const SEARCH_HOP_DISTANCE = 28;
 
@@ -59,6 +59,10 @@ export const collectWoodSkill = createSkill<void, { felledCount: number; planted
 				// 届かなくても、動いたぶんは地形が読み込まれている。
 			}
 			logs = woodScanner.findNearbyLogs(driver);
+			const now = driver.getState().position;
+			agent.log(
+				`[collecting.wood] ${hop + 1}回目: ${Math.hypot(now.x - from.x, now.z - from.z).toFixed(0)}ブロック動いて 原木 ${logs.length} 件`,
+			);
 		}
 
 		let felledCount = 0;
@@ -103,6 +107,9 @@ export const collectWoodSkill = createSkill<void, { felledCount: number; planted
 				// 葉は通り道を空けるためのおまけ。目線の高さだけで並べると
 				// 手前の葉ばかり掘って時間切れになり、何も持たずに終わる。
 				// 実際に「3ブロック伐採」と報告しながら持ち物が空だった。
+				agent.log(
+					`[collecting.wood] 原木 ${logs.length} 件、掘る候補 ${blocksToRemove.length} 件（目標 ${JSON.stringify(target)}）`,
+				);
 				const botY = driver.getState().position.y;
 				const rank = (p: Position) => {
 					const b = driver.world.blockAt(p);
@@ -132,11 +139,21 @@ export const collectWoodSkill = createSkill<void, { felledCount: number; planted
 						try {
 							await driver.dig(signal, pos);
 						} catch (digErr) {
-							// 1ブロック掘れないだけで木ごと諦めない。木の上の方は
-							// 採掘の届く距離(6ブロック)を超えるので、遠いものは
-							// 飛ばして届くものを掘る。掘るうちに近づくこともある。
 							if (signal.aborted) throw digErr;
-							continue;
+							// 届かないなら近づいてもう一度。飛ばすだけだと、
+							// 木は見つかっているのに1本も伐れないまま終わる。
+							const msg = digErr instanceof Error ? digErr.message : String(digErr);
+							if (!msg.includes("遠すぎて")) continue;
+							try {
+								await driver.goto(signal, { kind: "near", position: pos, distance: 2 });
+							} catch {
+								continue;
+							}
+							try {
+								await driver.dig(signal, pos);
+							} catch {
+								continue;
+							}
 						}
 						felledCount++;
 						brokeTally.set(block.name, (brokeTally.get(block.name) ?? 0) + 1);

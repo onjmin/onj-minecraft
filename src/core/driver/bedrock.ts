@@ -786,7 +786,9 @@ export class BedrockDriver implements BotDriver {
 				},
 				20_000,
 			);
-			await sleep(250);
+			// サーバーが在庫を送り直すのを待つ。すぐ次を作ると、識別子が
+			// 分からないままのスタックを素材に使って弾かれる。
+			await sleep(700);
 		}
 		await this.refresh();
 	}

@@ -689,34 +689,6 @@ func (s *session) handle(pk packet.Packet) {
 
 	case *packet.ItemStackResponse:
 		for _, r := range v.Responses {
-			// 応答には変わったスロットの新しい識別子が入っている。これを
-			// 取り込まないと、次の要求で古い StackNetworkID を送ることになり
-			// FailedToValidateSrcSlot(55) で拒否される。作業台を置いたあと
-			// 3x3 のクラフトが通らなかったのがこれ。
-			s.mu.Lock()
-			for _, info := range r.ContainerInfo {
-				if info.Container.ContainerID != protocol.ContainerCombinedHotBarAndInventory &&
-					info.Container.ContainerID != protocol.ContainerInventory &&
-					info.Container.ContainerID != protocol.ContainerHotBar {
-					continue
-				}
-				for _, si := range info.SlotInfo {
-					slot := int(si.Slot)
-					it, ok := s.rawSlots[slot]
-					if !ok {
-						continue
-					}
-					it.StackNetworkID = si.StackNetworkID
-					it.Stack.Count = uint16(si.Count)
-					if si.Count == 0 {
-						delete(s.rawSlots, slot)
-						continue
-					}
-					s.rawSlots[slot] = it
-				}
-			}
-			s.mu.Unlock()
-
 			s.mu.Lock()
 			id, waiting := s.craftWaiter[r.RequestID]
 			if waiting {
@@ -733,6 +705,40 @@ func (s *session) handle(pk packet.Packet) {
 					delete(s.craftEffect, r.RequestID)
 				}
 				s.mu.Unlock()
+				// 応答には変わったスロットの新しい識別子が入っている。これを
+				// 取り込まないと、次の要求で古い StackNetworkID を送ることになり
+				// FailedToValidateSrcSlot(55) で拒否される。作業台を置いたあと
+				// 3x3 のクラフトが通らなかったのがこれ。
+				s.mu.Lock()
+				for _, info := range r.ContainerInfo {
+					if info.Container.ContainerID != protocol.ContainerCombinedHotBarAndInventory &&
+						info.Container.ContainerID != protocol.ContainerInventory &&
+						info.Container.ContainerID != protocol.ContainerHotBar {
+						continue
+					}
+					for _, si := range info.SlotInfo {
+						slot := int(si.Slot)
+						it, ok := s.rawSlots[slot]
+						if !ok {
+							continue
+						}
+						it.StackNetworkID = si.StackNetworkID
+						it.Stack.Count = uint16(si.Count)
+						if si.Count == 0 {
+							delete(s.rawSlots, slot)
+							continue
+						}
+						s.rawSlots[slot] = it
+					}
+				}
+				s.mu.Unlock()
+
+				// 作った物の識別子はこちらでは分からない。0 のまま次の素材に
+				// 使うと FailedToValidateSrcSlot(55) で弾かれる。応答の
+				// ContainerInfo にも載ってこないので、持ち物の画面を閉じて
+				// サーバーに一覧を送り直させる。届けば InventoryContent が
+				// 全スロットを正しい識別子で埋め直す。
+				_ = s.conn.WritePacket(&packet.ContainerClose{WindowID: 0})
 				s.reply(id, true, "", nil)
 			} else {
 				s.reply(id, false, fmt.Sprintf("クラフトが拒否されました(status=%d)", r.Status), nil)

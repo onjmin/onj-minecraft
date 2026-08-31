@@ -62,7 +62,9 @@ async function main() {
 	show();
 
 	// 1. 原木。無ければ collecting.wood に採りに行かせる。
-	if (!anyLog() && !anyPlanks()) {
+	// 板が足りないなら採りに行く。少しでも持っていれば飛ばす作りだと、
+	// 板2枚で止まったまま何度回しても先へ進まない。
+	if (!anyLog() && (anyPlanks()?.count ?? 0) < 12) {
 		console.log("[chain] collecting.wood で原木を採る...");
 		const ac = new AbortController();
 		const timer = setTimeout(() => ac.abort(), 120_000);

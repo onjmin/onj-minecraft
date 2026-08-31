@@ -445,7 +445,7 @@ func (s *session) craftRequestLocked(rec craftRecipe, requestID int32) (*protoco
 		})
 	}
 
-	dest, destStackID, ok := s.outputSlotLocked(rec.Output)
+	dest, destStackID, ok := s.outputSlotLocked(rec.Output, spent)
 	if !ok {
 		return nil, nil, fmt.Errorf("持ち物に空きがありません")
 	}
@@ -488,8 +488,14 @@ func (s *session) freeSlotLocked() (int, bool) {
 // 同じ物が既にある枠へ重ねるのを優先する。空き枠だけを狙うと、写しが
 // 古いときに埋まっている枠を指してしまい FailedToValidateDstSlot(50) で
 // 拒否される。板を続けて作ると2回目で必ず起きていた。
-func (s *session) outputSlotLocked(outputName string) (int, int32, bool) {
+// used には、この要求の中で素材を取り出したスロットを渡す。そこを行き先に
+// すると、サーバーが「取り出し元と行き先が同じ」と見て
+// DstContainerAndSlotEqualToSrcContainerAndSlot(49) で拒否する。
+func (s *session) outputSlotLocked(outputName string, used map[int]int) (int, int32, bool) {
 	for i := 0; i < 36; i++ {
+		if used[i] > 0 {
+			continue
+		}
 		it, ok := s.rawSlots[i]
 		if !ok || it.Stack.Count == 0 {
 			continue
@@ -509,6 +515,13 @@ func (s *session) outputSlotLocked(outputName string) (int, int32, bool) {
 			return i, it.StackNetworkID, true
 		}
 	}
-	slot, ok := s.freeSlotLocked()
-	return slot, 0, ok
+	for i := 0; i < 36; i++ {
+		if used[i] > 0 {
+			continue
+		}
+		if it, ok := s.rawSlots[i]; !ok || it.Stack.Count == 0 {
+			return i, 0, true
+		}
+	}
+	return 0, 0, false
 }
