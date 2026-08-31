@@ -70,6 +70,8 @@ const FLEE_HEALTH = Number(process.env.FLEE_HEALTH ?? 10);
 const DEATH_LOOT_WINDOW_MS = Number(process.env.DEATH_LOOT_WINDOW_MS ?? 240_000);
 /** 一度の反射で振る回数。振り続けて本来の行動を止めない程度に。 */
 const ATTACK_SWINGS = 4;
+/** 頭上の蓋に使える物。何でもよいが、貴重な物を使わないよう絞る。 */
+const PLACEABLE_COVER = ["dirt", "cobblestone", "stone", "_planks", "gravel", "sand", "netherrack"];
 
 /** 攻撃してくる相手かどうか。名前で判断する。 */
 function isHostileMob(name: string): boolean {
@@ -1762,6 +1764,15 @@ export class MinecraftAgent {
 			} catch {
 				// 逃げ切れなくても、動いただけ距離は稼げている。
 			}
+
+			// 逃げても振り切れず、体力も残り少ないなら潜る。
+			// 走って逃げるだけでは追いつかれる。地面に潜って頭上を塞げば、
+			// 大抵の敵は届かない。装備が無いうちはこれが一番確実。
+			const after = this.driver.getState();
+			const stillNear = this.driver.nearbyEntities(6).some((e) => isHostileMob(e.name));
+			if (stillNear && after.health <= FLEE_HEALTH) {
+				await this.burrow(signal);
+			}
 			return;
 		}
 
@@ -1775,6 +1786,49 @@ export class MinecraftAgent {
 				return;
 			}
 			await new Promise((r) => setTimeout(r, 600));
+		}
+	}
+
+	/**
+	 * 足元を掘って潜り、頭上を塞ぐ。
+	 *
+	 * 装備が無いうちは走って逃げても追いつかれる。1マス潜って蓋をすれば
+	 * 地上の敵はまず届かない。塞ぐ物が無ければ潜るだけでも当たりにくくなる。
+	 */
+	private async burrow(signal: AbortSignal): Promise<void> {
+		const { driver } = this;
+		const pos = driver.getState().position;
+		const foot = { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) };
+		const below = { x: foot.x, y: foot.y - 1, z: foot.z };
+		const block = driver.world.blockAt(below);
+		if (!block || !block.diggable || block.name === "air") return;
+
+		this.log("[反射] 潜って身を隠す");
+		try {
+			await driver.equipBestTool(below);
+			await driver.dig(signal, below);
+			// 掘った穴へ落ちるのを待つ。
+			await new Promise((r) => setTimeout(r, 600));
+		} catch {
+			return;
+		}
+
+		// 頭上に蓋をする。置ける物が無ければ潜っただけで済ませる。
+		const cover = driver.inventory
+			.items()
+			.find((i) => i.slot >= 0 && i.slot <= 8 && PLACEABLE_COVER.some((n) => i.name.endsWith(n)));
+		if (!cover) return;
+		try {
+			await driver.equip(cover.name, "hand");
+			// 自分がいるマスの上に、その隣を支えにして置く。
+			const here = driver.getState().position;
+			const head = { x: Math.floor(here.x), y: Math.floor(here.y) + 1, z: Math.floor(here.z) };
+			const support = { x: head.x + 1, y: head.y, z: head.z };
+			if (driver.world.blockAt(support)?.solid) {
+				await driver.placeBlock(signal, support, { x: -1, y: 0, z: 0 });
+			}
+		} catch {
+			// 蓋ができなくても、潜っただけで当たりにくくはなっている。
 		}
 	}
 

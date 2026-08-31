@@ -370,12 +370,10 @@ func (s *session) handle(pk packet.Packet) {
 		// 消えた理由が分からないまま検証結果だけが揺れる。実際、土50個も
 		// ツルハシも失っていたのに気付けなかった。
 		emit(event{Event: "death", Data: map[string]any{"cause": v.Cause}})
-		// 死亡直後にも復帰を要求しておく。サーバーによっては Respawn を
-		// 先に送ってこないことがある。
-		_ = s.conn.WritePacket(&packet.PlayerAction{
-			EntityRuntimeID: s.game.EntityRuntimeID,
-			ActionType:      protocol.PlayerActionRespawn,
-		})
+		// 復帰を要求し続ける。サーバーが Respawn を送ってくる順番は当てに
+		// できず、1回投げただけでは死んだままになることがある。体力が
+		// 戻るまで数回繰り返す。
+		go s.requestRespawn()
 
 	case *packet.Respawn:
 		if v.EntityRuntimeID != s.game.EntityRuntimeID {
@@ -2204,6 +2202,34 @@ func (s *session) lookAtLocked(x, y, z float32) {
 
 // faceToward はプレイヤーから見て手前になる面を返す。
 // 0=下 1=上 2=北(-Z) 3=南(+Z) 4=西(-X) 5=東(+X)
+// requestRespawn は復帰を要求する。戻るまで数回繰り返す。
+//
+// 統合版は死んでも勝手には戻らない。実クライアントは死亡画面で
+// 「リスポーン」を押し、そこで初めて要求が飛ぶ。送らないと死んだまま
+// 入力を送り続け、以降の行動が全部無意味になる。
+func (s *session) requestRespawn() {
+	for i := 0; i < 10; i++ {
+		s.mu.Lock()
+		hp := s.health
+		rid := s.game.EntityRuntimeID
+		pos := s.pos
+		s.mu.Unlock()
+		if hp > 0 && i > 0 {
+			return
+		}
+		_ = s.conn.WritePacket(&packet.PlayerAction{
+			EntityRuntimeID: rid,
+			ActionType:      protocol.PlayerActionRespawn,
+		})
+		_ = s.conn.WritePacket(&packet.Respawn{
+			EntityRuntimeID: rid,
+			State:           packet.RespawnStateClientReadyToSpawn,
+			Position:        pos,
+		})
+		time.Sleep(1500 * time.Millisecond)
+	}
+}
+
 // openContainerAt はその位置のコンテナを開き、中身が届くまで待つ。
 // 開くのは設置と同じ ClickBlock。サーバーが対象を見て開いてくれる。
 func (s *session) openContainerAt(x, y, z float32) (*openContainer, error) {
