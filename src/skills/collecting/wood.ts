@@ -24,6 +24,8 @@ const FELL_BUDGET_MS = envNum("WOOD_FELL_BUDGET_MS", 40_000);
 const PICKUP_EVERY = 5;
 /** 1回の伐採で壊してよい葉の数。通り道を空けるぶんだけ。 */
 const MAX_LEAVES = envNum("WOOD_MAX_LEAVES", 6);
+/** これより離れていたら、着いたと言われても寄り直す。採掘は6ブロックまで。 */
+const REACH_MARGIN = envNum("WOOD_REACH_MARGIN", 5);
 /** 木が見つからないときに移動して探し直す回数。 */
 const SEARCH_HOPS = envNum("WOOD_SEARCH_HOPS", 6);
 /** 1回の移動距離。読み込み済みの地形の外へ出る程度。 */
@@ -95,6 +97,23 @@ export const collectWoodSkill = createSkill<void, { felledCount: number; planted
 				} catch (moveErr) {
 					if (signal.aborted) throw moveErr;
 					agent.log(`[collecting.wood] 木まで詰め切れず: ${moveErr}。届く範囲で掘る`);
+				}
+
+				// 「着いた」と返っても届いていないことがある。固いブロックの隣に
+				// 立てる場所を探す仕組みが、木より10ブロック低い所を選ぶような
+				// 場面で起きる。実測で7〜10ブロック手前に立ったまま、候補を
+				// 全部「遠すぎて」で捨てていた。届いていなければ真下を狙い直す。
+				{
+					const me = driver.getState().position;
+					const gap = Math.hypot(me.x - target.x, me.y - target.y, me.z - target.z);
+					if (gap > REACH_MARGIN) {
+						agent.log(`[collecting.wood] まだ ${gap.toFixed(1)} ブロック離れている。詰め直す`);
+						try {
+							await driver.goto(signal, { kind: "xz", x: target.x, z: target.z, distance: 1.5 });
+						} catch (retryErr) {
+							if (signal.aborted) throw retryErr;
+						}
+					}
 				}
 
 				const blocksToRemove: Position[] = [];
