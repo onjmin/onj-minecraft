@@ -209,6 +209,16 @@ export class BedrockDriver implements BotDriver {
 			if (!source || !message) return;
 			for (const l of this.chatListeners) l(source, message);
 		});
+		// 死亡は黙って進めない。持ち物が全部落ちるので、以降の判断が
+		// 「集めたはずの物がある」前提のままだと全部おかしくなる。
+		this.sidecar.on("death", (d: any) => {
+			console.log(`[bedrock] 死亡しました（${d?.cause ?? "原因不明"}）。持ち物はその場に落ちています`);
+			this.items = [];
+		});
+		this.sidecar.on("respawn", (d: any) => {
+			if (d?.position) this.state.position = toPos(d.position);
+			console.log("[bedrock] リスポーンしました");
+		});
 		this.sidecar.on("end", (reason: any) => {
 			this.spawned = false;
 			this.disconnectReason = String(reason ?? "理由不明");

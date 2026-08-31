@@ -365,6 +365,25 @@ func (s *session) handle(pk packet.Packet) {
 		s.worldTick = v.Time
 		s.mu.Unlock()
 
+	case *packet.DeathInfo:
+		// 死んだ。持ち物は全部その場に落ちる。黙って再開すると、集めた物が
+		// 消えた理由が分からないまま検証結果だけが揺れる。実際、土50個も
+		// ツルハシも失っていたのに気付けなかった。
+		emit(event{Event: "death", Data: map[string]any{"cause": v.Cause}})
+
+	case *packet.Respawn:
+		if v.EntityRuntimeID != s.game.EntityRuntimeID {
+			return
+		}
+		if v.State == packet.RespawnStateReadyToSpawn {
+			s.mu.Lock()
+			s.pos = v.Position
+			s.mu.Unlock()
+			emit(event{Event: "respawn", Data: map[string]any{
+				"position": []float32{v.Position[0], v.Position[1], v.Position[2]},
+			}})
+		}
+
 	case *packet.SetHealth:
 		s.mu.Lock()
 		s.health = float32(v.Health)
