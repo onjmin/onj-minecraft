@@ -31,14 +31,26 @@ export const collectStoneSkill = createSkill<void, { minedCount: number }>({
 			// 石は数が必要なので、上位10個をターゲットにする
 			for (const stone of stonePositions) {
 				if (Date.now() > deadline) break;
-				await driver.goto(signal, { kind: "near", position: stone.position, distance: 2 });
+				// 詰め切れなくても諦めない。採掘は6ブロックまで届くので、
+				// 少し手前で止まっていても掘れることが多い。届かなければ
+				// 下の dig が個別に失敗するだけで済む。
+				try {
+					await driver.goto(signal, { kind: "near", position: stone.position, distance: 2 });
+				} catch (moveErr) {
+					if (signal.aborted) throw moveErr;
+				}
 
 				const block = driver.world.blockAt(stone.position);
 				// 移動中にブロックが変わっていないかチェック
 				if (block && stoneScanner.isStone(block.name)) {
 					// 適切なツール（ツルハシ）を装備
 					await driver.equipBestTool(block.position);
-					await driver.dig(signal, block.position);
+					try {
+						await driver.dig(signal, block.position);
+					} catch (digErr) {
+						if (signal.aborted) throw digErr;
+						continue;
+					}
 					minedCount++;
 					// 落下物は足元に落ちるとは限らない。数個おきに拾いに行く。
 					if (minedCount % PICKUP_EVERY === 0) {

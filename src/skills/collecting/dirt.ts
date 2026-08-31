@@ -38,13 +38,23 @@ export const collectDirtSkill = createSkill<void, { count: number }>({
 
 			if (!block.diggable) continue;
 
-			await driver.goto(signal, { kind: "near", position: block.position, distance: 1 });
+			// 詰め切れなくても諦めない。採掘は6ブロックまで届く。
+			try {
+				await driver.goto(signal, { kind: "near", position: block.position, distance: 1 });
+			} catch (moveErr) {
+				if (signal.aborted) throw moveErr;
+			}
 
 			// 移動中に地形が変わりうるので取り直す
 			const currentBlock = driver.world.blockAt(block.position);
 			if (currentBlock?.diggable) {
 				await driver.equipBestTool(block.position);
-				await driver.dig(signal, block.position);
+				try {
+					await driver.dig(signal, block.position);
+				} catch (digErr) {
+					if (signal.aborted) throw digErr;
+					continue;
+				}
 				collected++;
 				// 回収は毎回ではなく数個おきに。pickupNearbyItems は落下物が
 				// 出るのを待つので、1個ごとに挟むと待ちで時間が尽きる。

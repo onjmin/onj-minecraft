@@ -1284,6 +1284,66 @@ func (s *session) dispatch(c command) {
 		s.mu.Unlock()
 		s.reply(c.ID, true, "", nil)
 
+	case "moveSlot":
+		// 持ち物の中でスロットを入れ替える。道具をホットバーへ持ってくるのに要る。
+		// 手に持てるのはホットバー(0..8)だけなので、奥に入った道具は
+		// 移してこないと使えない。移さないまま素手で掘り、石も鉱石も
+		// 落とさないまま「掘れた」ことになる。
+		{
+			if len(c.Names) == 0 {
+				s.reply(c.ID, false, "移動元のスロットを指定してください", nil)
+				return
+			}
+			from, err := strconv.Atoi(c.Names[0])
+			to := int(c.Count)
+			if err != nil || from < 0 || from > 35 || to < 0 || to > 35 {
+				s.reply(c.ID, false, "スロットは 0..35 です", nil)
+				return
+			}
+			s.mu.Lock()
+			src, ok := s.rawSlots[from]
+			if !ok || src.Stack.Count == 0 {
+				s.mu.Unlock()
+				s.reply(c.ID, false, fmt.Sprintf("スロット %d は空です", from), nil)
+				return
+			}
+			dst, dstOccupied := s.rawSlots[to]
+			s.craftReqID -= 2
+			reqID := s.craftReqID
+			inv := protocol.FullContainerName{ContainerID: protocol.ContainerCombinedHotBarAndInventory}
+			var action protocol.StackRequestAction
+			if dstOccupied && dst.Stack.Count > 0 {
+				// 行き先が埋まっているなら入れ替える。
+				swap := &protocol.SwapStackRequestAction{}
+				swap.Source = protocol.StackRequestSlotInfo{
+					Container: inv, Slot: byte(from), StackNetworkID: src.StackNetworkID,
+				}
+				swap.Destination = protocol.StackRequestSlotInfo{
+					Container: inv, Slot: byte(to), StackNetworkID: dst.StackNetworkID,
+				}
+				action = swap
+			} else {
+				place := &protocol.PlaceStackRequestAction{}
+				place.Count = byte(min(src.Stack.Count, 64))
+				place.Source = protocol.StackRequestSlotInfo{
+					Container: inv, Slot: byte(from), StackNetworkID: src.StackNetworkID,
+				}
+				place.Destination = protocol.StackRequestSlotInfo{
+					Container: inv, Slot: byte(to), StackNetworkID: 0,
+				}
+				action = place
+			}
+			s.mu.Unlock()
+
+			if err := s.conn.WritePacket(&packet.ItemStackRequest{
+				Requests: []protocol.ItemStackRequest{{RequestID: reqID, Actions: []protocol.StackRequestAction{action}}},
+			}); err != nil {
+				s.reply(c.ID, false, fmt.Sprintf("スロット移動に失敗: %v", err), nil)
+				return
+			}
+			s.reply(c.ID, true, "", nil)
+		}
+
 	case "wear":
 		// 防具を着る。手に持つのと違い、選択スロットを変えるだけでは着られない。
 		// 防具コンテナの該当スロットへ ItemStackRequest で移す必要がある。

@@ -26,13 +26,23 @@ export const mineOresSkill = createSkill<void, { minedCount: number }>({
 
 		try {
 			for (const ore of orePositions.slice(0, 3)) {
-				await driver.goto(signal, { kind: "near", position: ore.position, distance: 2 });
+				// 詰め切れなくても諦めない。採掘は6ブロックまで届く。
+				try {
+					await driver.goto(signal, { kind: "near", position: ore.position, distance: 2 });
+				} catch (moveErr) {
+					if (signal.aborted) throw moveErr;
+				}
 
 				// 移動中にブロックが変わっていないか取り直して確認する
 				const block = driver.world.blockAt(ore.position);
 				if (block && (block.name.includes("ore") || block.name.includes("raw"))) {
 					await driver.equipBestTool(block.position);
-					await driver.dig(signal, block.position);
+					try {
+						await driver.dig(signal, block.position);
+					} catch (digErr) {
+						if (signal.aborted) throw digErr;
+						continue;
+					}
 					minedCount++;
 				}
 			}

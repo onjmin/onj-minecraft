@@ -610,16 +610,42 @@ export class BedrockDriver implements BotDriver {
 		const kind = toolKindFor(block.name);
 		if (!kind) return;
 
+		// 写しが古いと、作ったばかりの道具を見落とす。
+		await this.refresh();
+
 		const ranked = ["netherite", "diamond", "iron", "stone", "golden", "wooden"];
+		// ホットバーに限らず持ち物全体から探す。以前はホットバーだけを見ており、
+		// 奥に入った道具があっても黙って素手で掘っていた。石も鉱石も素手では
+		// 何も落とさないので、掘っただけで何も得られない状態になる。
 		const candidates = this.items
-			.filter((i) => i.slot >= 0 && i.slot <= 8 && i.name.endsWith(`_${kind}`))
+			.filter((i) => i.slot >= 0 && i.slot <= 35 && i.name.endsWith(`_${kind}`))
 			.sort((a, b) => {
 				const ra = ranked.findIndex((m) => a.name.startsWith(m));
 				const rb = ranked.findIndex((m) => b.name.startsWith(m));
 				return (ra < 0 ? 99 : ra) - (rb < 0 ? 99 : rb);
 			});
-		if (candidates.length === 0) return;
-		await this.sidecar.send("hold", { count: candidates[0].slot });
+		const best = candidates[0];
+		if (!best) return;
+
+		let slot = best.slot;
+		if (slot > 8) {
+			// 手に持てるのはホットバーだけ。空きがあればそこへ、無ければ
+			// 使っていなさそうな末尾と入れ替える。
+			const occupied = new Set(this.items.filter((i) => i.slot <= 8).map((i) => i.slot));
+			let target = 8;
+			for (let i = 0; i <= 8; i++) {
+				if (!occupied.has(i)) {
+					target = i;
+					break;
+				}
+			}
+			await this.sidecar.send("moveSlot", { names: [String(slot)], count: target });
+			await sleep(300);
+			await this.refresh();
+			slot = target;
+		}
+		await this.sidecar.send("hold", { count: slot });
+		await sleep(150);
 	}
 	/**
 	 * 落ちているアイテムを拾う。
