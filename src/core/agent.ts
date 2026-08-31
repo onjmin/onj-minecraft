@@ -72,6 +72,8 @@ const DEATH_LOOT_WINDOW_MS = Number(process.env.DEATH_LOOT_WINDOW_MS ?? 240_000)
 const ATTACK_SWINGS = 4;
 /** 頭上の蓋に使える物。何でもよいが、貴重な物を使わないよう絞る。 */
 const PLACEABLE_COVER = ["dirt", "cobblestone", "stone", "_planks", "gravel", "sand", "netherrack"];
+/** 防具かどうかの判定に使う。 */
+const ARMOR_SUFFIXES = ["_helmet", "_chestplate", "_leggings", "_boots"];
 
 /** 攻撃してくる相手かどうか。名前で判断する。 */
 function isHostileMob(name: string): boolean {
@@ -1718,6 +1720,7 @@ export class MinecraftAgent {
 			await this.escapeLiquid(signal);
 			await this.recoverDeathLootIfAlive();
 			await this.wearBestArmor();
+			if (await this.shelterAtNight(signal)) return;
 			await this.reactToDanger(signal);
 			await this.escapeIfBoxedIn(signal);
 		} catch (e) {
@@ -1790,6 +1793,38 @@ export class MinecraftAgent {
 			}
 			await new Promise((r) => setTimeout(r, 600));
 		}
+	}
+
+	/**
+	 * 夜、丸腰なら潜ってやり過ごす。
+	 *
+	 * 8分で13回死に、大半が death.attack.mob だった。復帰しては即座に殺され、
+	 * 集めた物も作った道具もその都度消える。武器も防具も無いうちに夜の地上を
+	 * 歩き回るのは、進むどころか積み上げたものを失う行為でしかない。
+	 *
+	 * 戻り値が true なら、この周の他の反射は行わない。
+	 */
+	private async shelterAtNight(signal: AbortSignal): Promise<boolean> {
+		const state = this.driver.getState();
+		// 統合版の時刻はサイドカーが SetTime から拾っている。
+		const night = state.timeOfDay >= 13000 && state.timeOfDay <= 23000;
+		if (!night) return false;
+
+		const armed = this.hasWeapon();
+		const armored = this.driver.inventory
+			.items()
+			.some((i) => ARMOR_SUFFIXES.some((suf) => i.name.endsWith(suf)));
+		if (armed || armored) return false;
+
+		// 既に囲まれている(＝潜れている)なら、そのまま待つ。
+		const pos = state.position;
+		const foot = { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) };
+		const above = this.driver.world.blockAt({ ...foot, y: foot.y + 2 });
+		if (above && above.name !== "air") return true;
+
+		this.log("[反射] 夜で丸腰。潜ってやり過ごす");
+		await this.burrow(signal);
+		return true;
 	}
 
 	/**
