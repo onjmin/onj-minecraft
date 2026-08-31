@@ -40,6 +40,29 @@ const tryLoad = (bot: any, name: string, mod: any) => {
 
 let lastDiscordEmitAt = 0;
 
+/**
+ * 同じ行動を中断せずに続けてよい上限。
+ *
+ * 思考ループが同じスキルを選び直した場合は実行中のものを続けさせるが、
+ * それだけだとハングしたスキルに永久に居座られる。以前は30秒ごとの無条件中断が
+ * 結果的にその番人を兼ねていたので、代わりの上限をここで持つ。
+ */
+const MAX_UNINTERRUPTED_MS = Number(process.env.SKILL_MAX_RUN_MS ?? 300_000);
+
+/**
+ * 実行中の行動を、別の行動に乗り換えるために中断してよくなるまでの時間。
+ *
+ * 思考ループは30秒ごとに判断し直す。それより長くかかる行動は、毎回そこで
+ * 切られて最初からやり直しになり、永久に完了しない。本番の Realm で
+ * goto.surface が中断なしなら34秒で成功する一方、ループ内では27秒前後で
+ * 5回とも切られていた。
+ *
+ * 代償として、行動の乗り換えが最大でこの時間だけ遅れる。ただし発言は
+ * この判定より前で処理されるので、話しかけへの返答は遅れない。
+ * 戦闘や体力低下の割り込みも別経路なので影響しない。
+ */
+const MIN_UNINTERRUPTED_MS = Number(process.env.SKILL_MIN_RUN_MS ?? 60_000);
+
 type ObservationRecord = {
 	action: string;
 	rationale: string;
@@ -105,6 +128,10 @@ export class MinecraftAgent {
 
 	private currentAbort?: AbortController;
 	private currentSkillArgs: Record<string, any> = {};
+	/** 今の実行を開始した時刻。ハングの検出に使う（1回の実行が長すぎないか）。 */
+	private currentExecutionStartedAt = 0;
+	/** 今のスキルを担当し始めた時刻。乗り換えてよいかの判断に使う。 */
+	private currentTaskSince = 0;
 
 	private bases: {
 		id: string;
@@ -701,6 +728,7 @@ export class MinecraftAgent {
 						this.log(
 							`${skill.name} start${Object.keys(args).length > 0 ? ` with args: ${JSON.stringify(args)}` : ""}`,
 						);
+						this.currentExecutionStartedAt = Date.now();
 						result = await skill.handler({
 							agent: this,
 							signal: controller.signal,
@@ -712,6 +740,8 @@ export class MinecraftAgent {
 							throw err;
 						}
 					}
+					// 終わったものを「長く走っている」と誤判定しないよう戻す。
+					this.currentExecutionStartedAt = 0;
 					this.log(`${skill.name} end`);
 
 					if (!result) {
@@ -965,7 +995,14 @@ export class MinecraftAgent {
 
 		const rationale = result.memory || "No reasoning.";
 		const foundSkillName = result.action?.name;
-		const parsedArgs = result.action?.args || {};
+		const parsedArgs = this.nameParsedArgs(
+			foundSkillName,
+			result.action?.args || {},
+			result.action?.positional || [],
+		);
+
+		// 中断の要否を引数の変化でも判断するので、上書きする前に控える。
+		const previousArgs = foundSkillName ? this.currentSkillArgs[foundSkillName] : undefined;
 
 		if (foundSkillName) {
 			this.currentSkillArgs[foundSkillName] = parsedArgs;
@@ -992,9 +1029,42 @@ export class MinecraftAgent {
 		}
 
 		if (foundSkillName && this.skills.has(foundSkillName)) {
-			this.cancelCurrentExecution();
+			// 同じスキルを同じ引数で選び直しただけなら、実行中のものを続けさせる。
+			// 無条件に中断すると、思考ループの間隔(30秒)より長くかかる行動が
+			// 構造的に完了できない。本番の Realm で goto.surface が5回とも
+			// 29,28,28,29,29秒で中断され、一度も地表に着けなかったのがこれ。
+			const isSameTask =
+				this.currentTaskName === foundSkillName &&
+				JSON.stringify(previousArgs ?? {}) === JSON.stringify(parsedArgs);
+			const runningMs =
+				this.currentExecutionStartedAt > 0 ? Date.now() - this.currentExecutionStartedAt : 0;
+			const ranTooLong = runningMs > MAX_UNINTERRUPTED_MS;
+
+			// 担当し始めたばかりの行動は、別の行動のために止めない。
+			// 30秒では終わらない行動が最初からやり直しになり続けるため。
+			//
+			// 「今の実行の経過」ではなく「そのスキルを担当してからの経過」で測る。
+			// 実行ごとに測ると、16秒で終わって再実行される exploring.explore_land の
+			// ような短い行動が常に猶予内に入り、永久に乗り換えられなくなる。
+			const owningMs = this.currentTaskSince > 0 ? Date.now() - this.currentTaskSince : 0;
+			const tooEarlyToSwitch =
+				!isSameTask && this.currentTaskSince > 0 && owningMs < MIN_UNINTERRUPTED_MS;
+			if (tooEarlyToSwitch && !ranTooLong) {
+				this.log(
+					`${this.currentTaskName} を継続します（担当 ${Math.round(owningMs / 1000)}秒、${foundSkillName} への切り替えは保留）`,
+				);
+				return;
+			}
+
+			if (!isSameTask || ranTooLong) {
+				if (isSameTask) {
+					this.log(`${foundSkillName} が長すぎるため中断します`);
+				}
+				this.cancelCurrentExecution();
+			}
 			if (this.currentTaskName !== foundSkillName) {
 				this.currentTaskName = foundSkillName;
+				this.currentTaskSince = Date.now();
 				this.latestRationale = rationale;
 
 				const now = Date.now();
@@ -1019,6 +1089,36 @@ export class MinecraftAgent {
 				}
 			}
 		}
+	}
+
+	/**
+	 * キー名の無い引数にスキル定義の名前を割り当てる。
+	 *
+	 * `goto.coords(586, 0, -923)` のように位置引数だけで書かれると、パーサは
+	 * 値の並びしか返せない。どの名前に対応するかを知っているのは inputSchema
+	 * だけなので、突き合わせはここで行う。名前付きの引数が既にあるときは
+	 * そちらを信じて何もしない。
+	 */
+	private nameParsedArgs(
+		skillName: string | undefined,
+		args: Record<string, any>,
+		positional: unknown[],
+	): Record<string, any> {
+		if (!skillName || positional.length === 0 || Object.keys(args).length > 0) return args;
+
+		const schema = this.skills.get(skillName)?.inputSchema;
+		if (!schema) return args;
+
+		// オブジェクトのキー順は定義順。inputSchema は x, y, z のように
+		// 呼び出し順で書かれているので、そのまま対応させられる。
+		const keys = Object.keys(schema);
+		if (keys.length === 0) return args;
+
+		const named: Record<string, any> = {};
+		for (let i = 0; i < Math.min(keys.length, positional.length); i++) {
+			named[keys[i]] = positional[i];
+		}
+		return named;
 	}
 
 	private cancelCurrentExecution() {

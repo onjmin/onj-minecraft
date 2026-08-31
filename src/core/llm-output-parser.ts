@@ -114,7 +114,39 @@ export function parseSkillField(rawSkill: string) {
 		}
 	}
 
-	return { name, args };
+	// キー名が付いていれば位置引数は見ない。両方あるときは名前付きの方が確実。
+	const positional = tail && Object.keys(args).length === 0 ? parsePositionalArgs(tail) : [];
+
+	return { name, args, positional };
+}
+
+/** "-926" → -926、"true" → true。それ以外は文字列のまま。 */
+function coerceValue(rawVal: string): unknown {
+	// 負数と小数も数値として扱う。座標は普通に負になるので、
+	// ここで弾くと文字列のまま渡って検証に落ちる。
+	if (/^[+-]?\d+(?:\.\d+)?$/.test(rawVal)) return Number(rawVal);
+	if (/^(true|false)$/i.test(rawVal)) return rawVal.toLowerCase() === "true";
+	return rawVal;
+}
+
+/**
+ * キー名の無い引数を並び順のまま取り出す。
+ *
+ * `goto.coords(586, 0, -923)` のように位置引数だけで書かれることがある。
+ * 対応するキー名はスキルの inputSchema にしかないので、ここでは値の並びだけを
+ * 返し、名前の割り当ては呼び出し側(agent)に任せる。
+ */
+function parsePositionalArgs(argStr: string): unknown[] {
+	return argStr
+		.split(",")
+		.map((part) =>
+			part
+				.trim()
+				.replace(/^[("']+|[)"']+$/g, "")
+				.trim(),
+		)
+		.filter((part) => part.length > 0 && !/[:=]/.test(part))
+		.map(coerceValue);
 }
 
 function parseKeyValueArgs(argStr: string) {
@@ -132,17 +164,7 @@ function parseKeyValueArgs(argStr: string) {
 		const key = m[1];
 		const rawVal = m[2] ?? m[3] ?? m[4] ?? "";
 
-		let val: unknown = rawVal;
-
-		// 負数と小数も数値として扱う。座標は普通に負になるので、
-		// ここで弾くと文字列のまま渡って検証に落ちる。
-		if (/^[+-]?\d+(?:\.\d+)?$/.test(rawVal)) {
-			val = Number(rawVal);
-		} else if (/^(true|false)$/i.test(rawVal)) {
-			val = rawVal.toLowerCase() === "true";
-		}
-
-		parsed[key] = val;
+		parsed[key] = coerceValue(rawVal);
 	}
 	return parsed;
 }
@@ -152,6 +174,11 @@ export interface ParsedThought {
 	action?: {
 		name: string;
 		args?: Record<string, any>;
+		/**
+		 * キー名の無い引数を並び順のまま渡す。スキルの inputSchema と
+		 * 突き合わせて名前を付けるのは agent の仕事。
+		 */
+		positional?: unknown[];
 	};
 	memory?: string;
 }
@@ -173,11 +200,12 @@ export function parseLlmOutput(rawContent: string): ParsedThought {
 	}
 
 	// ③ Skill → action
-	const { name, args } = parseSkillField(sections.skill);
+	const { name, args, positional } = parseSkillField(sections.skill);
 	if (name) {
 		result.action = {
 			name,
 			args,
+			positional,
 		};
 	}
 
