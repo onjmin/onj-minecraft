@@ -211,6 +211,8 @@ export interface BotDriver {
 			| "system"
 			// プレイヤーに殴られた
 			| "attacked_by_player"
+			// プレイヤーに倒された。キルログから加害者名が分かる
+			| "killed_by_player"
 			| "kicked"
 			| "end",
 		listener: (...args: any[]) => void,

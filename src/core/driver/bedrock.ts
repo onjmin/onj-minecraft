@@ -181,6 +181,8 @@ export class BedrockDriver implements BotDriver {
 	private chatListeners: ((username: string, message: string) => void)[] = [];
 	/** サーバーからの通知(キルログ・死亡ログ・参加退出)の受け手。 */
 	private systemListeners: ((message: string) => void)[] = [];
+	/** 自分を倒したプレイヤーの名前の受け手。 */
+	private attackerListeners: ((name: string) => void)[] = [];
 	private endListeners: ((reason: string) => void)[] = [];
 	public disconnectReason: string | null = null;
 
@@ -283,6 +285,12 @@ export class BedrockDriver implements BotDriver {
 				// 送信者が無いものはサーバーからの通知。キルログや死亡ログ、
 				// 参加/退出がここに来る。捨てていたので、誰が誰にやられたかを
 				// 一切知らないままだった。
+				const args = Array.isArray(d.parameters) ? d.parameters.map(String) : [];
+				// 自分がプレイヤーに倒されたなら、加害者はここに書いてある。
+				// 体力の変化から推測するより確実。
+				if (message.includes("death.attack.player") && args[0] === this.username && args[1]) {
+					for (const l of this.attackerListeners) l(args[1]);
+				}
 				for (const l of this.systemListeners) l(describeSystemMessage(message, d.parameters));
 				return;
 			}
@@ -425,6 +433,7 @@ export class BedrockDriver implements BotDriver {
 	on(event: string, listener: (...args: any[]) => void): void {
 		if (event === "chat") this.chatListeners.push(listener as any);
 		else if (event === "system") this.systemListeners.push(listener as any);
+		else if (event === "killed_by_player") this.attackerListeners.push(listener as any);
 		else if (event === "end" || event === "kicked") this.endListeners.push(listener as any);
 		// spawn/death/health は現状 workflow 側で使っていないので受けるだけにしない。
 		else this.sidecar.on(event, listener as any);

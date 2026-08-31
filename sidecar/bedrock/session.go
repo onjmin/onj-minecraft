@@ -461,6 +461,11 @@ func (s *session) handle(pk packet.Packet) {
 		for _, a := range v.Attributes {
 			switch a.Name {
 			case "minecraft:health":
+				// 体力はこちらで動く。SetHealth ではない。実測で殴られても
+				// 攻撃検出が一度も発火しなかったのはこの取り違えが原因。
+				if a.Value < s.health {
+					s.notePlayerAttackLocked()
+				}
 				s.health = a.Value
 			case "minecraft:player.hunger":
 				s.food = a.Value

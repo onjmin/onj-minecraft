@@ -295,6 +295,11 @@ export class MinecraftAgent {
 			this.driver.on("system", (message: string) => this.handleSystemMessage(message));
 			// 殴られた相手から逃げるのはサイドカーの反射が担当する。
 			// ここでは記録だけ。人に殴られたことは覚えておく価値がある。
+			// 倒された相手はキルログに名前が出る。推測より確実。
+			this.driver.on("killed_by_player", (name: string) => {
+				this.log(`[通知] ${name} に倒された。しばらく人に近づかない`);
+				this.attackedByPlayerAt = Date.now();
+			});
 			this.driver.on("attacked_by_player", (d: any) => {
 				this.handleSystemMessage(`${d?.name ?? "誰か"} に攻撃された`);
 				this.attackedByPlayerAt = Date.now();
