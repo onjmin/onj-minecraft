@@ -623,13 +623,17 @@ export class BedrockDriver implements BotDriver {
 		const deadline = Date.now() + 15_000;
 		// 掘った直後はまだ落下物が現れていない。少し待ってから探す。
 		await sleep(700);
+		// 取りに行けなかったものを覚えておく。同じものを毎回選び直すと
+		// 6回の試行を1個に使い切ってしまい、隣に落ちている他のものを残す。
+		const unreachable = new Set<number>();
+
 		// 一度に何個も追いかけると時間切れになるので、近いものから数個まで。
 		for (let i = 0; i < 6; i++) {
 			if (signal.aborted || Date.now() > deadline) return;
 			await this.refresh();
 			const here = this.state.position;
 			const items = this.entities
-				.filter((e) => e.kind === "item")
+				.filter((e) => e.kind === "item" && !unreachable.has(e.id))
 				.sort((a, b) => distance(here, a.position) - distance(here, b.position));
 			const target = items[0];
 			if (!target || distance(here, target.position) > 24) {
@@ -642,15 +646,20 @@ export class BedrockDriver implements BotDriver {
 			}
 
 			try {
+				// 統合版は1ブロックほどに近づけばサーバーが勝手に拾う。
+				// 0.8 だと経路探索がマス目の中心にしか止まれず、ほぼ毎回
+				// 「届かなかった」になっていた。踏みに行ける距離で足りる。
 				await this.goto(signal, {
 					kind: "xz",
 					x: target.position.x,
 					z: target.position.z,
-					distance: 0.8,
+					distance: 1.5,
 				});
 			} catch {
-				// 届かないものは諦めて次へ。溶岩の上などは取りに行けない。
-				return;
+				// 届かないものは飛ばして次を取りに行く。ここで return すると
+				// 1つ取れなかっただけで残り全部を捨てることになる。
+				unreachable.add(target.id);
+				continue;
 			}
 			// 拾われるまで少し待つ。判定はサーバー側。
 			await sleep(500);

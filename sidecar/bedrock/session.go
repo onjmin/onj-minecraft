@@ -1482,6 +1482,7 @@ func (s *session) dispatch(c command) {
 		var chosen *craftRecipe
 		var lastErr error
 		var req *protocol.ItemStackRequest
+		var usedInputs []craftInput
 		for i := range list {
 			if list[i].NeedsTable && !c.Value {
 				lastErr = fmt.Errorf("%s は作業台が要ります", want)
@@ -1490,12 +1491,14 @@ func (s *session) dispatch(c command) {
 			// クライアントが出すリクエストIDは負の奇数を順に減らしていく。
 			// 正の値を出すと "expected a valid ItemStackRequestId" で弾かれる。
 			s.craftReqID -= 2
-			r, err := s.craftRequestLocked(list[i], s.craftReqID)
+			r, used, err := s.craftRequestLocked(list[i], s.craftReqID)
 			if err != nil {
 				lastErr = err
 				continue
 			}
 			chosen = &list[i]
+			// タグを解決したあとの素材表。何が減るかの予測にはこちらを使う。
+			usedInputs = used
 			req = r
 			break
 		}
@@ -1512,7 +1515,7 @@ func (s *session) dispatch(c command) {
 		s.craftEffect[req.RequestID] = craftOutcome{
 			Output:      chosen.Output,
 			OutputCount: chosen.OutputCount,
-			Inputs:      chosen.Inputs,
+			Inputs:      usedInputs,
 		}
 		s.mu.Unlock()
 

@@ -37,8 +37,56 @@ const (
 
 // craftInput は素材1種。
 type craftInput struct {
-	Name  string
+	// Name は素材そのものの名前。Tag が入っているときは空。
+	Name string
+	// Tag は「板材ならなんでも」のような素材の指定。棒・作業台・道具の
+	// レシピはこの形で来る。名前で1つに決まらないので、実際に何を使うかは
+	// クラフトするときに手持ちから選ぶ。
+	Tag   string
 	Count int
+}
+
+// tagMembers はタグに属するかを名前から判定する。
+//
+// サーバーはタグの中身を送ってこないので、こちらで持つしかない。
+// 全部を網羅する必要はなく、序盤の連鎖(棒→作業台→道具→松明)に要るものだけ
+// 分かればよい。知らないタグのレシピは取り込まない。
+var tagMembers = map[string]func(name string) bool{
+	"minecraft:planks": func(n string) bool { return strings.HasSuffix(n, "_planks") },
+	"minecraft:logs": func(n string) bool {
+		return strings.HasSuffix(n, "_log") || strings.HasSuffix(n, "_wood") ||
+			strings.HasSuffix(n, "_stem") || strings.HasSuffix(n, "_hyphae")
+	},
+	"minecraft:coals":  func(n string) bool { return n == "coal" || n == "charcoal" },
+	"minecraft:sticks": func(n string) bool { return n == "stick" },
+	"minecraft:stone_crafting_materials": func(n string) bool {
+		return n == "cobblestone" || n == "blackstone" || n == "cobbled_deepslate"
+	},
+	"minecraft:stone_tool_materials": func(n string) bool {
+		return n == "cobblestone" || n == "blackstone" || n == "cobbled_deepslate"
+	},
+	"minecraft:wooden_slabs": func(n string) bool { return strings.HasSuffix(n, "_slab") },
+}
+
+// logs_that_burn のように別名で来るものを寄せる。
+var tagAliases = map[string]string{
+	"minecraft:logs_that_burn":  "minecraft:logs",
+	"minecraft:planks_crafting": "minecraft:planks",
+}
+
+func normalizeTag(tag string) string {
+	if alias, ok := tagAliases[tag]; ok {
+		return alias
+	}
+	return tag
+}
+
+// itemMatchesTag はその名前のアイテムがタグに属するか。
+func itemMatchesTag(name, tag string) bool {
+	if f, ok := tagMembers[normalizeTag(tag)]; ok {
+		return f(name)
+	}
+	return false
 }
 
 // craftRecipe は使えるレシピ1件。
@@ -50,6 +98,12 @@ type craftRecipe struct {
 	Inputs      []craftInput
 	// GridSize は必要な枠の広さ。2 なら手持ちの 2x2 で作れる。
 	GridSize int
+	// Cells は形のあるレシピの並び。行優先で Width*Height 個。
+	// 空の枠は Name も Tag も空。棒のように「板2枚を縦に」といった配置は、
+	// 素材の数だけ分かっても再現できない。枠の位置が違うとサーバーは
+	// MismatchedRecipeForInputGridItems(35) で拒否する。
+	Cells         []craftInput
+	Width, Height int
 	// NeedsTable は作業台が要るか。
 	NeedsTable bool
 	// outputNetworkID は出来上がる物の実行時ID。名前はアイテム表から引く。
@@ -106,6 +160,14 @@ func collectRecipes(pk *packet.CraftingData) []craftRecipe {
 		}
 		rec.GridSize = int(max(r.Width, r.Height))
 		rec.NeedsTable = rec.GridSize > 2
+		// 形のあるレシピは枠の位置まで合わせないと拒否される。
+		rec.Width = int(r.Width)
+		rec.Height = int(r.Height)
+		if len(rec.Cells) != rec.Width*rec.Height {
+			// 記述子の数と縦横が合わない。位置を再現できないので落とす。
+			rec.Cells = nil
+			rec.Width, rec.Height = 0, 0
+		}
 		add(rec)
 	}
 
@@ -133,35 +195,67 @@ func buildRecipe(id uint32, block string, input []protocol.ItemDescriptorCount, 
 	// 同じ素材が複数枠にあるならまとめる。
 	counts := map[string]int{}
 	order := []string{}
+	// タグ指定の素材。名前と混ざらないよう "tag:" を付けて数える。
+	// あわせて枠ごとの中身(Cells)も作る。形のあるレシピはこれが要る。
+	cells := make([]craftInput, 0, len(input))
 	for _, in := range input {
-		d, ok := in.Descriptor.(*protocol.DefaultItemDescriptor)
-		if !ok {
-			// タグ指定などは解決できない。
+		var key string
+		switch d := in.Descriptor.(type) {
+		case *protocol.DefaultItemDescriptor:
+			key = strings.TrimPrefix(d.Name, "minecraft:")
+		case *protocol.ItemTagItemDescriptor:
+			// 中身を知らないタグは扱えない。素材を選べないまま送っても
+			// サーバーに弾かれるだけなので、レシピごと落とす。
+			if _, known := tagMembers[normalizeTag(d.Tag)]; !known {
+				lastReject.NonDefault++
+				if lastReject.SampleDesc == "" {
+					lastReject.SampleDesc = "tag:" + d.Tag
+				}
+				return craftRecipe{}, false
+			}
+			key = "tag:" + normalizeTag(d.Tag)
+		case *protocol.InvalidItemDescriptor:
+			// 空の枠。形のあるレシピでは意味があるので位置だけ残す。
+			cells = append(cells, craftInput{})
+			continue
+		default:
+			// MoLang など。解決できない。
 			lastReject.NonDefault++
 			if lastReject.SampleDesc == "" {
 				lastReject.SampleDesc = fmt.Sprintf("%T", in.Descriptor)
 			}
 			return craftRecipe{}, false
 		}
-		name := strings.TrimPrefix(d.Name, "minecraft:")
-		if name == "" {
+		if key == "" {
+			// 名前の無い記述子も空の枠として扱う。
+			cells = append(cells, craftInput{})
 			continue
 		}
 		n := int(in.Count)
 		if n <= 0 {
 			n = 1
 		}
-		if _, seen := counts[name]; !seen {
-			order = append(order, name)
+		if tag, ok := strings.CutPrefix(key, "tag:"); ok {
+			cells = append(cells, craftInput{Tag: tag, Count: n})
+		} else {
+			cells = append(cells, craftInput{Name: key, Count: n})
 		}
-		counts[name] += n
+		if _, seen := counts[key]; !seen {
+			order = append(order, key)
+		}
+		counts[key] += n
 	}
+	rec.Cells = cells
 	if len(order) == 0 {
 		lastReject.NoInput++
 		return craftRecipe{}, false
 	}
-	for _, name := range order {
-		rec.Inputs = append(rec.Inputs, craftInput{Name: name, Count: counts[name]})
+	for _, key := range order {
+		if tag, ok := strings.CutPrefix(key, "tag:"); ok {
+			rec.Inputs = append(rec.Inputs, craftInput{Tag: tag, Count: counts[key]})
+			continue
+		}
+		rec.Inputs = append(rec.Inputs, craftInput{Name: key, Count: counts[key]})
 	}
 	return rec, true
 }
@@ -170,7 +264,53 @@ func buildRecipe(id uint32, block string, input []protocol.ItemDescriptorCount, 
 //
 // 手順は「レシピを指定 → 素材を消費 → 出来上がり枠から手持ちへ移す」。
 // 素材の消費では、そのスロットの StackNetworkID を正しく載せないと弾かれる。
-func (s *session) craftRequestLocked(rec craftRecipe, requestID int32) (*protocol.ItemStackRequest, error) {
+// 戻り値の []craftInput は、タグを実際の素材に解決したあとの素材表。
+// 呼び出し側が「何が減るか」を予測するのに使う。タグのままでは減らせない。
+func (s *session) craftRequestLocked(rec craftRecipe, requestID int32) (*protocol.ItemStackRequest, []craftInput, error) {
+	// タグ指定の素材は、手持ちから実際に使うものを1つ決める。
+	// 「板材ならなんでも」のまま送っても、サーバーには何を消費するのか
+	// 伝わらない。持っている種類のうち数が足りるものを選ぶ。
+	resolved := make([]craftInput, 0, len(rec.Inputs))
+	for _, in := range rec.Inputs {
+		if in.Tag == "" {
+			resolved = append(resolved, in)
+			continue
+		}
+		counts := map[string]int{}
+		for _, item := range s.rawSlots {
+			name, ok := s.itemNames[item.Stack.ItemType.NetworkID]
+			if !ok || !itemMatchesTag(name, in.Tag) {
+				continue
+			}
+			counts[name] += int(item.Stack.Count)
+		}
+		pick := ""
+		for name, have := range counts {
+			if have >= in.Count {
+				pick = name
+				break
+			}
+		}
+		if pick == "" {
+			return nil, nil, fmt.Errorf("%s に使える素材が %d 個ありません", in.Tag, in.Count)
+		}
+		resolved = append(resolved, craftInput{Name: pick, Count: in.Count})
+
+		// 枠側にも同じ選択を反映する。枠ごとに別の木材を選ぶと形が崩れる。
+		// rec は値渡しなので、書き換えても登録済みのレシピには影響しない。
+		if len(rec.Cells) > 0 {
+			cells := make([]craftInput, len(rec.Cells))
+			copy(cells, rec.Cells)
+			for i := range cells {
+				if cells[i].Tag == in.Tag {
+					cells[i] = craftInput{Name: pick, Count: cells[i].Count}
+				}
+			}
+			rec.Cells = cells
+		}
+	}
+	rec.Inputs = resolved
+
 	// 素材が足りるかは先に見る。足りないまま送っても理由が返らない。
 	for _, in := range rec.Inputs {
 		have := 0
@@ -180,31 +320,50 @@ func (s *session) craftRequestLocked(rec craftRecipe, requestID int32) (*protoco
 			}
 		}
 		if have < in.Count {
-			return nil, fmt.Errorf("%s が %d 個足りません", in.Name, in.Count-have)
+			return nil, nil, fmt.Errorf("%s が %d 個足りません", in.Name, in.Count-have)
 		}
 	}
 
 	// サーバーはクラフト枠の中身をレシピと突き合わせる。まず枠へ移す。
-	// 枠の番号は 2x2 が 28..31、3x3 が 32..40。
+	// 枠の番号は 2x2 が 28..31、3x3 が 32..40。行優先で並ぶ。
 	var actions []protocol.StackRequestAction
-	gridSlot := craftingInputBase2x2
+	base := craftingInputBase2x2
+	gridWidth := 2
 	if rec.NeedsTable {
-		gridSlot = craftingInputBase3x3
+		base = craftingInputBase3x3
+		gridWidth = 3
 	}
-	for _, in := range rec.Inputs {
-		remaining := in.Count
+
+	// 1つ枠へ移す。使ったぶんは残数から引く。
+	// 同じ持ち物スロットを2回使うと数が合わなくなるので、使用量を控える。
+	spent := map[int]int{}
+	// 実際に置いた枠。消費の申告はここに置いたものだけを対象にする。
+	// 形のあるレシピは枠が飛び飛びになるので、範囲では表せない。
+	var filled []byte
+	placeOne := func(want craftInput, dstSlot byte) bool {
+		remaining := want.Count
+		if remaining <= 0 {
+			remaining = 1
+		}
 		for slot, item := range s.rawSlots {
 			if remaining <= 0 {
 				break
 			}
 			name, ok := s.itemNames[item.Stack.ItemType.NetworkID]
-			if !ok || name != in.Name {
+			if !ok {
 				continue
 			}
-			use := int(item.Stack.Count)
-			if use > remaining {
-				use = remaining
+			if want.Name != "" && name != want.Name {
+				continue
 			}
+			if want.Tag != "" && !itemMatchesTag(name, want.Tag) {
+				continue
+			}
+			avail := int(item.Stack.Count) - spent[slot]
+			if avail <= 0 {
+				continue
+			}
+			use := min(avail, remaining)
 			place := &protocol.PlaceStackRequestAction{}
 			place.Count = byte(use)
 			place.Source = protocol.StackRequestSlotInfo{
@@ -214,12 +373,44 @@ func (s *session) craftRequestLocked(rec craftRecipe, requestID int32) (*protoco
 			}
 			place.Destination = protocol.StackRequestSlotInfo{
 				Container:      protocol.FullContainerName{ContainerID: protocol.ContainerCraftingInput},
-				Slot:           gridSlot,
+				Slot:           dstSlot,
 				StackNetworkID: 0,
 			}
 			actions = append(actions, place)
-			gridSlot++
+			spent[slot] += use
 			remaining -= use
+		}
+		if remaining <= 0 {
+			filled = append(filled, dstSlot)
+			return true
+		}
+		return false
+	}
+
+	if len(rec.Cells) > 0 && rec.Width > 0 {
+		// 形のあるレシピ。枠の位置まで合わせる。左上に寄せて置く。
+		// 素材の数だけ合わせて先頭から詰めると、棒(板2枚を縦)のように
+		// 並びに意味があるものが MismatchedRecipeForInputGridItems で拒否される。
+		for row := 0; row < rec.Height; row++ {
+			for col := 0; col < rec.Width; col++ {
+				cell := rec.Cells[row*rec.Width+col]
+				if cell.Name == "" && cell.Tag == "" {
+					continue
+				}
+				dst := base + byte(row*gridWidth+col)
+				if !placeOne(cell, dst) {
+					return nil, nil, fmt.Errorf("枠に置く素材が足りません")
+				}
+			}
+		}
+	} else {
+		// 形を問わないレシピ。先頭から順に詰めてよい。
+		slot := base
+		for _, in := range rec.Inputs {
+			if !placeOne(in, slot) {
+				return nil, nil, fmt.Errorf("枠に置く素材が足りません")
+			}
+			slot++
 		}
 	}
 
@@ -232,11 +423,7 @@ func (s *session) craftRequestLocked(rec craftRecipe, requestID int32) (*protoco
 	// ExpectedItemSlotNotFullyConsumed(18) で拒否される。
 	// 同じ要求の中で新しくできたスタックは、リクエストIDを識別子として指す。
 	// 取り出し元(出来上がり枠)でも同じ規則。
-	base := craftingInputBase2x2
-	if rec.NeedsTable {
-		base = craftingInputBase3x3
-	}
-	for slot := base; slot < gridSlot; slot++ {
+	for _, slot := range filled {
 		actions = append(actions, &protocol.ConsumeStackRequestAction{
 			DestroyStackRequestAction: protocol.DestroyStackRequestAction{
 				Count: 1,
@@ -251,7 +438,7 @@ func (s *session) craftRequestLocked(rec craftRecipe, requestID int32) (*protoco
 
 	dest, ok := s.freeSlotLocked()
 	if !ok {
-		return nil, fmt.Errorf("持ち物に空きがありません")
+		return nil, nil, fmt.Errorf("持ち物に空きがありません")
 	}
 
 	// 出来上がりを持ち物へ移す。
@@ -270,7 +457,7 @@ func (s *session) craftRequestLocked(rec craftRecipe, requestID int32) (*protoco
 	}
 	actions = append(actions, take)
 
-	return &protocol.ItemStackRequest{RequestID: requestID, Actions: actions}, nil
+	return &protocol.ItemStackRequest{RequestID: requestID, Actions: actions}, rec.Inputs, nil
 }
 
 // freeSlotLocked は出来上がりを入れる空きスロットを探す。

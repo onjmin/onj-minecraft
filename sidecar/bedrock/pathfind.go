@@ -155,28 +155,49 @@ func (w *world) findPath(from, goal blockPos, tolerance float64, maxNodes int, c
 	}
 	cameFrom := map[blockPos]origin{}
 
+	// 手順を組み立てる。goal から遡って順番を戻す。
+	build := func(at blockPos) []step {
+		var path []step
+		for at != from {
+			o, ok := cameFrom[at]
+			if !ok {
+				break
+			}
+			path = append(path, o.st)
+			at = o.prev
+		}
+		for i, j := 0, len(path)-1; i < j; i, j = i+1, j-1 {
+			path[i], path[j] = path[j], path[i]
+		}
+		return path
+	}
+
+	// 打ち切ったときに使う「一番目標に近づけた地点」。
+	// 上限に達したからと nil を返すと、ボットは一歩も動かないまま
+	// 同じ計画を繰り返し、結局「目標に届かなかった」で終わる。
+	// 木の周りのように分岐が多い場所では 800 ノードは簡単に尽きる。
+	// 途中まででも進めば、そこから計画し直して近づける。
+	closest := from
+	closestH := h(from)
+
 	visited := 0
 	for open.Len() > 0 {
 		if visited >= maxNodes {
+			// 意味のあるぶん近づけたときだけ返す。ほとんど近づけていない
+			// 経路を返すと、進んでは計画し直すのを繰り返して足踏みになる。
+			if closestH < h(from)-1 {
+				return build(closest)
+			}
 			return nil
 		}
 		visited++
 		cur := heap.Pop(open).(*pathNode)
+		if hc := h(cur.pos); hc < closestH {
+			closestH = hc
+			closest = cur.pos
+		}
 		if reached(cur.pos) {
-			var path []step
-			at := cur.pos
-			for at != from {
-				o, ok := cameFrom[at]
-				if !ok {
-					break
-				}
-				path = append(path, o.st)
-				at = o.prev
-			}
-			for i, j := 0, len(path)-1; i < j; i, j = i+1, j-1 {
-				path[i], path[j] = path[j], path[i]
-			}
-			return path
+			return build(cur.pos)
 		}
 		if cur.g > best[cur.pos] {
 			continue

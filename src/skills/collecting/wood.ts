@@ -1,4 +1,5 @@
 import type { BlockInfo, BotDriver, Position } from "../../core/driver/types";
+import { describeGain, gainedSince, snapshotInventory, totalGain } from "../inventory-delta";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
 const SINGLE_SAPLING_TREES = ["oak", "birch", "acacia", "cherry"];
@@ -38,6 +39,10 @@ export const collectWoodSkill = createSkill<void, { felledCount: number; planted
 
 		let felledCount = 0;
 		let plantedCount = 0;
+		let gainedBefore: ReturnType<typeof snapshotInventory> | null = null;
+		// 何を壊したかを控える。「壊したのに何も増えない」ときに、
+		// 葉ばかり掘っていたのか原木を掘って拾えていないのかを分ける。
+		const brokeTally = new Map<string, number>();
 
 		let treeTypeToPlant: string | null = null;
 		if (logs.length > 0) {
@@ -46,7 +51,16 @@ export const collectWoodSkill = createSkill<void, { felledCount: number; planted
 
 				treeTypeToPlant = getSaplingTypeFromLog(logs[0].name);
 
-				await driver.goto(signal, { kind: "near", position: target, distance: 2 });
+				// 木の周りは葉と幹で塞がりやすく、要求した距離まで詰められない
+				// ことがある。届かなかっただけで諦めない。採掘は6ブロックまで
+				// 届くので、少し手前で止まっていても掘れる。掘れなければ
+				// 下の dig が個別に失敗するだけで済む。
+				try {
+					await driver.goto(signal, { kind: "near", position: target, distance: 2 });
+				} catch (moveErr) {
+					if (signal.aborted) throw moveErr;
+					agent.log(`[collecting.wood] 木まで詰め切れず: ${moveErr}。届く範囲で掘る`);
+				}
 
 				const blocksToRemove: Position[] = [];
 				for (let x = -1; x <= 1; x++) {
@@ -61,18 +75,27 @@ export const collectWoodSkill = createSkill<void, { felledCount: number; planted
 					}
 				}
 
+				// 原木を先に、葉は後に掘る。目的は原木を手に入れることで、
+				// 葉は通り道を空けるためのおまけ。目線の高さだけで並べると
+				// 手前の葉ばかり掘って時間切れになり、何も持たずに終わる。
+				// 実際に「3ブロック伐採」と報告しながら持ち物が空だった。
 				const botY = driver.getState().position.y;
-				blocksToRemove.sort((a, b) => {
-					const distA = Math.abs(a.y - (botY + 1.5));
-					const distB = Math.abs(b.y - (botY + 1.5));
-					return distA - distB;
-				});
+				const rank = (p: Position) => {
+					const b = driver.world.blockAt(p);
+					const isLogBlock = b ? isLog(b.name) : false;
+					// 同じ種類の中では目線に近いものから。遠いものは掘れない。
+					return (isLogBlock ? 0 : 1000) + Math.abs(p.y - (botY + 1.5));
+				};
+				blocksToRemove.sort((a, b) => rank(a) - rank(b));
 
 				// 1本あたりの時間を区切る。この木を丸ごと片付けることより、
 				// 原木を何本か手に入れて次の行動に移れることの方が大事。
 				// 上限が無いと、3x3x7の範囲(最大63ブロック)を掘り終わるまで
 				// 戻らず、思考ループから見れば永久に終わらない行動になる。
 				const deadline = Date.now() + FELL_BUDGET_MS;
+				// 成果は壊した数ではなく増えた持ち物で測る。葉は掘っても
+				// ほとんど何も落とさないので、壊した数だと嘘になる。
+				gainedBefore = snapshotInventory(driver);
 
 				for (const pos of blocksToRemove) {
 					if (Date.now() > deadline) {
@@ -82,8 +105,17 @@ export const collectWoodSkill = createSkill<void, { felledCount: number; planted
 					const block = driver.world.blockAt(pos);
 					if (block && block.name !== "air" && block.diggable) {
 						await driver.equipBestTool(pos);
-						await driver.dig(signal, pos);
+						try {
+							await driver.dig(signal, pos);
+						} catch (digErr) {
+							// 1ブロック掘れないだけで木ごと諦めない。木の上の方は
+							// 採掘の届く距離(6ブロック)を超えるので、遠いものは
+							// 飛ばして届くものを掘る。掘るうちに近づくこともある。
+							if (signal.aborted) throw digErr;
+							continue;
+						}
 						felledCount++;
+						brokeTally.set(block.name, (brokeTally.get(block.name) ?? 0) + 1);
 						// 回収は1ブロックごとではなく数ブロックおきにする。
 						// pickupNearbyItems は落下物が出るのを待つため、何も落ちて
 						// いなくても3秒近く使う。葉を1枚掘るたびにこれを挟むと、
@@ -174,8 +206,28 @@ export const collectWoodSkill = createSkill<void, { felledCount: number; planted
 			return skillResult.fail("No trees to fell and no suitable dirt/grass for planting.");
 		}
 
-		return skillResult.ok(`Felled ${felledCount} blocks, planted ${plantedCount} sapling(s).`, {
-			felledCount,
+		const gained = gainedBefore ? gainedSince(driver, gainedBefore) : new Map<string, number>();
+		if (brokeTally.size > 0) {
+			agent.log(
+				`[collecting.wood] 壊した内訳: ${[...brokeTally].map(([n, c]) => `${n}x${c}`).join(", ")}`,
+			);
+			const items = driver.nearbyEntities(24).filter((e) => e.kind === "item");
+			agent.log(
+				`[collecting.wood] 周囲の落下物 ${items.length} 個: ${items.map((e) => e.name).join(", ") || "なし"}`,
+			);
+		}
+		if (felledCount > 0 && totalGain(gained) === 0) {
+			// 壊せたのに何も増えていない。葉ばかり掘ったか、落下物を拾えて
+			// いない。成功として返すと、持っていない原木を前提に次の行動が
+			// 組まれる。
+			return skillResult.fail(
+				`Broke ${felledCount} blocks but obtained no wood. The logs may be out of reach; move closer to the trunk.`,
+			);
+		}
+
+		const what = describeGain(gained) || `${felledCount} blocks`;
+		return skillResult.ok(`Collected ${what}, planted ${plantedCount} sapling(s).`, {
+			felledCount: totalGain(gained) || felledCount,
 			plantedCount,
 		});
 	},

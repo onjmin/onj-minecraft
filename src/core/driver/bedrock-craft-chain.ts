@@ -13,6 +13,9 @@
  *   REALM_INVITE=https://realms.gg/xxxx npx tsx --env-file=.env \
  *     src/core/driver/bedrock-craft-chain.ts
  */
+import { profiles } from "../../profiles";
+import { collectWoodSkill } from "../../skills/collecting/wood";
+import { MinecraftAgent } from "../agent";
 import { BedrockDriver } from "./bedrock";
 
 const INVITE = process.env.REALM_INVITE ?? "";
@@ -30,6 +33,11 @@ async function main() {
 	const driver = new BedrockDriver({ realmInvite: INVITE });
 	driver.on("end", (r: string) => console.log(`[chain] 切断: ${r}`));
 
+	// 伐採は実際のスキルに任せる。ここで自前に掘ると、幹の上の方を選んで
+	// 「水平には着いたが採掘が届かない」ような、本番では起きない失敗を作る。
+	// collecting.wood は目線の高さに近い順に掘るのでその問題が無い。
+	const agent = new MinecraftAgent(Object.values(profiles)[0], [], driver);
+
 	console.log("[chain] 接続中...");
 	await driver.connect();
 	await sleep(6000);
@@ -38,35 +46,35 @@ async function main() {
 	const anyLog = () => driver.inventory.items().find((i) => i.name.endsWith("_log"));
 	const anyPlanks = () => driver.inventory.items().find((i) => i.name.endsWith("_planks"));
 
-	const show = () =>
+	// 体力と位置も出す。持ち物が突然空になるのは死亡が原因のことがあり、
+	// 持ち物だけ見ていると「回収に失敗した」と読み違える。
+	const show = () => {
+		const s2 = driver.getState();
 		console.log(
 			`  持ち物: ${
 				driver.inventory
 					.items()
 					.map((i) => `${i.name}x${i.count}`)
 					.join(", ") || "空"
-			}`,
+			}  [HP ${s2.health} 満腹 ${s2.food} 位置 ${s2.position.x.toFixed(0)},${s2.position.y.toFixed(0)},${s2.position.z.toFixed(0)}]`,
 		);
+	};
 	show();
 
-	// 1. 原木。無ければ近くの木を1本掘る。
+	// 1. 原木。無ければ collecting.wood に採りに行かせる。
 	if (!anyLog() && !anyPlanks()) {
-		const logs = driver.world.findBlocksMatching((n) => n.endsWith("_log"), 24, 1);
-		if (!step("原木が近くにある", logs.length > 0)) {
-			await driver.disconnect();
-			process.exit(1);
-		}
-		const target = logs[0].position;
-		console.log(`[chain] 原木 ${logs[0].name} を掘りに行く...`);
+		console.log("[chain] collecting.wood で原木を採る...");
 		const ac = new AbortController();
-		const timer = setTimeout(() => ac.abort(), 90_000);
+		const timer = setTimeout(() => ac.abort(), 120_000);
 		try {
-			await driver.goto(ac.signal, { kind: "near", position: target, distance: 2 });
-			await driver.equipBestTool(target);
-			await driver.dig(ac.signal, target);
-			await driver.pickupNearbyItems(ac.signal);
+			const r = await collectWoodSkill.handler({
+				agent,
+				signal: ac.signal,
+				args: undefined as any,
+			});
+			console.log(`  ${r.success ? "成功" : "失敗"}: ${r.summary}`);
 		} catch (e) {
-			console.log(`  掘る途中で: ${e}`);
+			console.log(`  伐採で例外: ${e}`);
 		}
 		clearTimeout(timer);
 		show();
