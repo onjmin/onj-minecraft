@@ -9,7 +9,7 @@
  * 通っているのは接続・状態・エンティティ・持ち物・移動・発言・ワールド読み取り・
  * 採掘・設置・クラフト・攻撃。本番 Realm で確認済み。
  *
- * 残っている未実装は精錬(smelt / canSmelt)だけ。notImplemented() で例外にする。
+ * 未実装は無くなった。
  * 黙って何もせず成功を装うと、スキル側が「やった」と誤解して先へ進むため。
  *   - smelt / canSmelt: 精錬
  */
@@ -50,6 +50,37 @@ export interface BedrockDriverOptions {
 	/** WSL のディストリビューション名。 */
 	wslDistro?: string;
 }
+
+/**
+ * かまどで焼けるもの。
+ *
+ * かまどのレシピはブロック別のレシピ表で来るが、そこは取り込んでいないので
+ * 名前で判断する。序盤の連鎖に要るものだけあればよい。
+ */
+const SMELTABLE = new Set([
+	"raw_iron",
+	"raw_gold",
+	"raw_copper",
+	"iron_ore",
+	"gold_ore",
+	"copper_ore",
+	"deepslate_iron_ore",
+	"deepslate_gold_ore",
+	"deepslate_copper_ore",
+	"sand",
+	"cobblestone",
+	"cobbled_deepslate",
+	"clay_ball",
+	"beef",
+	"porkchop",
+	"chicken",
+	"mutton",
+	"rabbit",
+	"cod",
+	"salmon",
+	"potato",
+	"kelp",
+]);
 
 /** 防具コンテナのスロット番号。Java版の destination 名に合わせる。 */
 const ARMOR_SLOTS: Record<string, number> = {
@@ -212,7 +243,9 @@ export class BedrockDriver implements BotDriver {
 		// 死亡は黙って進めない。持ち物が全部落ちるので、以降の判断が
 		// 「集めたはずの物がある」前提のままだと全部おかしくなる。
 		this.sidecar.on("death", (d: any) => {
-			console.log(`[bedrock] 死亡しました（${d?.cause ?? "原因不明"}）。持ち物はその場に落ちています`);
+			console.log(
+				`[bedrock] 死亡しました（${d?.cause ?? "原因不明"}）。持ち物はその場に落ちています`,
+			);
 			this.items = [];
 		});
 		this.sidecar.on("respawn", (d: any) => {
@@ -765,11 +798,34 @@ export class BedrockDriver implements BotDriver {
 	canCraft(itemName: string, _craftingTable?: Position): boolean {
 		return this.craftable.has(stripNamespace(itemName));
 	}
-	canSmelt(_itemName: string): boolean {
-		return false;
+	canSmelt(itemName: string): boolean {
+		// 焼けるかどうかはレシピ表では引けない。かまどのレシピは
+		// CraftingData の別枠で来るが、そこは取り込んでいない。
+		// 序盤に要るものだけ名前で判断する。
+		return SMELTABLE.has(stripNamespace(itemName));
 	}
-	async smelt(): Promise<void> {
-		notImplemented("精錬");
+	async smelt(
+		furnace: Position,
+		input: string,
+		inputCount: number,
+		fuel: string,
+		fuelCount: number,
+	): Promise<void> {
+		await this.sidecar.send(
+			"smelt",
+			{
+				x: furnace.x,
+				y: furnace.y,
+				z: furnace.z,
+				names: [stripNamespace(input), stripNamespace(fuel)],
+				count: inputCount,
+				// 燃料の数は face に載せる。専用の欄が無いので流用している。
+				face: fuelCount,
+			},
+			20_000,
+		);
+		await sleep(400);
+		await this.refresh();
 	}
 	async takeAllFromContainer(_signal: AbortSignal, position: Position): Promise<number> {
 		// サイドカーが開く・移す・閉じるまでを一続きで行う。途中で放り出すと

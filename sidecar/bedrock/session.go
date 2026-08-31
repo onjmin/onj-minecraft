@@ -370,9 +370,30 @@ func (s *session) handle(pk packet.Packet) {
 		// 消えた理由が分からないまま検証結果だけが揺れる。実際、土50個も
 		// ツルハシも失っていたのに気付けなかった。
 		emit(event{Event: "death", Data: map[string]any{"cause": v.Cause}})
+		// 死亡直後にも復帰を要求しておく。サーバーによっては Respawn を
+		// 先に送ってこないことがある。
+		_ = s.conn.WritePacket(&packet.PlayerAction{
+			EntityRuntimeID: s.game.EntityRuntimeID,
+			ActionType:      protocol.PlayerActionRespawn,
+		})
 
 	case *packet.Respawn:
 		if v.EntityRuntimeID != s.game.EntityRuntimeID {
+			return
+		}
+		// 統合版は死んでも勝手には戻らない。実クライアントは死亡画面で
+		// 「リスポーン」を押し、そこで初めて要求が飛ぶ。こちらから送らないと
+		// 死んだまま動き続け、以降の行動が全部無意味になる。
+		if v.State == packet.RespawnStateSearchingForSpawn {
+			_ = s.conn.WritePacket(&packet.PlayerAction{
+				EntityRuntimeID: s.game.EntityRuntimeID,
+				ActionType:      protocol.PlayerActionRespawn,
+			})
+			_ = s.conn.WritePacket(&packet.Respawn{
+				EntityRuntimeID: s.game.EntityRuntimeID,
+				State:           packet.RespawnStateClientReadyToSpawn,
+				Position:        v.Position,
+			})
 			return
 		}
 		if v.State == packet.RespawnStateReadyToSpawn {
@@ -1470,6 +1491,103 @@ func (s *session) dispatch(c command) {
 			s.reply(c.ID, true, "", nil)
 		}
 
+	case "smelt":
+		// かまどに素材と燃料を入れる。焼き上がりは待たない。
+		//
+		// 枠は「素材」「燃料」「出来上がり」の3つで、それぞれ別の ContainerID を
+		// 使う。チェストのようにまとめて1つの ID では指せない。
+		// Names[0] に素材名、Names[1] に燃料名、Count に素材の数、
+		// Face に燃料の数を入れて呼ぶ。
+		{
+			if len(c.Names) < 2 {
+				s.reply(c.ID, false, "素材と燃料を指定してください", nil)
+				return
+			}
+			inputName := trimNamespace(c.Names[0])
+			fuelName := trimNamespace(c.Names[1])
+			inputCount := max(1, c.Count)
+			fuelCount := max(1, int(c.Face))
+
+			box, err := s.openContainerAt(c.X, c.Y, c.Z)
+			if err != nil {
+				s.reply(c.ID, false, err.Error(), nil)
+				return
+			}
+
+			s.mu.Lock()
+			var actions []protocol.StackRequestAction
+			spent := map[int]int{}
+			inv := protocol.FullContainerName{ContainerID: protocol.ContainerCombinedHotBarAndInventory}
+			s.craftReqID -= 2
+			reqID := s.craftReqID
+
+			put := func(name string, want int, dstContainer byte) int {
+				moved := 0
+				for slot, item := range s.rawSlots {
+					if moved >= want {
+						break
+					}
+					n, ok := s.itemNames[item.Stack.ItemType.NetworkID]
+					if !ok || n != name {
+						continue
+					}
+					avail := int(item.Stack.Count) - spent[slot]
+					if avail <= 0 {
+						continue
+					}
+					use := min(avail, want-moved)
+					srcID := item.StackNetworkID
+					if spent[slot] > 0 {
+						srcID = reqID
+					}
+					place := &protocol.PlaceStackRequestAction{}
+					place.Count = byte(use)
+					place.Source = protocol.StackRequestSlotInfo{
+						Container: inv, Slot: byte(slot), StackNetworkID: srcID,
+					}
+					place.Destination = protocol.StackRequestSlotInfo{
+						Container:      protocol.FullContainerName{ContainerID: dstContainer},
+						Slot:           0,
+						StackNetworkID: 0,
+					}
+					actions = append(actions, place)
+					spent[slot] += use
+					moved += use
+				}
+				return moved
+			}
+
+			gotInput := put(inputName, inputCount, protocol.ContainerFurnaceIngredient)
+			gotFuel := put(fuelName, fuelCount, protocol.ContainerFurnaceFuel)
+			windowID := box.WindowID
+			s.mu.Unlock()
+
+			if gotInput == 0 || gotFuel == 0 {
+				_ = s.conn.WritePacket(&packet.ContainerClose{WindowID: windowID})
+				s.mu.Lock()
+				s.container = nil
+				s.mu.Unlock()
+				s.reply(c.ID, false, fmt.Sprintf("投入できませんでした（素材 %d / 燃料 %d）", gotInput, gotFuel), nil)
+				return
+			}
+
+			if err := s.conn.WritePacket(&packet.ItemStackRequest{
+				Requests: []protocol.ItemStackRequest{{RequestID: reqID, Actions: actions}},
+			}); err != nil {
+				s.reply(c.ID, false, fmt.Sprintf("投入に失敗: %v", err), nil)
+				return
+			}
+			time.Sleep(500 * time.Millisecond)
+
+			// 開けっ放しにすると次の操作が通らない。焼き上がりは後で
+			// takeAll で取りに来る。
+			_ = s.conn.WritePacket(&packet.ContainerClose{WindowID: windowID})
+			s.mu.Lock()
+			s.container = nil
+			s.mu.Unlock()
+			s.reply(c.ID, true, "", map[string]any{"input": gotInput, "fuel": gotFuel})
+		}
+
 	case "takeAll":
 		// コンテナを開いて中身を持ち物へ移し、閉じる。
 		//
@@ -2086,6 +2204,50 @@ func (s *session) lookAtLocked(x, y, z float32) {
 
 // faceToward はプレイヤーから見て手前になる面を返す。
 // 0=下 1=上 2=北(-Z) 3=南(+Z) 4=西(-X) 5=東(+X)
+// openContainerAt はその位置のコンテナを開き、中身が届くまで待つ。
+// 開くのは設置と同じ ClickBlock。サーバーが対象を見て開いてくれる。
+func (s *session) openContainerAt(x, y, z float32) (*openContainer, error) {
+	bx := int32(math.Floor(float64(x)))
+	by := int32(math.Floor(float64(y)))
+	bz := int32(math.Floor(float64(z)))
+	s.mu.Lock()
+	reach := s.pos.Sub(mgl32.Vec3{float32(bx) + 0.5, float32(by) + 0.5, float32(bz) + 0.5}).Len()
+	if reach > digReach {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("遠すぎて届きません（%.1f ブロック）", reach)
+	}
+	face := faceToward(s.pos, bx, by, bz)
+	clicked, _ := s.world.runtimeIDAt(bx, by, bz)
+	held := s.rawSlots[int(s.heldSlot)]
+	s.container = nil
+	s.pendingPlace = &protocol.UseItemTransactionData{
+		ActionType:       protocol.UseItemActionClickBlock,
+		TriggerType:      protocol.TriggerTypePlayerInput,
+		BlockPosition:    protocol.BlockPos{bx, by, bz},
+		BlockFace:        face,
+		HotBarSlot:       s.heldSlot,
+		HeldItem:         held,
+		Position:         s.pos,
+		ClickedPosition:  clickOffset(face),
+		BlockRuntimeID:   uint32(clicked),
+		ClientPrediction: protocol.ClientPredictionSuccess,
+	}
+	s.lookAtLocked(float32(bx)+0.5, float32(by)+0.5, float32(bz)+0.5)
+	s.mu.Unlock()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+		s.mu.Lock()
+		box := s.container
+		s.mu.Unlock()
+		if box != nil && box.Filled {
+			return box, nil
+		}
+	}
+	return nil, fmt.Errorf("コンテナが開きませんでした")
+}
+
 // containerIDFor はコンテナの種類から、スロットを指すときの ContainerID を返す。
 // 種類ごとに枠の意味が違うので、どれも同じ ID で指すことはできない。
 func containerIDFor(containerType byte) byte {
