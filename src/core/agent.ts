@@ -1012,27 +1012,32 @@ export class MinecraftAgent {
 	}
 
 	private getAgentStateForThinking() {
-		const skillsContext = Array.from(this.skills.values()).map((t) => {
-			const hasArgs = t.inputSchema && Object.keys(t.inputSchema).length > 0;
-			const argsInfo = hasArgs
-				? Object.entries(t.inputSchema)
-						.map(([k, v]) => `${k}: ${(v as any).description}`)
-						.join(", ")
-				: "";
-			// これまでの実績を添える。うまくいっていない手段を避けられる。
-			const rel = this.skillReliability(t.name);
-			const note =
-				rel && rel.tried >= 3
-					? ` [これまで ${rel.tried} 回試して成功率 ${Math.round(rel.rate * 100)}%${
-							rel.rate < 0.2 ? "。ほぼ失敗している。別の手を先に試すこと" : ""
-						}]`
+		const skillsContext = Array.from(this.skills.values())
+			// 落とし物の回収は、落とし物があるときだけ見せる。無いときに見せると
+			// LLM が選んで即失敗する。実測で15分に20回選ばれ、そのぶん他の
+			// 行動が選ばれなかった。これは反射で扱うもので、判断の対象ではない。
+			.filter((t) => t.name !== gotoDeathPointSkill.name || this.getDeathPoint() !== null)
+			.map((t) => {
+				const hasArgs = t.inputSchema && Object.keys(t.inputSchema).length > 0;
+				const argsInfo = hasArgs
+					? Object.entries(t.inputSchema)
+							.map(([k, v]) => `${k}: ${(v as any).description}`)
+							.join(", ")
 					: "";
-			return {
-				name: t.name,
-				description: t.description + note,
-				args: argsInfo,
-			};
-		});
+				// これまでの実績を添える。うまくいっていない手段を避けられる。
+				const rel = this.skillReliability(t.name);
+				const note =
+					rel && rel.tried >= 3
+						? ` [これまで ${rel.tried} 回試して成功率 ${Math.round(rel.rate * 100)}%${
+								rel.rate < 0.2 ? "。ほぼ失敗している。別の手を先に試すこと" : ""
+							}]`
+						: "";
+				return {
+					name: t.name,
+					description: t.description + note,
+					args: argsInfo,
+				};
+			});
 
 		const historyText = this.getHistoryContext();
 		const inventory =

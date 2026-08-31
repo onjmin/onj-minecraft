@@ -26,6 +26,8 @@ function isSafeBlock(name: string): boolean {
 
 /** 空が見えているかを測る高さ。屋根はこの範囲に収まる前提。 */
 const SKY_SCAN_HEIGHT = 32;
+/** これだけ上がれていれば、途中でも成果として認める。 */
+const PARTIAL_CLIMB = 3;
 
 function isTransparent(name: string): boolean {
 	return !name || name === "air" || name === "water" || name === "lava";
@@ -130,9 +132,22 @@ export const gotoSurfaceSkill = createSkill<void, { y: number; method: string }>
 		const digUpTargetY = Math.min(320, startY + 30);
 		let currentDigY = startY;
 
+		// 掘り上がりは1ブロックに数秒かかる。30ブロック掘り切るまで成功と
+		// 認めないと、地下深くからは何度やっても失敗になる。実測で64回試して
+		// 成功率0%。上がったぶんを成果として返す。
+		const climbed = () => Math.floor(driver.getState().position.y) - startY;
+		const partial = (): SkillResponse<{ y: number; method: string }> | null => {
+			const gained = climbed();
+			if (gained < PARTIAL_CLIMB) return null;
+			return skillResult.ok(`Climbed ${gained} blocks toward the surface.`, {
+				y: startY + gained,
+				method: "dig-up-partial",
+			});
+		};
+
 		while (currentDigY < digUpTargetY) {
 			if (signal.aborted) {
-				return skillResult.fail("Aborted");
+				return partial() ?? skillResult.fail("Aborted");
 			}
 
 			const checkPos: Position = {
@@ -168,12 +183,12 @@ export const gotoSurfaceSkill = createSkill<void, { y: number; method: string }>
 				await driver.dig(signal, checkPos);
 				await new Promise((r) => setTimeout(r, 100));
 			} catch {
-				return skillResult.fail("Dig-up aborted or failed");
+				return partial() ?? skillResult.fail("Dig-up aborted or failed");
 			}
 
 			currentDigY++;
 		}
 
-		return skillResult.fail("Could not reach surface.");
+		return partial() ?? skillResult.fail("Could not reach surface.");
 	},
 });
