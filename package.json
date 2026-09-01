@@ -6,6 +6,7 @@
 	"scripts": {
 		"start": "tsx src/workflow/index.ts",
 		"dev": "tsx --watch src/workflow/index.ts",
+		"start:bedrock": "bash scripts/run-bedrock.sh",
 		"lint": "biome check .",
 		"format": "biome format --write ."
 	},
