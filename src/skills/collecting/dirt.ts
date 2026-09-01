@@ -1,8 +1,9 @@
+import { envNum } from "../../core/utils/env";
 import { describeGain, gainedSince, snapshotInventory, totalGain } from "../inventory-delta";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
 /** 1回の採集にかける上限。 */
-const DIRT_BUDGET_MS = Number(process.env.DIRT_BUDGET_MS ?? 40_000);
+const DIRT_BUDGET_MS = envNum("DIRT_BUDGET_MS", 40_000);
 /** 何ブロック掘るごとに落下物を拾いに行くか。 */
 const PICKUP_EVERY = 5;
 

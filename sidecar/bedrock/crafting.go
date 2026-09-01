@@ -366,7 +366,7 @@ func (s *session) craftRequestLocked(rec craftRecipe, requestID int32) (*protoco
 			use := min(avail, remaining)
 			// 同じスロットから2回目以降を取り出すときは、元の識別子では指せない。
 			// 1回目の取り出しでそのスタックの識別子が変わるため、古いものを
-			// 送ると FailedToValidateSrcSlot(55) になる。同一要求の中で
+			// 送ると FailedToValidateSrcSlot(49) になる。同一要求の中で
 			// 変化したスタックはリクエストIDで指す決まり。
 			// 木のツルハシは板3枚を同じスロットから取るので必ず踏む。
 			srcID := item.StackNetworkID
@@ -490,7 +490,7 @@ func (s *session) freeSlotLocked() (int, bool) {
 // 拒否される。板を続けて作ると2回目で必ず起きていた。
 // used には、この要求の中で素材を取り出したスロットを渡す。そこを行き先に
 // すると、サーバーが「取り出し元と行き先が同じ」と見て
-// DstContainerAndSlotEqualToSrcContainerAndSlot(49) で拒否する。
+// DstContainerAndSlotEqualToSrcContainerAndSlot(48) で拒否する。
 func (s *session) outputSlotLocked(outputName string, used map[int]int) (int, int32, bool) {
 	for i := 0; i < 36; i++ {
 		if used[i] > 0 {

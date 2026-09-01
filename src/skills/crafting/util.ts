@@ -182,9 +182,19 @@ export function findAllPlaceablePositions(agent: MinecraftAgent): PlaceCandidate
 	return candidates;
 }
 
-/** 原木名から板材名を導く (birch_log -> birch_planks)。 */
+/**
+ * 原木名から板材名を導く (birch_log -> birch_planks)。
+ *
+ * 接尾辞は末尾でのみ落とす。以前は `/_log|_stem|_wood$/` と書いていて、
+ * `$` が最後の選択肢にしか掛からず `_log` はどこにあっても消えていた。
+ *
+ * 皮を剥いだ原木も同じ板材になる。stripped_ を付けたままだと
+ * stripped_oak_planks という存在しない名前を作り、レシピが引けずに
+ * 「木は持っているのに板材が作れない」で連鎖が止まる。
+ */
 function plankNameFromLog(logName: string): string {
-	return `${logName.replace(/_log|_stem|_wood$/, "")}_planks`;
+	const base = logName.replace(/^stripped_/, "").replace(/(_log|_stem|_wood|_hyphae)$/, "");
+	return `${base}_planks`;
 }
 
 /** インベントリから最初に見つかった原木を返す。 */
@@ -197,6 +207,69 @@ function findLog(agent: MinecraftAgent) {
 /** インベントリから最初に見つかった板材を返す。 */
 function findPlanks(agent: MinecraftAgent) {
 	return agent.driver.inventory.items().find((i) => i.name.endsWith("_planks"));
+}
+
+/**
+ * 板材の合計枚数。種類も山も問わずに数える。
+ *
+ * findPlanks() は最初の1山しか返さない。樫と白樺を両方持っていると
+ * oak_planks:2 と birch_planks:3 が別の山になり、合計5枚あるのに
+ * 「2枚しかない」と判定される。作業台は板材4枚だが、板材のレシピは
+ * タグ指定なので種類が混ざっていても作れる。数えるときも混ぜて数える。
+ *
+ * これを1山で見ていたため、材料が足りているのに作業台が用意できず、
+ * 木の剣が最後まで作れないことがあった。
+ */
+export function countPlanks(agent: MinecraftAgent): number {
+	return agent.driver.inventory
+		.items()
+		.filter((i) => i.name.endsWith("_planks"))
+		.reduce((sum, i) => sum + i.count, 0);
+}
+
+/** 原木の合計本数。1本で板材4枚になる。 */
+export function countLogs(agent: MinecraftAgent): number {
+	return agent.driver.inventory
+		.items()
+		.filter((i) => i.name.endsWith("_log") || i.name.endsWith("_stem") || i.name.endsWith("_wood"))
+		.reduce((sum, i) => sum + i.count, 0);
+}
+
+/** 品目の合計。同じ物が複数スロットに散っていても数え落とさない。 */
+export function countItem(agent: MinecraftAgent, name: string): number {
+	return agent.driver.inventory
+		.items()
+		.reduce((sum, i) => (i.name === name ? sum + i.count : sum), 0);
+}
+
+/**
+ * driver.craft() を安全に呼ぶ。
+ *
+ * 統合版はサーバーに拒否されると例外を投げる(BedrockDriver.craft は
+ * sidecar.send を経由し、送信側が ok:false を reject にしている)。
+ * ここの ensureXxx 系はどれもその前提を忘れて素通しにしていたため、
+ * 拒否が丸ごと ensureSticks/ensurePlanks の外まで抜け、呼び出し元の
+ * crafting.tool / crafting.weapon の try ブロックにも入らずに
+ * MinecraftAgent の反射ループまで届いていた。そこでは「aborted」と
+ * 誤表記された上で例外を再送出し、指数バックオフ(最大30秒)だけがかかって
+ * 同じ拒否を延々と繰り返す。skillStats にも一切残らないので、LLM から見て
+ * 「crafting.weapon が失敗し続けている」ことにすら気づけなかった。
+ * 失敗は例外ではなく戻り値の false で返し、ここで一度だけログする。
+ */
+async function tryCraft(
+	agent: MinecraftAgent,
+	label: string,
+	itemName: string,
+	count: number,
+	craftingTable?: Position,
+): Promise<boolean> {
+	try {
+		await agent.driver.craft(itemName, count, craftingTable);
+		return true;
+	} catch (err) {
+		agent.log(`[${label}] クラフトが拒否された: ${itemName} x${count}: ${err}`);
+		return false;
+	}
 }
 
 /**
@@ -218,12 +291,9 @@ export async function ensureCraftingTable(agent: MinecraftAgent): Promise<BlockI
 
 	// 3. なければ作る（原木 -> 板材 -> 作業台）
 	if (!tableItem) {
-		let planks = findPlanks(agent);
-		agent.log(
-			`[ensureCraftingTable] Planks in inventory: found=${!!planks}, count=${planks?.count || 0}`,
-		);
+		agent.log(`[ensureCraftingTable] Planks in inventory: total=${countPlanks(agent)}`);
 
-		if (!planks || planks.count < 4) {
+		if (countPlanks(agent) < 4) {
 			const logItem = findLog(agent);
 
 			agent.log(
@@ -242,16 +312,15 @@ export async function ensureCraftingTable(agent: MinecraftAgent): Promise<BlockI
 				agent.log(`[ensureCraftingTable] FAIL: No plank recipe`);
 				return null;
 			}
-			await driver.craft(plankItemName, 1);
-			planks = findPlanks(agent);
-			agent.log(`[ensureCraftingTable] After crafting planks: count=${planks?.count || 0}`);
+			await tryCraft(agent, "ensureCraftingTable", plankItemName, 1);
+			agent.log(`[ensureCraftingTable] After crafting planks: total=${countPlanks(agent)}`);
 		}
 
-		if (planks && planks.count >= 4) {
+		if (countPlanks(agent) >= 4) {
 			const canCraftTable = driver.canCraft("crafting_table");
 			agent.log(`[ensureCraftingTable] Table recipe: found=${canCraftTable}`);
 			if (canCraftTable) {
-				await driver.craft("crafting_table", 1);
+				await tryCraft(agent, "ensureCraftingTable", "crafting_table", 1);
 			}
 			tableItem = driver.inventory.items().find((i) => i.name === "crafting_table");
 			agent.log(`[ensureCraftingTable] Crafted table item: found=${!!tableItem}`);
@@ -288,13 +357,13 @@ export async function ensureFurnace(agent: MinecraftAgent): Promise<BlockInfo | 
 
 	// 3. なければ作る（丸石 x 8 -> かまど）
 	if (!furnaceItem) {
-		const cobble = driver.inventory.items().find((i) => i.name === "cobblestone");
-		agent.log(
-			`[ensureFurnace] Cobble in inventory: found=${!!cobble}, count=${cobble?.count || 0}`,
-		);
+		// 山ごとではなく合計で数える。丸石が 4+4 の2山に分かれているとき、
+		// 最初の山だけを見て「8個に足りない」と判定していた。
+		const cobble = countItem(agent, "cobblestone");
+		agent.log(`[ensureFurnace] Cobble in inventory: total=${cobble}`);
 
 		// 丸石が8個以上必要
-		if (!cobble || cobble.count < 8) {
+		if (cobble < 8) {
 			agent.log(`[ensureFurnace] FAIL: Not enough cobble (need 8)`);
 			return null;
 		}
@@ -311,7 +380,7 @@ export async function ensureFurnace(agent: MinecraftAgent): Promise<BlockInfo | 
 
 		if (!canCraftFurnace) return null;
 
-		await driver.craft("furnace", 1, table.position);
+		await tryCraft(agent, "ensureFurnace", "furnace", 1, table.position);
 		furnaceItem = driver.inventory.items().find((i) => i.name === "furnace");
 		agent.log(`[ensureFurnace] Crafted furnace: found=${!!furnaceItem}`);
 	}
@@ -335,19 +404,16 @@ export async function ensureFurnace(agent: MinecraftAgent): Promise<BlockInfo | 
 export async function ensureSticks(agent: MinecraftAgent, count = 4): Promise<boolean> {
 	const { driver } = agent;
 
-	// 1. インベントリ確認
-	const sticks = driver.inventory.items().find((i) => i.name === "stick");
-	agent.log(
-		`[ensureSticks] sticks found=${!!sticks}, count=${sticks?.count || 0}, required=${count}`,
-	);
-	if (sticks && sticks.count >= count) return true;
+	// 1. インベントリ確認。棒も複数の山に分かれうるので合計で見る。
+	agent.log(`[ensureSticks] sticks total=${countItem(agent, "stick")}, required=${count}`);
+	if (countItem(agent, "stick") >= count) return true;
 
 	// 2. なければ作る（板材 -> 棒）
 	let planks = findPlanks(agent);
-	agent.log(`[ensureSticks] planks: found=${!!planks}, count=${planks?.count || 0}`);
+	agent.log(`[ensureSticks] planks: total=${countPlanks(agent)}`);
 
 	// 板材がない場合は原木から作る（再帰的に板材を確保するようなロジック）
-	if (!planks || planks.count < 2) {
+	if (countPlanks(agent) < 2) {
 		const logItem = findLog(agent);
 
 		agent.log(
@@ -367,7 +433,7 @@ export async function ensureSticks(agent: MinecraftAgent, count = 4): Promise<bo
 
 		if (!canCraftPlanks) return false;
 
-		await driver.craft(plankItemName, 1);
+		if (!(await tryCraft(agent, "ensureSticks", plankItemName, 1))) return false;
 		planks = findPlanks(agent);
 		agent.log(
 			`[ensureSticks] After crafting planks: found=${!!planks}, count=${planks?.count || 0}`,
@@ -375,18 +441,20 @@ export async function ensureSticks(agent: MinecraftAgent, count = 4): Promise<bo
 	}
 
 	// 3. 棒をクラフト（2枚の板材から4本の棒）
-	if (planks && planks.count >= 2) {
+	if (countPlanks(agent) >= 2) {
 		// 棒は作業台不要
 		const canCraftSticks = driver.canCraft("stick");
 
 		agent.log(`[ensureSticks] stickRecipe: found=${canCraftSticks}`);
 
 		if (canCraftSticks) {
-			await driver.craft("stick", Math.ceil(count / 4));
-			const sticksAfter = driver.inventory.items().find((i) => i.name === "stick");
-			agent.log(`[ensureSticks] After crafting sticks: count=${sticksAfter?.count || 0}`);
-			agent.log(`[ensureSticks] SUCCESS: Crafted sticks`);
-			return true;
+			await tryCraft(agent, "ensureSticks", "stick", Math.ceil(count / 4));
+			// 作ったつもりで数を確かめずに true を返していた。クラフトが
+			// 弾かれても成功として返るので、呼び出し側は棒があるものとして
+			// 剣の作成へ進み、そこで初めて失敗する。実際に増えたかで答える。
+			const after = countItem(agent, "stick");
+			agent.log(`[ensureSticks] After crafting sticks: total=${after}`);
+			return after >= count;
 		}
 	}
 
@@ -403,15 +471,12 @@ export async function ensureSticks(agent: MinecraftAgent, count = 4): Promise<bo
 export async function ensurePlanks(agent: MinecraftAgent, minCount = 4): Promise<boolean> {
 	const { driver } = agent;
 
-	const planks = findPlanks(agent);
-	if (planks && planks.count >= minCount) {
-		agent.log(`[ensurePlanks] Already have enough planks: ${planks.count}`);
+	const have = countPlanks(agent);
+	if (have >= minCount) {
+		agent.log(`[ensurePlanks] Already have enough planks: ${have}`);
 		return true;
 	}
-
-	if (planks) {
-		agent.log(`[ensurePlanks] Already have some planks: ${planks.count}, need ${minCount}`);
-	}
+	agent.log(`[ensurePlanks] Have ${have} planks, need ${minCount}`);
 
 	agent.log(
 		`[ensurePlanks] Current inventory: ${driver.inventory
@@ -424,7 +489,7 @@ export async function ensurePlanks(agent: MinecraftAgent, minCount = 4): Promise
 
 	if (!logItem) {
 		agent.log(
-			`[ensurePlanks] FAIL: No logs in inventory, and not enough planks (have ${planks?.count || 0}, need ${minCount})`,
+			`[ensurePlanks] FAIL: No logs in inventory, and not enough planks (have ${have}, need ${minCount})`,
 		);
 		return false;
 	}
@@ -439,14 +504,16 @@ export async function ensurePlanks(agent: MinecraftAgent, minCount = 4): Promise
 		return false;
 	}
 
-	// 必要な板材の数に合わせて原木の数を変える（1原木 = 4板材）
-	const logsNeeded = Math.ceil(minCount / 4);
-	await driver.craft(plankItemName, logsNeeded);
+	// 足りないぶんだけ作る。1原木 = 板材4枚。
+	// 既に持っているぶんを引かずに minCount 全部を作ろうとしていたので、
+	// 原木を余計に潰していた。
+	const logsNeeded = Math.ceil((minCount - have) / 4);
+	await tryCraft(agent, "ensurePlanks", plankItemName, Math.max(1, logsNeeded));
 
-	const planksAfter = findPlanks(agent);
-	agent.log(`[ensurePlanks] After crafting: count=${planksAfter?.count || 0}`);
+	const after = countPlanks(agent);
+	agent.log(`[ensurePlanks] After crafting: total=${after}`);
 
-	return Boolean(planksAfter && planksAfter.count >= minCount);
+	return after >= minCount;
 }
 
 /**
@@ -468,20 +535,21 @@ export async function ensureChest(agent: MinecraftAgent): Promise<BlockInfo | nu
 
 	// 3. なければ作る（板材 x 8 -> チェスト）
 	if (!chestItem) {
-		let planks = findPlanks(agent);
-		agent.log(`[ensureChest] Planks in inventory: found=${!!planks}, count=${planks?.count || 0}`);
+		// 板材はタグ指定なので種類が混ざっていても作れる。数えるときも
+		// 山ごとではなく合計で見る。樫4枚と白樺4枚を持っているとき、
+		// 山で見ると8枚あるのに「足りない」と判定していた。
+		agent.log(`[ensureChest] Planks in inventory: total=${countPlanks(agent)}`);
 
-		if (!planks || planks.count < 8) {
+		if (countPlanks(agent) < 8) {
 			agent.log(`[ensureChest] Not enough planks (need 8)`);
 			const ensured = await ensurePlanks(agent, 8);
 			if (!ensured) {
 				agent.log(`[ensureChest] FAIL: Could not ensure planks`);
 				return null;
 			}
-			planks = findPlanks(agent);
 		}
 
-		if (planks && planks.count >= 8) {
+		if (countPlanks(agent) >= 8) {
 			const table = await ensureCraftingTable(agent);
 			if (!table) {
 				agent.log(`[ensureChest] FAIL: No crafting table`);
@@ -493,7 +561,7 @@ export async function ensureChest(agent: MinecraftAgent): Promise<BlockInfo | nu
 
 			if (!canCraftChest) return null;
 
-			await driver.craft("chest", 1, table.position);
+			await tryCraft(agent, "ensureChest", "chest", 1, table.position);
 			chestItem = driver.inventory.items().find((i) => i.name === "chest");
 			agent.log(`[ensureChest] Crafted chest: found=${!!chestItem}`);
 		}

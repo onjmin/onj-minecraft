@@ -180,6 +180,30 @@ export interface BotDriver {
 	equipBestTool(position: Position): Promise<void>;
 	pickupNearbyItems(signal: AbortSignal): Promise<void>;
 
+	/**
+	 * 食べ物を食べて満腹度を戻す。食べたら true。
+	 *
+	 * これが無いまま長く動かしていた。food は知覚まで通っていて思考プロンプトに
+	 * 「Hunger: 20」と出るのに、減ったものを戻す手段がどこにも無かった。
+	 * 満腹度が 18 を切ると体力が自然回復しなくなるので、狩って焼いた肉を
+	 * 持ったまま、回復できずに殴られて死ぬ状態が続いていた。
+	 * shelterAtNight の「潜っても満腹度が足りなければ回復しない」という
+	 * 但し書きは、この欠落をそのまま言い当てている。
+	 *
+	 * 何を食べるかは実装側が選ぶ（腐肉やフグのような不利益のあるものは避ける）。
+	 */
+	eat(signal: AbortSignal): Promise<boolean>;
+
+	/**
+	 * 持ち物のアイテムを地面に落とす。
+	 *
+	 * Java版・統合版とも、プレイヤー同士で直接手渡す操作は存在しない。
+	 * バニラで人に物を渡す唯一の方法は、相手のそばで落として拾わせること
+	 * （Q キー相当）。呼ぶ前に相手のすぐ近くまで goto しておくこと。
+	 * 持っている数より多く指定したら、持っている分だけ落とす。
+	 */
+	dropItem(itemName: string, count: number): Promise<void>;
+
 	/** 作業台が必要な場合は craftingTable にその位置を渡す。 */
 	craft(itemName: string, count: number, craftingTable?: Position): Promise<void>;
 	/** 指定アイテムを今のインベントリで作れるか。 */

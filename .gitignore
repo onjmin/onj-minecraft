@@ -146,3 +146,6 @@ sidecar/bedrock/bin/
 
 # ブロック状態表（2.4MB・scripts/build-sidecar.sh が取得する）
 sidecar/bedrock/data/block_states.nbt
+
+# Claude Code のローカル許可設定
+.claude/settings.local.json

@@ -60,7 +60,7 @@ async function run(model: string) {
 	console.log(`\n${"=".repeat(70)}\n${model}\n${"=".repeat(70)}`);
 
 	for (const line of SCRIPT) {
-		conversation.record("onjmin", line, false);
+		conversation.record("onjmin", line, "player");
 		const started = Date.now();
 		try {
 			const { reply, request } = await conversation.respond(SITUATION);
@@ -68,7 +68,7 @@ async function run(model: string) {
 			console.log(`<onjmin> ${line}`);
 			console.log(`<kusabot> ${reply || "(黙る)"}   [${sec}s]`);
 			if (request) console.log(`         依頼として拾った: ${request}`);
-			if (reply) conversation.record("kusabot", reply, true);
+			if (reply) conversation.record("kusabot", reply, "self");
 		} catch (err) {
 			console.log(`<onjmin> ${line}`);
 			console.log(`  ERROR: ${err}`);

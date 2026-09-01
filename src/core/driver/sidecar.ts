@@ -65,7 +65,13 @@ function defaultBinary(viaWsl: boolean): string {
  * 人間が受け取るのは共有される URL の方なので、こちら側で剥がす。
  */
 function inviteCode(invite: string): string {
-	return invite.trim().replace(/^https?:\/\/(?:www\.)?realms\.gg\//i, "");
+	const text = invite.trim();
+	// 共有リンクには2つの形がある。realms.gg の短縮形と、
+	// minecraft.net/…/open?inviteCode=XXXX のクエリ形。後者を剥がせずに
+	// 丸ごと渡すと 404 になり、Realm が消えたのかリンクが古いのか区別がつかない。
+	const q = /[?&]inviteCode=([^&#\s]+)/i.exec(text);
+	if (q) return q[1];
+	return text.replace(/^https?:\/\/(?:www\.)?realms\.gg\//i, "");
 }
 
 /** C:\foo\bar → /mnt/c/foo/bar。WSL に渡すパスの変換。 */

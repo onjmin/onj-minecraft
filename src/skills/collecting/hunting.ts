@@ -33,9 +33,15 @@ export const huntAnimalsSkill = createSkill<void, { hunted: string; success: boo
 		try {
 			// 2. Equip weapon (sword or axe)
 			// 武器を装備（剣を優先、なければ斧）
-			const weapon = driver.inventory
-				.items()
-				.find((item) => item.name.includes("sword") || item.name.includes("axe"));
+			//
+			// includes("axe") で探していたので pickaxe が引っかかっていた。
+			// しかも find は持ち物の並び順で最初の1つを返すため、剣を持って
+			// いてもツルハシが手前にあればそちらを持って殴りに行っていた。
+			// ツルハシの攻撃力は素手と大差ない。順番に探して剣を優先する。
+			const items = driver.inventory.items();
+			const weapon =
+				items.find((item) => item.name.endsWith("_sword")) ??
+				items.find((item) => item.name.endsWith("_axe"));
 			if (weapon) await driver.equip(weapon.name, "hand");
 
 			// 3. Approach and attack

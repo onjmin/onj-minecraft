@@ -32,7 +32,15 @@ export const craftWeaponSkill = createSkill<void, { item: string; material: stri
 		// 剣に2枚、作業台に4枚。まとめて確保する。剣のぶんだけ用意すると、
 		// この直後の ensureCraftingTable が板不足で止まる。実測で
 		// crafting.weapon が28回選ばれて、剣の要求が0回だった。
-		await ensurePlanks(agent, 6);
+		//
+		// 戻り値を捨てていた。板材を用意できなくてもそのまま先へ進み、
+		// 作業台も剣も作れずに「材料不足」以外の分かりにくい失敗になる。
+		// ここで止めれば、伐採へ回るべきだと上位に伝わる。
+		if (!(await ensurePlanks(agent, 6))) {
+			return skillResult.fail(
+				"Insufficient materials: need at least 6 planks (or logs to make them) for a weapon and a crafting table.",
+			);
+		}
 
 		// 1. 次に作るべき装備を判定
 		const target = craftingManager.determineNextWeapon(agent);
@@ -69,76 +77,144 @@ export const craftWeaponSkill = createSkill<void, { item: string; material: stri
 	},
 });
 
+/**
+ * 装備の種類ごとに「実在する素材」だけを、良い順に並べたもの。
+ *
+ * 以前は剣も防具も同じ materials 表を引いていた。しかし木や石の防具は
+ * Minecraft に存在しない。板材を持っているだけで wooden_helmet が、
+ * 丸石を5個持っているだけで stone_helmet が「次に作るもの」として選ばれ、
+ * 当然どちらも作れずに失敗していた。剣を既に持っている間はこれが延々と続く。
+ *
+ * 防具の素材は革・鉄・金・ダイヤ。チェーンは通常クラフトできないので入れない。
+ * 金は防具としては脆く、鉄より先に作る意味がないので候補から外す。
+ * 革は牛から取れるので、序盤に実際に作れる唯一の防具になる。
+ */
+const MATERIALS_BY_TYPE: Record<string, string[]> = {
+	sword: ["diamond", "iron", "stone", "wooden"],
+	helmet: ["diamond", "iron", "leather"],
+	chestplate: ["diamond", "iron", "leather"],
+	leggings: ["diamond", "iron", "leather"],
+	boots: ["diamond", "iron", "leather"],
+};
+
+/** 素材から作るのに要る個数。剣は素材2＋棒1。 */
+const REQUIRED_COUNT: Record<string, number> = {
+	sword: 2,
+	helmet: 5,
+	chestplate: 8,
+	leggings: 7,
+	boots: 4,
+};
+
+/** その素材を1個ぶん数えるときに見るアイテム名。 */
+function resourceNameFor(material: string): string | null {
+	switch (material) {
+		case "wooden":
+			return null; // 板材はタグで来るので個別に数える
+		case "stone":
+			return "cobblestone";
+		case "leather":
+			return "leather";
+		case "diamond":
+			// ダイヤは精錬しないので diamond_ingot というアイテムは無い。
+			// `${material}_ingot` の一律で引いていたため、ダイヤを何個持って
+			// いても0個と数えられ、ダイヤの剣も防具も一度も作られなかった。
+			return "diamond";
+		default:
+			return `${material}_ingot`;
+	}
+}
+
+/** 盾の材料。板材6枚と鉄1個。 */
+const SHIELD_PLANKS = 6;
+
 // craftingManager に武器用ロジックを追加
 export const craftingManager = {
-	materials: ["diamond", "iron", "gold", "stone", "wooden"],
+	// 良い順。防具に使えるかは MATERIALS_BY_TYPE 側で絞る。
+	materials: ["diamond", "iron", "gold", "stone", "wooden", "leather"],
 	weaponTypes: ["sword", "shield", "helmet", "chestplate", "leggings", "boots"],
 
 	determineNextWeapon: (agent: MinecraftAgent): { skillType: string; material: string } | null => {
 		const items = agent.driver.inventory.items();
+		const worn = agent.driver.inventory.armor();
 
 		for (const type of craftingManager.weaponTypes) {
 			// 盾は素材の概念が特殊（基本木+鉄）なので個別処理
 			if (type === "shield") {
 				const hasShield = items.some((it) => it.name === "shield");
-				const iron = items.find((it) => it.name === "iron_ingot");
-				const planks = items.find((it) => it.name.endsWith("_planks"));
-				if (!hasShield && iron && planks && planks.count >= 1) {
-					return { skillType: "shield", material: "iron" };
-				}
-				// 原木からも作れる
-				const logs = items.find(
-					(it) =>
-						it.name.endsWith("_log") || it.name.endsWith("_stem") || it.name.endsWith("_wood"),
-				);
-				if (!hasShield && iron && logs) {
+				const iron = items.some((it) => it.name === "iron_ingot");
+				// 盾は板材6枚と鉄1個。板材1枚あるだけで「作れる」と答えて
+				// いたため、材料が足りないまま盾を選び続けて失敗し、盾より
+				// 後ろにある防具へ一度も進めなかった。原木は1本で板材4枚。
+				const planks = items
+					.filter((it) => it.name.endsWith("_planks"))
+					.reduce((sum, it) => sum + it.count, 0);
+				const logs = items
+					.filter(
+						(it) =>
+							it.name.endsWith("_log") || it.name.endsWith("_stem") || it.name.endsWith("_wood"),
+					)
+					.reduce((sum, it) => sum + it.count, 0);
+				if (!hasShield && iron && planks + logs * 4 >= SHIELD_PLANKS) {
 					return { skillType: "shield", material: "iron" };
 				}
 				continue;
 			}
 
-			// 防具・剣のアップグレード判定
-			let currentBestIdx = 999;
-			for (const item of items) {
-				if (item.name.endsWith(`_${type}`)) {
-					const mat = item.name.split("_")[0];
-					const idx = craftingManager.materials.indexOf(mat);
+			// その装備で実在する素材だけを見る。存在しない木・石の防具を
+			// 候補にすると、作れないものを選んでは失敗するだけになる。
+			const ladder = MATERIALS_BY_TYPE[type];
+			if (!ladder) continue;
+
+			// 同じ品目が複数スロットに散っていることがあるので、合計で数える。
+			// スロット単位で見ると、丸石が3+3の2山にあるとき「5個に足りない」と
+			// 判定して、実際には作れるものを作らない。
+			const total = (name: string): number =>
+				items.reduce((sum, it) => (it.name === name ? sum + it.count : sum), 0);
+
+			// 今持っている最良の素材の順位。持っていなければ ladder の外。
+			//
+			// 着ている防具も数える。items() には出てこないので、持ち物だけを
+			// 見ると鉄をフル装備していても「1つも持っていない」ことになり、
+			// 同じ防具を作り直し続けて鉄を使い切る。
+			let currentBestIdx = ladder.length;
+			for (const item of [...items, ...worn]) {
+				if (item?.name.endsWith(`_${type}`)) {
+					const mat = item.name.slice(0, -`_${type}`.length);
+					const idx = ladder.indexOf(mat);
 					if (idx !== -1 && idx < currentBestIdx) currentBestIdx = idx;
 				}
 			}
 
-			for (let i = 0; i < craftingManager.materials.length; i++) {
-				const mat = craftingManager.materials[i];
-				// currentBestIdx=999 は「持っていない」→スキップしない
-				if (currentBestIdx !== 999 && i >= currentBestIdx) continue;
+			const need = REQUIRED_COUNT[type] ?? 1;
 
-				// 金の防具は基本作らないようにスキップ（金ツールは作る場合があるが防具は効率が悪いため）
-				if (mat === "gold") continue;
+			for (let i = 0; i < ladder.length; i++) {
+				// 今持っているものと同等以下なら作り直す意味がない。
+				if (i >= currentBestIdx) continue;
 
+				const mat = ladder[i];
 				if (mat === "wooden") {
-					// 木素材: 板材または原木
-					const planks = items.find((it) => it.name.endsWith("_planks"));
-					const logs = items.find(
-						(it) =>
-							it.name.endsWith("_log") || it.name.endsWith("_stem") || it.name.endsWith("_wood"),
-					);
-					if (planks || logs) {
+					// 板材はタグ指定なので種類を問わない。原木からでも作れる。
+					const planks = items
+						.filter((it) => it.name.endsWith("_planks"))
+						.reduce((sum, it) => sum + it.count, 0);
+					const logs = items
+						.filter(
+							(it) =>
+								it.name.endsWith("_log") || it.name.endsWith("_stem") || it.name.endsWith("_wood"),
+						)
+						.reduce((sum, it) => sum + it.count, 0);
+					// 原木1本で板材4枚。足りるかは板材に換算して見る。
+					if (planks + logs * 4 >= need) {
 						return { skillType: type, material: mat };
 					}
-				} else if (mat === "stone") {
-					const resourceName = "cobblestone";
-					const resource = items.find((it) => it.name === resourceName);
-					const REQUIRED = { sword: 2, helmet: 5, chestplate: 8, leggings: 7, boots: 4 };
-					if (resource && resource.count >= (REQUIRED as any)[type]) {
-						return { skillType: type, material: mat };
-					}
-				} else {
-					const resourceName = `${mat}_ingot`;
-					const resource = items.find((it) => it.name === resourceName);
-					const REQUIRED = { sword: 2, helmet: 5, chestplate: 8, leggings: 7, boots: 4 };
-					if (resource && resource.count >= (REQUIRED as any)[type]) {
-						return { skillType: type, material: mat };
-					}
+					continue;
+				}
+
+				const resourceName = resourceNameFor(mat);
+				if (!resourceName) continue;
+				if (total(resourceName) >= need) {
+					return { skillType: type, material: mat };
 				}
 			}
 		}

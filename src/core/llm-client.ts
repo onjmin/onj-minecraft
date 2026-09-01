@@ -1,10 +1,14 @@
 // 環境変数の取得（URL末尾の /chat/completions は fetch 側で付与する方が汎用的）
-const LLM_BASE_URL = process.env.LLM_API_BASE ?? "http://localhost:1234/v1";
-const LLM_API_KEY = process.env.LLM_API_KEY ?? "not-needed";
-const LLM_MODEL = process.env.LLM_MODEL_NAME ?? "local-model";
+// envStr/envNum を使うのは、.env に `KEY=` と書いた行が空文字で渡ってくるため。
+// 詳しくは utils/env.ts を参照。
+import { envNum, envStr } from "./utils/env";
 
-const EMBED_BASE_URL = process.env.EMBED_API_BASE ?? "http://localhost:1234/v1";
-const EMBED_MODEL = process.env.EMBED_MODEL_NAME ?? "local-model";
+const LLM_BASE_URL = envStr("LLM_API_BASE", "http://localhost:1234/v1");
+const LLM_API_KEY = envStr("LLM_API_KEY", "not-needed");
+const LLM_MODEL = envStr("LLM_MODEL_NAME", "local-model");
+
+const EMBED_BASE_URL = envStr("EMBED_API_BASE", "http://localhost:1234/v1");
+const EMBED_MODEL = envStr("EMBED_MODEL_NAME", "local-model");
 
 export interface LLMOutput {
 	content: string;
@@ -143,13 +147,13 @@ export function repairAndParseJSON<T>(badJson: string): { data: T | null; error:
  * 一致しない。実際 devstral はコード向けのモデルで、会話は不得手。
  * 別のエンドポイント・別のモデルに向けられるようにしておく。
  */
-const CHAT_BASE_URL = process.env.CHAT_API_BASE ?? LLM_BASE_URL;
-const CHAT_API_KEY = process.env.CHAT_API_KEY ?? LLM_API_KEY;
-const CHAT_MODEL = process.env.CHAT_MODEL_NAME ?? LLM_MODEL;
+const CHAT_BASE_URL = envStr("CHAT_API_BASE", LLM_BASE_URL);
+const CHAT_API_KEY = envStr("CHAT_API_KEY", LLM_API_KEY);
+const CHAT_MODEL = envStr("CHAT_MODEL_NAME", LLM_MODEL);
 /** 会話は temperature 0 だと同じ返事を繰り返す。既定を少し上げる。 */
-const CHAT_TEMPERATURE = Number(process.env.CHAT_TEMPERATURE ?? 0.7);
+const CHAT_TEMPERATURE = envNum("CHAT_TEMPERATURE", 0.7);
 /** 返事が返らないまま詰まるのを防ぐ。黙るより諦める方がよい。 */
-const CHAT_TIMEOUT_MS = Number(process.env.CHAT_TIMEOUT_MS ?? 45_000);
+const CHAT_TIMEOUT_MS = envNum("CHAT_TIMEOUT_MS", 45_000);
 
 export interface ChatMessage {
 	role: "system" | "user" | "assistant";

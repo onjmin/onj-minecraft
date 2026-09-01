@@ -11,7 +11,6 @@
  * 発言・ワールド読み取り・採掘・設置・クラフト・攻撃まで通っている。
  */
 import { MinecraftAgent } from "../core/agent";
-import { isLeaveRequest, shouldYieldSeat } from "./bedrock-session";
 import { BedrockDriver } from "../core/driver/bedrock";
 import { envNum } from "../core/utils/env";
 import { kusabot } from "../profiles/kusabot";
@@ -31,6 +30,8 @@ import { gotoCoordsSkill } from "../skills/goto/coords";
 import { gotoDeathPointSkill } from "../skills/goto/death";
 import { gotoPlayerSkill } from "../skills/goto/player";
 import { gotoSurfaceSkill } from "../skills/goto/surface";
+import { giveItemSkill } from "../skills/social/give";
+import { isLeaveRequest, shouldYieldSeat } from "./bedrock-session";
 
 // 統合版でもスキルは一通り動く。Driver 層が Java 版との差を吸収しているので
 // skills/ 側は共通のものをそのまま使う。
@@ -56,6 +57,7 @@ const bedrockSkills = [
 	craftTorchSkill,
 	craftSmeltingSkill,
 	buildingBaseSkill,
+	giveItemSkill,
 ];
 
 /** 席を譲って抜けたときの終了コード。呼び出し側が再入場の判断に使う。 */

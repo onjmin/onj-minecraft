@@ -95,6 +95,16 @@ func liveToken(cachePath string) (*oauth2.Token, error) {
 // inviteCode は招待リンクから招待コードだけを取り出す。
 func inviteCode(invite string) string {
 	code := strings.TrimSpace(invite)
+	// minecraft.net/…/open?inviteCode=XXXX の形。クエリから取り出す。
+	if i := strings.Index(code, "inviteCode="); i >= 0 {
+		rest := code[i+len("inviteCode="):]
+		for j := 0; j < len(rest); j++ {
+			if rest[j] == '&' || rest[j] == '#' {
+				return rest[:j]
+			}
+		}
+		return rest
+	}
 	for _, prefix := range []string{"https://realms.gg/", "http://realms.gg/", "realms.gg/"} {
 		if rest, ok := strings.CutPrefix(code, prefix); ok {
 			return rest
@@ -105,6 +115,11 @@ func inviteCode(invite string) string {
 
 func main() {
 	invite := flag.String("invite", "", "Realm の招待コード（https://realms.gg/ は省略可）")
+	// 招待コードが手元に無くても、そのアカウントが既に参加している Realm
+	// なら一覧から選べる。招待リンクは配った本人しか持っていないことが多く、
+	// それが無いだけで検証が始められないのは詰まりどころだった。
+	listRealms := flag.Bool("list-realms", false, "参加済みの Realm を一覧して終了する")
+	realmID := flag.Int("realm-id", 0, "参加済みの Realm に ID で繋ぐ（-invite の代わり）")
 	cache := flag.String("token-cache", ".bedrock-auth/gophertunnel.json", "MSAトークンのキャッシュ先")
 	address := flag.String("address", "", "開発用: 統合版サーバーへ直に繋ぐ (例: 127.0.0.1:19132)")
 	name := flag.String("name", "", "開発用: 表示名を指定する（複数体を繋ぎ分けるため。online-mode=false のときだけ効く）")
@@ -161,8 +176,8 @@ func main() {
 		return
 	}
 
-	if *invite == "" {
-		fail("-invite か -address を指定してください")
+	if *invite == "" && *realmID == 0 && !*listRealms {
+		fail("-invite か -realm-id か -address を指定してください（-list-realms で一覧）")
 	}
 
 	// --- 認証 ---
@@ -206,9 +221,46 @@ func main() {
 	// URL の方なので、ここで剥がす。TypeScript 側でも剥がしているが、
 	// このバイナリを直接叩く経路もあるため両方で面倒を見る。
 	rc := realms.NewClient(msa, nil)
-	realm, err := rc.Realm(ctx, inviteCode(*invite))
-	if err != nil {
-		fail("Realm の取得に失敗: %v", err)
+
+	// 一覧して終わる経路。どの Realm にどの ID で入れるかを確かめるためのもの。
+	if *listRealms {
+		list, err := rc.Realms(ctx)
+		if err != nil {
+			fail("Realm の一覧取得に失敗: %v", err)
+		}
+		for _, r := range list {
+			emit(event{Event: "realm", Data: map[string]any{
+				"id": r.ID, "name": r.Name, "state": r.State,
+				"defaultPermission": r.DefaultPermission, "expired": r.Expired,
+			}})
+		}
+		emit(event{Event: "realms_listed", Data: map[string]any{"count": len(list)}})
+		return
+	}
+
+	var realm realms.Realm
+	if *realmID != 0 {
+		// 参加済みの一覧から選ぶ。招待コードは要らない。
+		list, err := rc.Realms(ctx)
+		if err != nil {
+			fail("Realm の一覧取得に失敗: %v", err)
+		}
+		found := false
+		for _, r := range list {
+			if r.ID == *realmID {
+				realm, found = r, true
+				break
+			}
+		}
+		if !found {
+			fail("ID %d の Realm に参加していません（-list-realms で確認してください）", *realmID)
+		}
+	} else {
+		var err error
+		realm, err = rc.Realm(ctx, inviteCode(*invite))
+		if err != nil {
+			fail("Realm の取得に失敗: %v", err)
+		}
 	}
 	emit(event{Event: "realm", Data: map[string]any{
 		"id": realm.ID, "name": realm.Name, "state": realm.State,

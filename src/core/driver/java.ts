@@ -7,6 +7,7 @@
 import { goals } from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
 import type { MinecraftAgent } from "../agent";
+import { pickFood } from "./food";
 import type {
 	BlockInfo,
 	BotDriver,
@@ -20,6 +21,9 @@ import type {
 	Registry,
 	WorldReader,
 } from "./types";
+
+/** 防具のスロット番号。頭・胴・脚・足の順。 */
+const JAVA_ARMOR_SLOTS = [5, 6, 7, 8];
 
 const toVec3 = (p: Position): Vec3 => new Vec3(p.x, p.y, p.z);
 const toPosition = (v: { x: number; y: number; z: number }): Position => ({
@@ -102,6 +106,13 @@ export class JavaDriver implements BotDriver {
 			},
 			emptySlotCount() {
 				return self.bot.inventory.emptySlotCount();
+			},
+			armor() {
+				// 防具はスロット 5..8 (頭・胴・脚・足)。items() には含まれない。
+				return JAVA_ARMOR_SLOTS.map((slot) => {
+					const i = self.bot.inventory.slots?.[slot];
+					return i ? { name: i.name, count: i.count, slot: i.slot } : null;
+				});
 			},
 		};
 
@@ -274,6 +285,32 @@ export class JavaDriver implements BotDriver {
 
 	async pickupNearbyItems(signal: AbortSignal): Promise<void> {
 		await this.agent.pickupNearbyItems(signal);
+	}
+
+	async eat(_signal: AbortSignal): Promise<boolean> {
+		const food = pickFood(this.bot.inventory.items().map((i) => i.name));
+		if (!food) return false;
+		try {
+			await this.equip(food, "hand");
+			// mineflayer の consume() は食べ終わるまで待つ。
+			await (this.bot as any).consume();
+			return true;
+		} catch {
+			// 満腹で食べられない・持ち替えに失敗した等。food が減っていれば次の周で再試行する。
+			return false;
+		}
+	}
+
+	async dropItem(itemName: string, count: number): Promise<void> {
+		const item = this.bot.inventory.items().find((i: any) => i.name === itemName);
+		if (!item) throw new Error(`Item ${itemName} not in inventory`);
+		const n = Math.max(1, Math.min(count, item.count));
+		if (n >= item.count) {
+			// tossStack はスタック丸ごと。端数無く落とせるなら余計な指定をしない方が確実。
+			await this.bot.tossStack(item);
+		} else {
+			await (this.bot as any).toss(item.type, (item as any).metadata ?? null, n);
+		}
 	}
 
 	private recipeFor(itemName: string, craftingTable?: Position) {

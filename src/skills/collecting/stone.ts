@@ -1,9 +1,10 @@
 import type { BlockInfo, BotDriver } from "../../core/driver/types";
+import { envNum } from "../../core/utils/env";
 import { describeGain, gainedSince, snapshotInventory, totalGain } from "../inventory-delta";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
 /** 1回の採集にかける上限。長すぎると思考ループから見て終わらない行動になる。 */
-const STONE_BUDGET_MS = Number(process.env.STONE_BUDGET_MS ?? 40_000);
+const STONE_BUDGET_MS = envNum("STONE_BUDGET_MS", 40_000);
 /** 何ブロック掘るごとに落下物を拾いに行くか。 */
 const PICKUP_EVERY = 4;
 

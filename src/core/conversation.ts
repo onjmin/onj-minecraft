@@ -12,6 +12,7 @@
  */
 import type { AgentProfile } from "../profiles/types";
 import { type ChatMessage, chatLlm } from "./llm-client";
+import { envNum } from "./utils/env";
 
 /** 返事を書くために渡す「今の状況」。分かる範囲でよい。 */
 export interface ChatSituation {
@@ -28,13 +29,28 @@ export interface ChatSituation {
 	/** できること（スキル名の一覧）。できない依頼を断るために要る。 */
 	skillNames?: string[];
 	nearbyPlayers?: string[];
+	/**
+	 * サーバーからの通知（キルログ・死亡ログ・参加退出）。
+	 *
+	 * 会話の列ではなくこちらに載せる。誰かが死んだ知らせを user の発言として
+	 * 積むと、モデルはそれを「直前の相手の発言」として扱い、話しかけてきた
+	 * 人ではなくキルログに返事をする。事実としては要るので、状況として渡す。
+	 */
+	recentEvents?: string[];
 }
+
+/**
+ * 発言の出どころ。
+ *   player: 他人の発言。返事の宛先になる。
+ *   self:   自分の発言。履歴に assistant として積む。
+ *   system: サーバーからの通知。会話ではないので返事の宛先にしない。
+ */
+export type ChatTurnKind = "player" | "self" | "system";
 
 export interface ChatTurn {
 	speaker: string;
 	message: string;
-	/** 自分の発言か。履歴を assistant として積むために使う。 */
-	self: boolean;
+	kind: ChatTurnKind;
 	at: number;
 }
 
@@ -46,14 +62,26 @@ export interface ChatReply {
 }
 
 /** ゲーム内チャットに流していい長さ。長い返事は読まれないし邪魔になる。 */
-const MAX_UTTERANCE = Number(process.env.CHAT_MAX_CHARS ?? 160);
-/** 保持する会話ターン数（自分の発言も含む）。 */
-const MAX_TURNS = Number(process.env.CHAT_HISTORY_TURNS ?? 20);
+const MAX_UTTERANCE = envNum("CHAT_MAX_CHARS", 160);
+/** 保持する会話ターン数（自分の発言も含む）。0以下にされると全部消えるので下限を置く。 */
+const MAX_TURNS = Math.max(1, envNum("CHAT_HISTORY_TURNS", 20));
+/**
+ * 保持する通知の本数。会話ターンとは別枠にすること。
+ *
+ * 同じ枠に入れると、通知が来ただけで会話が押し出される。統合版は送信者の
+ * 無いサーバーメッセージ（参加・退出・他人の死亡ログ）を全部ここへ流すので、
+ * 人の多いRealmでは返事を作っている数十秒のうちに枠が埋まる。埋まると
+ * lastFromOthers() が null になり、話しかけた相手に二度と返事をしなくなる。
+ */
+const MAX_EVENTS = 20;
 /** これより古いやり取りは文脈から外す。昨日の話を引きずらせない。 */
-const HISTORY_WINDOW_MS = Number(process.env.CHAT_HISTORY_WINDOW_MS ?? 20 * 60_000);
+const HISTORY_WINDOW_MS = envNum("CHAT_HISTORY_WINDOW_MS", 20 * 60_000);
 
 export class Conversation {
+	/** 人の発言と自分の発言。返事の材料はここだけから作る。 */
 	private turns: ChatTurn[] = [];
+	/** サーバーからの通知。会話とは別の入れ物に持つ。 */
+	private events: ChatTurn[] = [];
 
 	/**
 	 * modelOverride はモデルを比べるとき用。本番では渡さず、
@@ -64,34 +92,79 @@ export class Conversation {
 		private modelOverride?: string,
 	) {}
 
-	/** 発言を記録する。相手のものも自分のものも、同じ列に時系列で積む。 */
-	record(speaker: string, message: string, self: boolean): void {
+	/**
+	 * 発言を記録する。相手のものも自分のものも、同じ列に時系列で積む。
+	 * kind に真偽値を渡していた頃の呼び出しも受けられるようにしてある。
+	 */
+	record(speaker: string, message: string, kind: ChatTurnKind | boolean): void {
 		const text = message.trim();
 		if (!text) return;
-		this.turns.push({ speaker, message: text, self, at: Date.now() });
+		const resolved: ChatTurnKind = typeof kind === "boolean" ? (kind ? "self" : "player") : kind;
+		const turn: ChatTurn = { speaker, message: text, kind: resolved, at: Date.now() };
+
+		// 通知は会話を押し出さない。別の入れ物に、別の上限で持つ。
+		if (resolved === "system") {
+			this.events.push(turn);
+			if (this.events.length > MAX_EVENTS) {
+				this.events.splice(0, this.events.length - MAX_EVENTS);
+			}
+			return;
+		}
+
+		this.turns.push(turn);
 		if (this.turns.length > MAX_TURNS) {
 			this.turns.splice(0, this.turns.length - MAX_TURNS);
 		}
 	}
 
-	/** 思考プロンプトに載せるための行。自分の発言も含めて時系列で返す。 */
+	/**
+	 * 思考プロンプトに載せるための行。自分の発言も通知も含めて時系列で返す。
+	 *
+	 * 通知に使う枠を先に区切っておく。単純に新しい順で切ると、参加通知が
+	 * 数本流れただけで全部が通知になり、人に何を頼まれたかが思考プロンプトから
+	 * 消える。会話を主、通知を従にして混ぜる。
+	 */
 	lines(limit = 6): string[] {
-		return this.turns.slice(-limit).map((t) => `<${t.speaker}> ${t.message}`);
+		const eventRoom = Math.min(this.events.length, Math.floor(limit / 3));
+		const talk = this.turns.slice(-(limit - eventRoom));
+		const events = this.events.slice(-eventRoom);
+		return [...talk, ...events]
+			.sort((a, b) => a.at - b.at)
+			.map((t) => `<${t.speaker}> ${t.message}`);
 	}
 
-	/** 最後の相手の発言。返す相手を決めるのに使う。 */
+	/**
+	 * 最後の相手の発言。返す相手を決めるのに使う。
+	 *
+	 * 通知は turns に入れていないので本来は出てこないが、宛先が「サーバー」に
+	 * 化けると会話が壊れるので、ここでも種別で弾いておく。
+	 */
 	lastFromOthers(): ChatTurn | null {
 		for (let i = this.turns.length - 1; i >= 0; i--) {
-			if (!this.turns[i].self) return this.turns[i];
+			if (this.turns[i].kind === "player") return this.turns[i];
 		}
 		return null;
 	}
 
 	/**
+	 * 直近のサーバー通知。会話の列ではなく「今の状況」として渡すためのもの。
+	 *
+	 * 古いものは載せない。「最近のできごと」として渡す以上、1時間前の
+	 * キルログを混ぜると、モデルはそれを今起きたこととして喋る。
+	 */
+	recentEvents(limit = 4): string[] {
+		const cutoff = Date.now() - HISTORY_WINDOW_MS;
+		return this.events
+			.filter((t) => t.at >= cutoff)
+			.slice(-limit)
+			.map((t) => t.message);
+	}
+
+	/**
 	 * 返事を作る。発言はしない（送るのは呼び出し側の責任）。
 	 *
-	 * 相手の発言が無いときは何も返さない。話しかけられていないのに
-	 * 喋り出すのはここの仕事ではない。
+	 * 相手の発言が無いときは何も返さない。話しかけへの返事はここの仕事だが、
+	 * 自分から挨拶して申し出るのは greet() の役目で、ここでは行わない。
 	 */
 	async respond(situation: ChatSituation): Promise<ChatReply> {
 		const last = this.lastFromOthers();
@@ -108,7 +181,31 @@ export class Conversation {
 		return parseReply(raw, this.profile.minecraftName);
 	}
 
-	private buildSystemPrompt(s: ChatSituation): string {
+	/**
+	 * 話しかけられていなくても、自分から挨拶して手伝いを申し出る。
+	 *
+	 * respond() と違い、直前の相手の発言が無くても呼べる。召使い風の人格である
+	 * 以上、頼まれるのを待つだけでは「役に立てる子」に見えない。近くに人が
+	 * いたら自分から動く方が自然で、実際に役立つ。
+	 * 申し出た内容は Request 欄にも書かせ、そのまま依頼として実行に回す。
+	 * 「言うだけで何もしない」のでは有能に見えないため。
+	 */
+	async greet(situation: ChatSituation, targetName: string): Promise<ChatReply> {
+		const messages: ChatMessage[] = [
+			{ role: "system", content: this.buildSystemPrompt(situation, { mode: "greet", targetName }) },
+			...this.buildHistory(),
+		];
+
+		const raw = await chatLlm.talk(normalizeMessages(messages), {
+			model: this.modelOverride,
+		});
+		return parseReply(raw, this.profile.minecraftName);
+	}
+
+	private buildSystemPrompt(
+		s: ChatSituation,
+		opts?: { mode: "greet"; targetName: string },
+	): string {
 		const lang = this.profile.chatLanguage?.trim();
 		const sections: string[] = [];
 
@@ -124,24 +221,49 @@ export class Conversation {
 
 		sections.push(`=== 今の状況 ===\n${describeSituation(s)}`);
 
-		sections.push(
-			[
-				"=== 返事の作り方 ===",
-				"- 直前の相手の発言に答えてください。自分の作業計画を一方的に語らないこと。",
-				"- 1〜2文、長くても60文字程度。ゲーム内チャットなので長文は読まれません。",
-				"- 「今の状況」に書かれていないことを、あるかのように言わないでください。",
-				"  座標・持ち物・体力を聞かれたら、上の値をそのまま使うこと。",
-				"- できないことを頼まれたら、正直に断ってください。",
-				"- 同じ返事を繰り返さないこと。前と同じことを聞かれたら言い方を変えるか、",
-				"  「さっきも言ったけど」と前置きしてください。",
-				"- 自分の名前を先頭に付けないでください。発言の中身だけを書くこと。",
-				"- 顔文字・絵文字・記号の装飾は使わないでください。",
-				lang ? `- ${lang}で書いてください。` : "",
-				"- 自分に向けられていない雑談なら、黙っていてよいです（Reply を none にする）。",
-			]
-				.filter(Boolean)
-				.join("\n"),
-		);
+		if (opts?.mode === "greet") {
+			sections.push(
+				[
+					"=== 今回のきっかけ ===",
+					`${opts.targetName} が近くにいる。話しかけられてはいないが、あなたから一言かけてよい場面です。`,
+					"今すぐ役に立てそうな手伝いを一つだけ、具体的に申し出てください。",
+					"「なにか手伝おうか」のような漠然とした申し出ではなく、「今の状況」の持ち物・",
+					"できることから実際に一つ選ぶこと(例: 薪を集めてくる、食料をとってくる、",
+					`持ち物にある物を1つ選んで${opts.targetName}に渡す)。渡す申し出なら`,
+					"品目名まで具体的に言ってください(例: 石の剣を渡そうか)。",
+					"申し出た内容は Request にもそのまま書くこと。あなたはすぐそれに取りかかります。",
+					"最近同じ人に似た申し出をしていたら、繰り返さずに黙ってよい(Reply を none にする)。",
+					"- 1文、長くても40文字程度。ゲーム内チャットなので長文は読まれません。",
+					"- 「今の状況」に書かれていないことを、あるかのように言わないでください。",
+					"- 自分の名前を先頭に付けないでください。発言の中身だけを書くこと。",
+					"- 顔文字・絵文字・記号の装飾は使わないでください。",
+					lang ? `- ${lang}で書いてください。` : "",
+				]
+					.filter(Boolean)
+					.join("\n"),
+			);
+		} else {
+			sections.push(
+				[
+					"=== 返事の作り方 ===",
+					"- 直前の相手の発言に答えてください。自分の作業計画を一方的に語らないこと。",
+					"- 1〜2文、長くても60文字程度。ゲーム内チャットなので長文は読まれません。",
+					"- 「今の状況」に書かれていないことを、あるかのように言わないでください。",
+					"  座標・持ち物・体力を聞かれたら、上の値をそのまま使うこと。",
+					"- できないことを頼まれたら、正直に断ってください。",
+					"- 同じ返事を繰り返さないこと。前と同じことを聞かれたら言い方を変えるか、",
+					"  「さっきも言ったけど」と前置きしてください。",
+					"- 何かをくれた・してもらったと言われたら、経緯を訂正したり条件を付けたりせず、",
+					"  素直にお礼だけ言ってください。「でも」「実は」で切り返さないこと。",
+					"- 自分の名前を先頭に付けないでください。発言の中身だけを書くこと。",
+					"- 顔文字・絵文字・記号の装飾は使わないでください。",
+					lang ? `- ${lang}で書いてください。` : "",
+					"- 自分に向けられていない雑談なら、黙っていてよいです（Reply を none にする）。",
+				]
+					.filter(Boolean)
+					.join("\n"),
+			);
+		}
 
 		sections.push(
 			[
@@ -149,21 +271,34 @@ export class Conversation {
 				"次の2行だけを出力してください。説明や前置きは書かないこと。",
 				"",
 				"Reply: (実際に喋る一言。黙るなら none)",
-				"Request: (相手から受けた作業の依頼を一文で要約。依頼でなければ none)",
+				opts?.mode === "greet"
+					? "Request: (自分から申し出た作業を一文で要約。何も申し出ないなら none)"
+					: "Request: (相手から受けた作業の依頼を一文で要約。依頼でなければ none)",
+				"",
+				"Request は、断った場合や今できない場合でもそのまま書いてください。",
+				"できるかどうかを決めるのは別の担当で、ここは「何を頼まれたか」を残す欄です。",
 			].join("\n"),
 		);
 
 		return sections.join("\n\n");
 	}
 
-	/** 会話履歴を messages に変換する。相手の発言は話者名を添える。 */
+	/**
+	 * 会話履歴を messages に変換する。相手の発言は話者名を添える。
+	 *
+	 * サーバー通知は載せない。載せると user の発言として積まれ、返事を
+	 * 作っている最中にキルログが届いただけで、モデルはそちらを「直前の
+	 * 相手の発言」と見て話しかけてきた人ではなくログに答える。
+	 * 事実としては要るので、状況(recentEvents)の側で渡している。
+	 * turns には通知を入れていないが、種別の判定はここでも残しておく。
+	 */
 	private buildHistory(): ChatMessage[] {
 		const cutoff = Date.now() - HISTORY_WINDOW_MS;
 		return this.turns
-			.filter((t) => t.at >= cutoff)
+			.filter((t) => t.at >= cutoff && t.kind !== "system")
 			.map((t) => ({
-				role: t.self ? ("assistant" as const) : ("user" as const),
-				content: t.self ? t.message : `<${t.speaker}> ${t.message}`,
+				role: t.kind === "self" ? ("assistant" as const) : ("user" as const),
+				content: t.kind === "self" ? t.message : `<${t.speaker}> ${t.message}`,
 			}));
 	}
 }
@@ -188,6 +323,12 @@ function describeSituation(s: ChatSituation): string {
 	}
 	if (s.nearbyPlayers?.length) {
 		lines.push(`近くにいる人: ${s.nearbyPlayers.join(", ")}`);
+	}
+	if (s.recentEvents?.length) {
+		lines.push(`最近のできごと:\n${s.recentEvents.map((e) => `  - ${e}`).join("\n")}`);
+		lines.push(
+			"これは場の出来事であって、あなたへの話しかけではありません。返事の宛先にしないこと。",
+		);
 	}
 	if (s.skillNames?.length) {
 		lines.push(`できること: ${s.skillNames.join(", ")}`);

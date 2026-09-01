@@ -1,5 +1,6 @@
 import type { MinecraftAgent } from "../../core/agent";
 import type { Position } from "../../core/driver/types";
+import { describeGain, gainedSince, snapshotInventory, totalGain } from "../inventory-delta";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
 /** どれだけ離れるか。相手の追跡が切れる程度。 */
@@ -52,10 +53,11 @@ export const gotoDeathPointSkill = createSkill<void, { recovered: string }>({
 			return skillResult.fail("No death point to return to (or the drops have already despawned).");
 		}
 
-		const before = new Map<string, number>();
-		for (const item of driver.inventory.items()) {
-			before.set(item.name, (before.get(item.name) ?? 0) + item.count);
-		}
+		// 増減はスロットごとではなく品目ごとに数える。同じ物が複数スロットに
+		// 散っていることがあるので、スロットの count を品目の合計と引き算すると
+		// 数が合わない。拾ってスタックがまとまった場合は差が 0 になり、
+		// 全部回収できていても「何も無かった」と報告してしまう。
+		const before = snapshotInventory(driver);
 
 		agent.log(
 			`[goto.death_point] (${point.x.toFixed(0)}, ${point.y.toFixed(0)}, ${point.z.toFixed(0)}) へ落とし物を取りに行く`,
@@ -78,25 +80,35 @@ export const gotoDeathPointSkill = createSkill<void, { recovered: string }>({
 			await driver.pickupNearbyItems(signal);
 		}
 
-		const gained: string[] = [];
-		for (const item of driver.inventory.items()) {
-			const diff = item.count - (before.get(item.name) ?? 0);
-			if (diff > 0) gained.push(`${item.name} x${diff}`);
+		const gained = gainedSince(driver, before);
+		const what = describeGain(gained);
+
+		// 中断されたなら、拾い切れていないだけで落とし物はまだある。
+		// ここで下の「何も無かった」枝に落とすと clearDeathPoint() まで走る。
+		// 回収中に殺し直された場合、agent 側は死亡地点に retryAfter を付けて
+		// わざと残している（後で取りに戻るため）。それを消してしまうと、
+		// 1回目の落とし物も2回目の落とし物も二度と回収されない。
+		if (signal.aborted) {
+			return skillResult.fail(
+				totalGain(gained) > 0
+					? `Interrupted while recovering (got ${what} so far).`
+					: "Interrupted before recovering anything.",
+			);
 		}
 
 		// 用が済んだらすぐ離れる。ここは自分が殺された場所で、相手はたいてい
 		// まだいる。拾った物を抱えて留まるのが一番損をする。
 		await retreatFrom(agent, signal, point);
 
-		if (gained.length === 0) {
+		if (totalGain(gained) === 0) {
 			// 一度行って拾えないなら、もう落ちていない。追い続けても仕方がない。
 			agent.clearDeathPoint();
 			return skillResult.fail("Reached the death point but found nothing left to pick up.");
 		}
 
 		agent.clearDeathPoint();
-		return skillResult.ok(`Recovered ${gained.join(", ")} from the death point.`, {
-			recovered: gained.join(", "),
+		return skillResult.ok(`Recovered ${what} from the death point.`, {
+			recovered: what,
 		});
 	},
 });

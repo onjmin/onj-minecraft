@@ -6,6 +6,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import { postToUnj } from "./unj-bridge.js";
 
 const dir = path.join(process.cwd(), "logs", "chat");
 
@@ -34,8 +35,17 @@ function timestamp(): string {
 /**
  * 1行書く。direction は "in"(受信) か "out"(送信)。
  * 書けなくても呼び出し元を止めない。記録のために本筋が落ちるのは本末転倒。
+ *
+ * forwardToUnj (既定true) をfalseにすると、unjへの投稿だけ止めてファイルには残す。
+ * unjから中継してMinecraftへ喋らせた発言をunjへ送り返すと、投稿がエコーして
+ * 二重に積み上がるため、unj-relay.ts からの中継発言はfalseで呼ぶこと。
  */
-export function appendChatLog(direction: "in" | "out", speaker: string, message: string): void {
+export function appendChatLog(
+	direction: "in" | "out",
+	speaker: string,
+	message: string,
+	opts?: { forwardToUnj?: boolean },
+): void {
 	try {
 		fs.mkdirSync(dir, { recursive: true });
 		const arrow = direction === "in" ? "<-" : "->";
@@ -46,5 +56,9 @@ export function appendChatLog(direction: "in" | "out", speaker: string, message:
 		);
 	} catch {
 		// 記録に失敗しても会話は続ける。
+	}
+	if (opts?.forwardToUnj ?? true) {
+		// unjへの実況投稿は失敗しても止めない。await不要（結果を待つ理由が無い）。
+		void postToUnj(speaker, message);
 	}
 }

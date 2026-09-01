@@ -59,6 +59,10 @@ const eyeHeight = float32(1.62)
 // 攻撃が届く距離。バニラのプレイヤーは3ブロックほど。
 const attackReach = float32(3.5)
 
+// 食べ終わるまでの時間。バニラの食事は32tick(1.6秒)なので、少し余裕を持たせる。
+// これより早く「食べ終わった」を送るとサーバーに捨てられ、満腹度が戻らない。
+const eatDuration = 1900 * time.Millisecond
+
 // 敵に反応し始める距離。
 //
 // 広すぎると、敵が視界にいる限り逃げ続けて何もできない。実測で 10 にしたとき、
@@ -772,7 +776,7 @@ func (s *session) handle(pk packet.Packet) {
 				s.mu.Unlock()
 				// 応答には変わったスロットの新しい識別子が入っている。これを
 				// 取り込まないと、次の要求で古い StackNetworkID を送ることになり
-				// FailedToValidateSrcSlot(55) で拒否される。作業台を置いたあと
+				// FailedToValidateSrcSlot(49) で拒否される。作業台を置いたあと
 				// 3x3 のクラフトが通らなかったのがこれ。
 				s.mu.Lock()
 				for _, info := range r.ContainerInfo {
@@ -799,14 +803,23 @@ func (s *session) handle(pk packet.Packet) {
 				s.mu.Unlock()
 
 				// 作った物の識別子はこちらでは分からない。0 のまま次の素材に
-				// 使うと FailedToValidateSrcSlot(55) で弾かれる。応答の
+				// 使うと FailedToValidateSrcSlot(49) で弾かれる。応答の
 				// ContainerInfo にも載ってこないので、持ち物の画面を閉じて
 				// サーバーに一覧を送り直させる。届けば InventoryContent が
 				// 全スロットを正しい識別子で埋め直す。
 				_ = s.conn.WritePacket(&packet.ContainerClose{WindowID: 0})
 				s.reply(id, true, "", nil)
 			} else {
-				s.reply(id, false, fmt.Sprintf("クラフトが拒否されました(status=%d)", r.Status), nil)
+				// moveSlot・wear もこの待ち行列に相乗りしているので、
+				// 「クラフトが」に固定すると持ち替え・装備の失敗までクラフト
+				// 用語で誤報することになる。汎用の言い回しにする。
+				//
+				// status の意味は実測ログの数字を見て当てずっぽうで書かないこと。
+				// gophertunnel の ItemStackResponseStatus 定義と数値がずれていた
+				// ことがあり(49 を DstContainerAndSlotEqualToSrcContainerAndSlot
+				// だと思い込んでいたが、実際は 48。49 は FailedToValidateSrcSlot)、
+				// 起きている現象と原因の対応を取り違えたまま放置していた。
+				s.reply(id, false, fmt.Sprintf("操作が拒否されました(status=%d)", r.Status), nil)
 			}
 		}
 
@@ -1718,6 +1731,57 @@ func (s *session) dispatch(c command) {
 		}
 		s.reply(c.ID, true, "", nil)
 
+	case "eat":
+		// 手に持っている食べ物を食べる。何を持つかは呼び出し側("hold")の責任。
+		//
+		// 統合版の消費は2段構え。食べ始めを PlayerAuthInput の ItemInteraction に
+		// 載せ(設置と同じ経路)、食べ終わりを ReleaseItem トランザクションで送る。
+		// 片方だけでは満腹度は戻らない。食べ始めだけでは「口を付けた」状態で
+		// 終わり、食べ終わりだけでは何を食べたのか成立しない。
+		{
+			s.mu.Lock()
+			held, ok := s.rawSlots[int(s.heldSlot)]
+			if !ok || held.Stack.Count == 0 {
+				s.mu.Unlock()
+				s.reply(c.ID, false, "手に何も持っていません", nil)
+				return
+			}
+			slot := s.heldSlot
+			// 空を右クリックする形。食べ物はブロックを指す必要がない。
+			s.pendingPlace = &protocol.UseItemTransactionData{
+				ActionType:       protocol.UseItemActionClickAir,
+				TriggerType:      protocol.TriggerTypePlayerInput,
+				HotBarSlot:       slot,
+				HeldItem:         held,
+				Position:         s.pos,
+				ClientPrediction: protocol.ClientPredictionSuccess,
+			}
+			s.mu.Unlock()
+
+			// 食べ終わるまで待つ。この間も毎tickの入力は送られ続ける。
+			time.Sleep(eatDuration)
+
+			s.mu.Lock()
+			// 持ち物は食べている間に変わりうるので、送る直前のものを載せる。
+			after := s.rawSlots[int(slot)]
+			// s.pos は既に目線の高さ。ここでは足元へ直す必要はない。
+			head := s.pos
+			s.mu.Unlock()
+
+			if err := s.conn.WritePacket(&packet.InventoryTransaction{
+				TransactionData: &protocol.ReleaseItemTransactionData{
+					ActionType:   protocol.ReleaseItemActionConsume,
+					HotBarSlot:   slot,
+					HeldItem:     after,
+					HeadPosition: head,
+				},
+			}); err != nil {
+				s.reply(c.ID, false, fmt.Sprintf("食事の完了を送れない: %v", err), nil)
+				return
+			}
+			s.reply(c.ID, true, "", nil)
+		}
+
 	case "place":
 		bx := int32(math.Floor(float64(c.X)))
 		by := int32(math.Floor(float64(c.Y)))
@@ -1801,15 +1865,104 @@ func (s *session) dispatch(c command) {
 				}
 				action = place
 			}
+			// 送りっぱなしで即 true を返していた。サーバーがこの要求を
+			// 拒否しても(例: 元の識別子が古くて FailedToValidateSrcSlot)
+			// 呼び出し側には成功としか伝わらず、実際には動いていない物を
+			// 「移した」前提で次の操作(装備・クラフト)へ進んでいた。
+			// クラフトと同じ待ち行列に載せ、本当の応答を返す。
+			// 成功時は ItemStackResponse.ContainerInfo から from/to 両方の
+			// 新しい識別子を rawSlots に取り込める。次の要求がこの場で
+			// 直した値を使えるので、moveSlot 直後のクラフトが古い識別子で
+			// 弾かれることも減る。
+			s.craftWaiter[reqID] = c.ID
 			s.mu.Unlock()
 
 			if err := s.conn.WritePacket(&packet.ItemStackRequest{
 				Requests: []protocol.ItemStackRequest{{RequestID: reqID, Actions: []protocol.StackRequestAction{action}}},
 			}); err != nil {
+				s.mu.Lock()
+				delete(s.craftWaiter, reqID)
+				s.mu.Unlock()
 				s.reply(c.ID, false, fmt.Sprintf("スロット移動に失敗: %v", err), nil)
 				return
 			}
-			s.reply(c.ID, true, "", nil)
+			// 応答は ItemStackResponse ハンドラが返す。
+		}
+
+	case "drop":
+		// 持ち物のアイテムを地面に落とす。
+		//
+		// プレイヤー同士で直接手渡すパケットは存在しない。バニラで人に物を
+		// 渡す唯一の方法は、相手のそばで落として自動拾得を待つこと。
+		// 呼び出し側(BedrockDriver.dropItem)が事前に相手の近くまで寄せてから
+		// これを呼ぶ前提。
+		//
+		// DropStackRequestAction は「持ち物の画面を開いている間に落とす」
+		// 想定のアクションで、Q キー相当(InventoryTransaction)とは別物だが、
+		// moveSlot・wear と同じくクラフト用の Interact(OpenInventory) は
+		// 常に開いている体で送っているので、同じ枠組みで通る。
+		{
+			if len(c.Names) == 0 {
+				s.reply(c.ID, false, "落とす物の名前を指定してください", nil)
+				return
+			}
+			want := trimNamespace(c.Names[0])
+			wantCount := int(c.Count)
+			if wantCount <= 0 {
+				wantCount = 1
+			}
+
+			s.mu.Lock()
+			remaining := wantCount
+			var actions []protocol.StackRequestAction
+			// 1山で足りなければ複数のスタックにまたがって集める。丸石を
+			// 2山に分けて持っているだけで「1個も渡せない」にはしない。
+			for slot, item := range s.rawSlots {
+				if remaining <= 0 {
+					break
+				}
+				name, ok := s.itemNames[item.Stack.ItemType.NetworkID]
+				if !ok || name != want {
+					continue
+				}
+				use := remaining
+				if have := int(item.Stack.Count); use > have {
+					use = have
+				}
+				if use <= 0 {
+					continue
+				}
+				actions = append(actions, &protocol.DropStackRequestAction{
+					Count: byte(use),
+					Source: protocol.StackRequestSlotInfo{
+						Container:      protocol.FullContainerName{ContainerID: protocol.ContainerCombinedHotBarAndInventory},
+						Slot:           byte(slot),
+						StackNetworkID: item.StackNetworkID,
+					},
+				})
+				remaining -= use
+			}
+			if len(actions) == 0 {
+				s.mu.Unlock()
+				s.reply(c.ID, false, fmt.Sprintf("%s を持っていません", want), nil)
+				return
+			}
+			s.craftReqID -= 2
+			reqID := s.craftReqID
+			// 複数アクションでも RequestID は1つ。クラフトの複数枠消費と同じ扱い。
+			s.craftWaiter[reqID] = c.ID
+			s.mu.Unlock()
+
+			if err := s.conn.WritePacket(&packet.ItemStackRequest{
+				Requests: []protocol.ItemStackRequest{{RequestID: reqID, Actions: actions}},
+			}); err != nil {
+				s.mu.Lock()
+				delete(s.craftWaiter, reqID)
+				s.mu.Unlock()
+				s.reply(c.ID, false, fmt.Sprintf("アイテムを落とすのに失敗: %v", err), nil)
+				return
+			}
+			// 応答は ItemStackResponse ハンドラが返す。
 		}
 
 	case "wear":
@@ -1857,6 +2010,9 @@ func (s *session) dispatch(c command) {
 				Slot:           byte(armorSlot),
 				StackNetworkID: 0,
 			}
+			// moveSlot と同じ理由。送りっぱなしで true を返すと、サーバーに
+			// 拒否されても呼び出し側は「着られた」ことにして先へ進む。
+			s.craftWaiter[reqID] = c.ID
 			s.mu.Unlock()
 
 			if err := s.conn.WritePacket(&packet.ItemStackRequest{
@@ -1865,10 +2021,13 @@ func (s *session) dispatch(c command) {
 					Actions:   []protocol.StackRequestAction{move},
 				}},
 			}); err != nil {
+				s.mu.Lock()
+				delete(s.craftWaiter, reqID)
+				s.mu.Unlock()
 				s.reply(c.ID, false, fmt.Sprintf("装備の送信に失敗: %v", err), nil)
 				return
 			}
-			s.reply(c.ID, true, "", nil)
+			// 応答は ItemStackResponse ハンドラが返す。
 		}
 
 	case "smelt":

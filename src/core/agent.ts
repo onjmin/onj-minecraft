@@ -3,11 +3,14 @@ import path from "node:path";
 import mineflayer, { type ControlState } from "mineflayer";
 import { goals, Movements, pathfinder } from "mineflayer-pathfinder";
 import type { AgentProfile } from "../profiles/types";
+import { craftWeaponSkill } from "../skills/crafting/weapon";
 import { exploreLandSkill } from "../skills/exploring/land";
 import { gotoDeathPointSkill } from "../skills/goto/death";
 import { gotoSurfaceSkill } from "../skills/goto/surface";
+import { giveItemSkill } from "../skills/social/give";
 import type { SkillResponse } from "../skills/types";
 import { type ChatSituation, Conversation } from "./conversation";
+import { EAT_BELOW_FOOD, pickFood } from "./driver/food";
 import { JavaDriver } from "./driver/java";
 import type { BotDriver, Position } from "./driver/types";
 import { chatLlm, llm } from "./llm-client";
@@ -119,6 +122,27 @@ const SPIN_LIMIT = envNum("SKILL_SPIN_LIMIT", 3);
  */
 const REQUEST_TTL_MS = envNum("CHAT_REQUEST_TTL_MS", 10 * 60_000);
 
+/**
+ * 近くの人に自分から声をかけるまで、直近の発言からこれだけ間を空ける。
+ * 実際の会話が始まった/始まりかけている最中に横から挨拶を割り込ませないため。
+ */
+const GREET_QUIET_AFTER_HEARD_MS = envNum("GREET_QUIET_AFTER_HEARD_MS", 20_000);
+/** 同じ人には、この間隔を空けてからでないと自分から声をかけない。しつこくしない。 */
+const GREET_COOLDOWN_MS = envNum("GREET_COOLDOWN_MS", 15 * 60_000);
+
+/**
+ * 一回成功したら依頼が消化される類のスキル。
+ *
+ * ほとんどのスキルは何周もかけて進める前提(木を集めて→何度も
+ * collecting.wood を選び直す)なので、依頼は簡単には消さない方がよい。
+ * ここに載っているものは逆で、1回の成功が「頼まれたことをやり切った」を
+ * 意味する。載せずにいると、pendingRequest の TTL(10分)が切れるまで
+ * 同じ依頼を思考プロンプトが見せ続け、同じ行為を繰り返してしまう。
+ * 集める系は多めに集めても実害が薄いが、渡す系は渡しすぎると
+ * 持ち物を無駄に失うだけなので、ここに含める。
+ */
+const ONE_SHOT_REQUEST_SKILLS = new Set<string>([giveItemSkill.name]);
+
 /** 攻撃してくる相手かどうか。名前で判断する。 */
 function isHostileMob(name: string): boolean {
 	const hostile = [
@@ -170,6 +194,13 @@ type StrategicState = {
 	chats: string[]; // FIFO 3 (自分自身の過去発言)
 };
 
+/**
+ * 起動中の全エージェント。unj-relay.ts が「unjの人間発言を誰の口で喋らせるか」を
+ * 選ぶために参照する（agent.tsからunj-bridge.tsへは依存させたくないので、
+ * ポーリングと発話先の選択はunj-relay.ts側に置き、ここはレジストリだけ持つ）。
+ */
+export const activeAgents: MinecraftAgent[] = [];
+
 export class MinecraftAgent {
 	/**
 	 * mineflayer のボット本体。Java版でのみ生成される。
@@ -211,10 +242,21 @@ export class MinecraftAgent {
 	 *
 	 * 会話履歴（直近3件）だけでは、少し喋っただけで依頼が押し出されて
 	 * 消える。「木を集めて」と言われたことを覚えておく場所が要る。
+	 *
+	 * selfInitiated が立っているものは、人から頼まれたのではなく
+	 * greetPlayer() で自分から申し出た内容。思考プロンプトでの言い回しを
+	 * 変えるためだけの印で、実行の扱いは依頼と同じにする。
 	 */
-	private pendingRequest: { text: string; from: string; at: number } | null = null;
+	private pendingRequest: {
+		text: string;
+		from: string;
+		at: number;
+		selfInitiated?: boolean;
+	} | null = null;
 	/** 他プレイヤーの発言を最後に受け取った時刻。0 は未受信。 */
 	private lastHeardAt = 0;
+	/** 自分から挨拶して申し出た相手と、その時刻。しつこく繰り返さないための記録。 */
+	private greetedRecently = new Map<string, number>();
 	/** 連続失敗回数。待機時間を伸ばして暴走を防ぐのに使う。 */
 	private consecutiveFailures = 0;
 	/** 直前に失敗したスキル名。別のスキルに切り替わったらカウンタを戻す。 */
@@ -245,6 +287,13 @@ export class MinecraftAgent {
 	private attackedByPlayerAt = 0;
 	/** 最後に潜った時刻。掘り進み続けるのを止めるために見る。 */
 	private lastBurrowAt = 0;
+	/**
+	 * 今わざと潜っているか。
+	 *
+	 * shelterAtNight が立て、returnToSurfaceIfBuried が読む。自分で作った
+	 * 隠れ穴を「埋まっている」と誤読して掘り返すのを止めるためのもの。
+	 */
+	private sheltering = false;
 	/** 人から話しかけられて、次の判断を急ぎたいときに立てる。 */
 	private humanRequestPending = false;
 	/** 思考ループの待ちを途中で切り上げるための呼び出し口。 */
@@ -300,6 +349,7 @@ export class MinecraftAgent {
 	 */
 	constructor(profile: AgentProfile, skillList: any[], injectedDriver?: BotDriver) {
 		this.profile = profile;
+		activeAgents.push(this);
 		this.skills = new Map(skillList.map((t) => [t.name, t]));
 		this.conversation = new Conversation(profile);
 		console.log(`[Chat] model=${chatLlm.modelName} endpoint=${chatLlm.endpoint}`);
@@ -345,8 +395,14 @@ export class MinecraftAgent {
 				);
 			});
 			// 復帰したら、まず落とし物を取りに行かせる。放っておくと消える。
+			//
+			// ただし getDeathPoint() で見ること。生のフィールドを見ると、直前の
+			// death ハンドラが置いた待ち時間(retryAfter)を無視して回収に戻す。
+			// death は respawn の直前に来るので、「返り討ちに遭ったから間を置く」
+			// と決めて exploring に切り替えた判断が、毎回ここで上書きされていた。
+			// 実測で 01:13〜01:17 の4分間に15回、ほぼ同じ場所で死に続けている。
 			this.driver.on("respawn", () => {
-				if (!this.deathPoint) return;
+				if (!this.getDeathPoint()) return;
 				this.currentTaskName = gotoDeathPointSkill.name;
 				this.currentTaskSince = Date.now();
 				this.requestImmediateThink();
@@ -413,6 +469,21 @@ export class MinecraftAgent {
 
 		// イベント登録
 		this.initEvents();
+	}
+
+	/** 表示名。unj-relay.ts が発話先のエージェントを名前で選ぶために使う。 */
+	get minecraftName(): string {
+		return this.profile.minecraftName;
+	}
+
+	/**
+	 * unjから中継された発言をそのままゲーム内チャットへ流す。LLMは使わない
+	 * （思考ループ・会話履歴を経由しない直送）。appendChatLogはforwardToUnj:falseで
+	 * 呼び、unjへ投稿し返してエコーしないようにする。
+	 */
+	public async relaySpeak(message: string): Promise<void> {
+		await this.driver.chat(message);
+		appendChatLog("out", this.profile.minecraftName, message, { forwardToUnj: false });
 	}
 
 	/**
@@ -496,7 +567,11 @@ export class MinecraftAgent {
 					continue;
 				}
 
-				this.driver.chat(result.reply);
+				// 送信の失敗で返事の記録まで巻き添えにしない。await せずに
+				// 投げっぱなしにすると、サイドカーが落ちている間の reject が
+				// 誰にも拾われず、Node が未処理の拒否としてプロセスごと
+				// 落とす。喋れなかったことはログに出れば足りる。
+				await this.driver.chat(result.reply).catch((e) => this.log(`発言に失敗: ${e}`));
 				this.conversation.record(this.profile.minecraftName, result.reply, "self");
 				appendChatLog("out", this.profile.minecraftName, result.reply);
 				this.log(`-> ${result.reply}`);
@@ -546,6 +621,9 @@ export class MinecraftAgent {
 		if (Date.now() - this.pendingRequest.at > REQUEST_TTL_MS) {
 			this.pendingRequest = null;
 			return null;
+		}
+		if (this.pendingRequest.selfInitiated) {
+			return `自分から${this.pendingRequest.from}に申し出た: ${this.pendingRequest.text}`;
 		}
 		return `${this.pendingRequest.from} からの依頼: ${this.pendingRequest.text}`;
 	}
@@ -1013,15 +1091,17 @@ export class MinecraftAgent {
 				// 棒か、棒になる木を持っていなければ何も作れない。
 				// 実測で crafting.tool が10分に21回選ばれ、全部
 				// 「棒が要る」で即失敗していた。
-				return this.driver.inventory
-					.items()
-					.some(
-						(i) =>
-							i.name === "stick" ||
-							i.name.endsWith("_planks") ||
-							i.name.endsWith("_log") ||
-							i.name.endsWith("_wood"),
-					);
+				return this.driver.inventory.items().some(
+					(i) =>
+						i.name === "stick" ||
+						i.name.endsWith("_planks") ||
+						i.name.endsWith("_log") ||
+						i.name.endsWith("_wood") ||
+						// ネザーの木(crimson_stem / warped_stem)も板材になる。
+						// ここだけ抜けていたので、ネザーの木しか持っていないと
+						// クラフト系が一覧から丸ごと消えていた。
+						i.name.endsWith("_stem"),
+				);
 			}
 			case "crafting.smelting": {
 				// かまどか、かまどになる丸石が要る。
@@ -1034,6 +1114,15 @@ export class MinecraftAgent {
 				// 殴られた直後は近づかない。誰もいないなら行き先が無い。
 				if (this.wasAttackedByPlayerRecently()) return false;
 				return this.driver.nearbyEntities(64).some((e) => e.kind === "player");
+			}
+			case "social.give": {
+				// 渡す相手も渡す物も無いなら選ばせない。空の持ち物で
+				// 「渡そうか」と申し出て、実行の段になって初めて
+				// 「何も持っていません」で失敗するのを避ける。
+				if (this.wasAttackedByPlayerRecently()) return false;
+				const hasPlayer = this.driver.nearbyEntities(64).some((e) => e.kind === "player");
+				const hasItem = this.driver.inventory.items().length > 0;
+				return hasPlayer && hasItem;
 			}
 			default:
 				return true;
@@ -1149,6 +1238,18 @@ export class MinecraftAgent {
 					}
 
 					this.recordSkillOutcome(skill.name, result.success);
+					// 依頼を果たしたら消す。pendingRequest は TTL(10分)か新しい
+					// 依頼で上書きされるまで残り続ける仕組みで、これ自体は
+					// 「木を集めて」のように何周もかけて進める依頼には都合がいい
+					// (1周目で消えると、続きをやる理由が思考プロンプトから消える)。
+					// だが social.give のような一回で完結する行為には向かない。
+					// 消さずに置くと、同じ「◯◯に渡そうか」という自分の申し出を
+					// 消費し続けてしまい、渡すたびにまた同じ申し出が見え、また
+					// 渡す、を TTL が切れるまで繰り返す。集める系は多く集めすぎても
+					// 損はないが、渡す系は渡しすぎるとただ持ち物を失うだけになる。
+					if (result.success && ONE_SHOT_REQUEST_SKILLS.has(skill.name)) {
+						this.pendingRequest = null;
+					}
 					this.pushHistory({
 						action: this.currentTaskName,
 						rationale: this.latestRationale || "Continuing task",
@@ -1467,7 +1568,7 @@ export class MinecraftAgent {
 				this.chatSimhashCache,
 			);
 			if (isNewChat && this.updateFIFO(this.strategicState.chats, chatMessage)) {
-				this.driver.chat(chatMessage);
+				await this.driver.chat(chatMessage).catch((e) => this.log(`発言に失敗: ${e}`));
 				this.conversation.record(this.profile.minecraftName, chatMessage, "self");
 				appendChatLog("out", this.profile.minecraftName, chatMessage);
 			}
@@ -1812,11 +1913,16 @@ export class MinecraftAgent {
 
 		const attackPromise = attackLoop();
 
+		// 中断されたら止める。ここで bot.attack(target) を呼んでいたので、
+		// 「やめろ」と言われた瞬間にもう一発殴っていた。攻撃の停止は
+		// pvp プラグイン側に持たせる。
 		if (signal) {
 			signal.addEventListener(
 				"abort",
 				() => {
-					bot.attack(target);
+					try {
+						(bot as any).pvp?.stop();
+					} catch {}
 				},
 				{ once: true },
 			);
@@ -2002,6 +2108,16 @@ export class MinecraftAgent {
 			await this.recoverDeathLootIfAlive();
 			this.returnToSurfaceIfBuried();
 			await this.wearBestArmor();
+			// 食事は籠るより先。籠っても満腹度が足りなければ体力は戻らないので、
+			// 先に食べておかないと「隠れたのに回復しない」まま夜を越すことになる。
+			await this.eatIfHungry(signal);
+			// 丸腰で木があるなら、まず剣。籠るより前に置くのは、
+			// 剣さえあれば籠らずに済む場面が多いため。
+			this.craftSwordIfUnarmed();
+			// 待たせず自分から動く。await しない: LLM 呼び出しを含むので、
+			// ここで待つと反射ループそのものが詰まる。結果は後続の反射に
+			// 依存しないので、投げっぱなしで構わない。
+			this.maybeGreetNearbyPlayer();
 			if (await this.shelterAtNight(signal)) return;
 			await this.escapeIfBoxedIn(signal);
 		} catch (e) {
@@ -2011,11 +2127,158 @@ export class MinecraftAgent {
 	}
 
 	/**
+	 * 近くに人がいれば、自分から挨拶して手伝いを申し出る。
+	 *
+	 * 「話しかけられるまで喋らない」だけでは、召使い風の人格なのに
+	 * 突っ立って待っているだけに見える。会話中に横から割り込まないよう
+	 * 直近の発言からの間隔と、戦闘中でないことを見てから声をかける。
+	 * 同じ相手には GREET_COOLDOWN_MS を空けるまで繰り返さない。
+	 */
+	private maybeGreetNearbyPlayer(): void {
+		if (this.isReplying) return;
+		const state = this.driver.getState();
+		if (!state.isReady || state.health <= 0) return;
+		// 誰かの発言をつい最近受けているなら、本物の会話が始まっている/
+		// 始まりかけている。そこへ挨拶を割り込ませない。
+		if (Date.now() - this.lastHeardAt < GREET_QUIET_AFTER_HEARD_MS) return;
+		// 殴ってきた相手がいる状況で愛想よく声をかけるのはおかしい。
+		if (this.wasAttackedByPlayerRecently()) return;
+		// 戦闘中に世間話は始めない。
+		if (this.driver.nearbyEntities(10).some((e) => isHostileMob(e.name))) return;
+
+		const names = this.nearbyPlayerNames();
+		if (names.length === 0) return;
+
+		const now = Date.now();
+		const target = names.find((n) => now - (this.greetedRecently.get(n) ?? 0) > GREET_COOLDOWN_MS);
+		if (!target) return;
+
+		// 呼び出し前に記録する。LLM 応答を待つ間に反射ループが何周も回るので、
+		// 先に印を付けておかないと応答が来るまでの間に同じ相手へ何度も
+		// 声をかけようとしてしまう。
+		this.greetedRecently.set(target, now);
+		void this.greetPlayer(target);
+	}
+
+	/**
+	 * 近くにいる人へ、自分から挨拶して手伝いを申し出る。
+	 *
+	 * 申し出た内容は pendingRequest にそのまま積み、思考ループへ渡す。
+	 * 「言うだけで動かない」のでは有能に見えない。返事の生成と実行は
+	 * replyToChat と同じ isReplying の鍵を共有し、二重に喋らせない。
+	 */
+	private async greetPlayer(target: string): Promise<void> {
+		if (this.isReplying) return;
+		this.isReplying = true;
+
+		try {
+			let result: { reply: string; request: string | null };
+			try {
+				result = await this.conversation.greet(this.getChatSituation(), target);
+			} catch (err) {
+				this.log(`Greet error: ${err}`);
+				return;
+			}
+
+			if (result.request) {
+				this.pendingRequest = {
+					text: result.request,
+					from: target,
+					at: Date.now(),
+					selfInitiated: true,
+				};
+				this.log(`[自分から申し出た] ${result.request}`);
+				this.humanRequestPending = true;
+				this.requestImmediateThink();
+			}
+
+			if (!result.reply) return;
+
+			await this.driver.chat(result.reply).catch((e) => this.log(`発言に失敗: ${e}`));
+			this.conversation.record(this.profile.minecraftName, result.reply, "self");
+			appendChatLog("out", this.profile.minecraftName, result.reply);
+			this.log(`-> ${result.reply}`);
+		} finally {
+			this.isReplying = false;
+		}
+	}
+
+	/**
 	 * 生き返っていて落とし物が残っているなら、取りに行く手配をする。
 	 *
 	 * サーバーが復帰の通知を返さないことがあるので、イベントに頼らず
 	 * 「死亡地点を控えている・体力がある」で判断する。
 	 */
+	/**
+	 * 腹が減っていて食べ物があるなら食べる。
+	 *
+	 * 長いあいだ、食べる手段そのものが無かった。満腹度は知覚まで通っていて
+	 * 思考プロンプトに「Hunger: n」と出るのに、減ったものを戻す口がどこにも
+	 * 無い。満腹度が18を切ると体力が自然回復しなくなるため、狩って焼いた肉を
+	 * 持ったまま回復できず、削られては死ぬ、を繰り返していた。
+	 *
+	 * LLM に選ばせない。腹が減ったら食べるのは判断ではなく前提で、
+	 * 30秒に1回の思考を待つ類のものでもない。
+	 */
+	private async eatIfHungry(signal: AbortSignal): Promise<void> {
+		const state = this.driver.getState();
+		if (!state.isReady || state.health <= 0) return;
+		if (state.food >= EAT_BELOW_FOOD) return;
+		// 食べている間は動けない。敵が目の前にいるなら、まず逃げる方が先。
+		if (this.driver.nearbyEntities(6).some((e) => isHostileMob(e.name))) return;
+		if (!pickFood(this.driver.inventory.items().map((i) => i.name))) return;
+
+		const ate = await this.driver.eat(signal);
+		if (ate) {
+			this.log(`[反射] 食事をとった (満腹度 ${state.food} → ${this.driver.getState().food})`);
+		}
+	}
+
+	/**
+	 * 丸腰で、木が手元にあるなら、剣を作ることを最優先にする。
+	 *
+	 * 「木が手に入ったら剣を最優先」はプロンプトの AGENT RULES に文章として
+	 * 書いてあるだけで、実際には守られていなかった。本番で spruce_log を5本
+	 * 持ち、素手のまま exploring.explore_land を3回続けて選び、その間に
+	 * ゾンビに繰り返し殺されている。板材6枚あれば剣は作れるので、材料は
+	 * 足りていた。
+	 *
+	 * しかも explore_land は「目的地に着いた」ので毎回 Success を返す。
+	 * 失敗が続いたときの停滞判定は成功では発火しないため、何も得ない行動を
+	 * 成功として無限に繰り返せてしまう。だからここは判断に任せず前提として置く。
+	 *
+	 * 敵が近いときはやらない。クラフトの最中は無防備で、作りかけで殺されると
+	 * 材料ごと落とすことになる。その場合は籠る側の反射に任せる。
+	 */
+	private craftSwordIfUnarmed(): void {
+		if (!this.skills.has(craftWeaponSkill.name)) return;
+		if (this.currentTaskName === craftWeaponSkill.name) return;
+		// 既に何か作っている最中なら邪魔しない。
+		if (this.currentTaskName.startsWith("crafting.")) return;
+		if (this.hasWeapon()) return;
+
+		const state = this.driver.getState();
+		if (!state.isReady || state.health <= 0) return;
+		if (this.driver.nearbyEntities(10).some((e) => isHostileMob(e.name))) return;
+
+		// 剣2枚＋作業台4枚で板材6枚。原木1本が板材4枚になる。
+		const items = this.driver.inventory.items();
+		const planks = items
+			.filter((i) => i.name.endsWith("_planks"))
+			.reduce((sum, i) => sum + i.count, 0);
+		const logs = items
+			.filter(
+				(i) => i.name.endsWith("_log") || i.name.endsWith("_stem") || i.name.endsWith("_wood"),
+			)
+			.reduce((sum, i) => sum + i.count, 0);
+		if (planks + logs * 4 < 6) return;
+
+		this.log("[反射] 丸腰で木がある。剣を作る");
+		this.currentTaskName = craftWeaponSkill.name;
+		this.currentTaskSince = Date.now();
+		this.instantRepeats = 0;
+	}
+
 	private async recoverDeathLootIfAlive(): Promise<void> {
 		const point = this.getDeathPoint();
 		if (!point) return;
@@ -2050,6 +2313,10 @@ export class MinecraftAgent {
 	private returnToSurfaceIfBuried(): void {
 		if (!this.skills.has(gotoSurfaceSkill.name)) return;
 		if (this.currentTaskName === gotoSurfaceSkill.name) return;
+		// 自分で潜ったのなら、それは「埋まっている」ではない。掘り返さない。
+		// この反射は shelterAtNight より前に回るので、これが無いと
+		// 「潜る→掘り返す」を毎周くり返し、夜の地上に出っぱなしになる。
+		if (this.sheltering) return;
 		// 採集や設置の最中は割り込まない。地下にいるのが目的のことがある。
 		if (this.currentTaskName.startsWith("collecting.")) return;
 		if (this.currentTaskName.startsWith("building.")) return;
@@ -2092,6 +2359,18 @@ export class MinecraftAgent {
 	 * 戻り値が true なら、この周の他の反射は行わない。
 	 */
 	private async shelterAtNight(signal: AbortSignal): Promise<boolean> {
+		// 「今わざと潜っている」ことを覚えておく。これが無いと
+		// returnToSurfaceIfBuried が、潜ったばかりの穴を「埋まっている」と
+		// 読んで掘り返す。実測で 05:00:16 に潜り、30秒後に地上へ戻され、
+		// 05:05:47 には同じ秒に両方が発火していた。夜通しこれを往復して
+		// 地上に出続け、mob に86回殺されている。
+		const sheltering = await this.decideShelter(signal);
+		this.sheltering = sheltering;
+		return sheltering;
+	}
+
+	/** 潜るべきか判断し、必要なら実際に潜る。戻り値は「今潜っている扱いか」。 */
+	private async decideShelter(signal: AbortSignal): Promise<boolean> {
 		const state = this.driver.getState();
 		// 死んでいる間は何もしない。復帰の要求はサイドカーが出している。
 		if (state.health <= 0) return false;

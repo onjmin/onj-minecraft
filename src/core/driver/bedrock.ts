@@ -14,6 +14,7 @@
  *   - smelt / canSmelt: 精錬
  */
 import { BlockView } from "./blockview";
+import { pickFood } from "./food";
 import { BedrockSidecar } from "./sidecar";
 import type {
 	BlockInfo,
@@ -119,6 +120,18 @@ function describeSystemMessage(key: string, params: unknown): string {
 		default:
 			return args.length > 0 ? `${key} (${args.join(", ")})` : key;
 	}
+}
+
+/**
+ * その死亡ログが「プレイヤーに殺された」ものか。
+ *
+ * 統合版の翻訳キーは加害者の種類まで含む。プレイヤーが手を下した経路は
+ * 素手・武器(death.attack.player)だけでなく、爆発(TNT・ベッド・
+ * リスポーンアンカー)や矢もある。末尾が .player のものは加害者が
+ * プレイヤーなので、そこで見る。
+ */
+function isPlayerKill(key: string): boolean {
+	return key.startsWith("death.attack.") && key.endsWith(".player");
 }
 
 /** 防具コンテナのスロット番号。Java版の destination 名に合わせる。 */
@@ -309,7 +322,14 @@ export class BedrockDriver implements BotDriver {
 				const args = Array.isArray(d.parameters) ? d.parameters.map(String) : [];
 				// 自分がプレイヤーに倒されたなら、加害者はここに書いてある。
 				// 体力の変化から推測するより確実。
-				if (message.includes("death.attack.player") && args[0] === this.username && args[1]) {
+				//
+				// death.attack.player だけを見ていると取りこぼす。プレイヤーに
+				// 殺される経路は殴られるだけではなく、TNT・ベッド・リスポーン
+				// アンカーによる爆発も同じくらい多い。それらは
+				// death.attack.explosion.player で来るので、素通ししていた。
+				// 実際、接続16秒後の初死亡がこれで、加害者を覚えないまま
+				// 相手に近づき直していた。
+				if (isPlayerKill(message) && args[0] === this.username && args[1]) {
 					for (const l of this.attackerListeners) l(args[1]);
 				}
 				for (const l of this.systemListeners) l(describeSystemMessage(message, d.parameters));
@@ -760,11 +780,17 @@ export class BedrockDriver implements BotDriver {
 			// になる。作業台を作った直後の設置で実際に起きた。
 			await this.refresh();
 			// ホットバー(スロット0-8)にあるものしか持てない。
-			const slot = this.items.find((i) => i.name === want && i.slot >= 0 && i.slot <= 8);
-			if (!slot) {
-				throw new Error(`${itemName} がホットバーにありません`);
+			const inHotbar = this.items.find((i) => i.name === want && i.slot >= 0 && i.slot <= 8);
+			// ホットバーに無ければ諦めていた。クラフトで増えた物は空いている
+			// 枠に入るので、持ち物の奥に入っていることの方が多い。実際、
+			// 作った作業台やチェストが奥に入っただけで設置に失敗し、
+			// 「作れているのに置けない」で連鎖が止まっていた。
+			// 道具の持ち替え(equipBestTool)と同じ手順でホットバーへ移す。
+			const slot = inHotbar ? inHotbar.slot : await this.moveToHotbar(want);
+			if (slot === null) {
+				throw new Error(`${itemName} を持っていません`);
 			}
-			await this.sidecar.send("hold", { count: slot.slot });
+			await this.sidecar.send("hold", { count: slot });
 			// サーバーが持ち替えを反映するまでの間。すぐ設置すると取りこぼす。
 			await sleep(200);
 			return;
@@ -784,6 +810,30 @@ export class BedrockDriver implements BotDriver {
 		await this.refresh();
 		// 着せたものを控える。防具コンテナは読み返せないので、ここが唯一の記録。
 		this.worn[armorSlot] = { name: want, count: 1, slot: -1 };
+	}
+
+	/**
+	 * 持ち物の奥にあるものをホットバーへ移し、移した先のスロットを返す。
+	 * 持っていなければ null。
+	 */
+	private async moveToHotbar(want: string): Promise<number | null> {
+		const item = this.items.find((i) => i.name === want && i.slot > 8 && i.slot <= 35);
+		if (!item) return null;
+		// 空きがあればそこへ、無ければ使っていなさそうな末尾と入れ替える。
+		const occupied = new Set(
+			this.items.filter((i) => i.slot >= 0 && i.slot <= 8).map((i) => i.slot),
+		);
+		let target = 8;
+		for (let i = 0; i <= 8; i++) {
+			if (!occupied.has(i)) {
+				target = i;
+				break;
+			}
+		}
+		await this.sidecar.send("moveSlot", { names: [String(item.slot)], count: target });
+		await sleep(300);
+		await this.refresh();
+		return target;
 	}
 
 	/**
@@ -816,20 +866,10 @@ export class BedrockDriver implements BotDriver {
 
 		let slot = best.slot;
 		if (slot > 8) {
-			// 手に持てるのはホットバーだけ。空きがあればそこへ、無ければ
-			// 使っていなさそうな末尾と入れ替える。
-			const occupied = new Set(this.items.filter((i) => i.slot <= 8).map((i) => i.slot));
-			let target = 8;
-			for (let i = 0; i <= 8; i++) {
-				if (!occupied.has(i)) {
-					target = i;
-					break;
-				}
-			}
-			await this.sidecar.send("moveSlot", { names: [String(slot)], count: target });
-			await sleep(300);
-			await this.refresh();
-			slot = target;
+			// 手に持てるのはホットバーだけ。奥にあるものは移してから持つ。
+			const moved = await this.moveToHotbar(best.name);
+			if (moved === null) return;
+			slot = moved;
 		}
 		await this.sidecar.send("hold", { count: slot });
 		await sleep(150);
@@ -917,6 +957,41 @@ export class BedrockDriver implements BotDriver {
 			await sleep(800);
 		}
 	}
+
+	async eat(_signal: AbortSignal): Promise<boolean> {
+		await this.refresh();
+		const food = pickFood(this.inventory.items().map((i) => i.name));
+		if (!food) return false;
+
+		const before = this.state.food;
+		try {
+			// 食べるのは手に持っているものなので、まず持ち替える。
+			await this.equip(food, "hand");
+			// 統合版の消費は「使い始め」と「使い終わり」の2段。サイドカー側で
+			// 両方を送って、食べ終わるまで待ってから返す。
+			const res = await this.sidecar.send("eat", {}, 10_000);
+			if (!res?.ok) return false;
+		} catch {
+			return false;
+		}
+
+		// 満腹度はサーバーから遅れて届く。増えていなければ食べられていない
+		// （満腹だった・持ち替えに失敗した）ので、成功を騙らない。
+		await sleep(500);
+		await this.refresh();
+		return this.state.food > before;
+	}
+
+	async dropItem(itemName: string, count: number): Promise<void> {
+		const want = stripNamespace(itemName);
+		await this.refresh();
+		await this.sidecar.send("drop", { names: [want], count }, 20_000);
+		// サーバーが在庫を送り直すのを待つ。すぐ次の判断をすると、
+		// 渡したはずのものがまだ手元にあるように見える。
+		await sleep(300);
+		await this.refresh();
+	}
+
 	async craft(itemName: string, count: number, craftingTable?: Position): Promise<void> {
 		const want = stripNamespace(itemName);
 		// 3x3 の枠は作業台の画面を開いている間しか使えない。位置を渡さないと

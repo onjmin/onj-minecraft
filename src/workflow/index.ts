@@ -1,4 +1,5 @@
 import { MinecraftAgent } from "../core/agent";
+import { startUnjRelayPolling } from "../core/utils/unj-relay";
 import { profiles } from "../profiles";
 import { buildingBaseSkill } from "../skills/building/base";
 import { collectDirtSkill } from "../skills/collecting/dirt";
@@ -16,6 +17,7 @@ import { gotoBaseSkill } from "../skills/goto/base";
 import { gotoCoordsSkill } from "../skills/goto/coords";
 import { gotoPlayerSkill } from "../skills/goto/player";
 import { gotoSurfaceSkill } from "../skills/goto/surface";
+import { giveItemSkill } from "../skills/social/give";
 
 const allSkills = [
 	// --- Collecting Domain (With integrated Eat/Equip routine) ---
@@ -43,6 +45,9 @@ const allSkills = [
 	gotoBaseSkill, // 拠点帰還
 	gotoPlayerSkill, // プレイヤーへ移動
 	gotoSurfaceSkill, // 地上へ移動
+
+	// --- Social Domain ---
+	giveItemSkill, // アイテムを人に渡す
 ];
 /**
  * Initialize and start all agents
@@ -53,6 +58,9 @@ const allSkills = [
 		new MinecraftAgent(profile, allSkills);
 		await new Promise((resolve) => setTimeout(resolve, 5000));
 	}
+	// unjの人間発言をMinecraftチャットへ中継するポーリングを開始
+	// （UNJ_BASE_URL/UNJ_ADMIN_API_KEY未設定なら内部で何もしない）
+	startUnjRelayPolling();
 })();
 
 console.log(`Started ${Object.values(profiles).length} agents.`);
