@@ -125,10 +125,33 @@ const REQUEST_TTL_MS = envNum("CHAT_REQUEST_TTL_MS", 10 * 60_000);
 /**
  * 近くの人に自分から声をかけるまで、直近の発言からこれだけ間を空ける。
  * 実際の会話が始まった/始まりかけている最中に横から挨拶を割り込ませないため。
+ *
+ * 以前は20秒だった。AI同士の会話は考える時間があるぶん間が空きやすく、
+ * その間を「静かになった」と誤認して割り込んでいた
+ * （「AI会話に割り込んでくる」という苦情の主因）。返信に時間がかかる
+ * 相手を想定し、大きく空ける。
  */
-const GREET_QUIET_AFTER_HEARD_MS = envNum("GREET_QUIET_AFTER_HEARD_MS", 20_000);
+const GREET_QUIET_AFTER_HEARD_MS = envNum("GREET_QUIET_AFTER_HEARD_MS", 3 * 60_000);
 /** 同じ人には、この間隔を空けてからでないと自分から声をかけない。しつこくしない。 */
 const GREET_COOLDOWN_MS = envNum("GREET_COOLDOWN_MS", 15 * 60_000);
+/**
+ * 相手が誰であっても、自分から声をかけるのはこの間隔を空けてから。
+ * GREET_COOLDOWN_MS は相手ごとの制限なので、これが無いと near にいる
+ * 人数分だけ次々に声をかけてしまい、しゃべりっぱなしになる
+ * （「枠を潰す」という苦情の一因）。
+ */
+const GREET_GLOBAL_COOLDOWN_MS = envNum("GREET_GLOBAL_COOLDOWN_MS", 5 * 60_000);
+/**
+ * 自分を挟まずに他人同士が会話しているとみなす、直近の発言者数のしきい値。
+ * 2人以上が交互に話していれば、それは自分向けの雑談ではなく他人同士の
+ * 会話である可能性が高い。そこには割り込まない。
+ */
+const OTHERS_CONVERSING_WINDOW_MS = envNum("OTHERS_CONVERSING_WINDOW_MS", 2 * 60_000);
+/**
+ * 自分が発言してからこの間に届いた発言は、その続きの返信とみなす。
+ * 名前を呼ばれていなくても、直前に自分から話しかけた相手の返事には答える。
+ */
+const ADDRESSED_FOLLOWUP_MS = envNum("ADDRESSED_FOLLOWUP_MS", 45_000);
 
 /**
  * 一回成功したら依頼が消化される類のスキル。
@@ -257,6 +280,10 @@ export class MinecraftAgent {
 	private lastHeardAt = 0;
 	/** 自分から挨拶して申し出た相手と、その時刻。しつこく繰り返さないための記録。 */
 	private greetedRecently = new Map<string, number>();
+	/** 直近で自分から声をかけた時刻（相手を問わない）。話しっぱなしを防ぐ。 */
+	private lastGreetAt = 0;
+	/** 自分が最後に何か発言した時刻。直後の返信を「自分への返事」とみなすのに使う。 */
+	private lastSelfSpokeAt = 0;
 	/** 連続失敗回数。待機時間を伸ばして暴走を防ぐのに使う。 */
 	private consecutiveFailures = 0;
 	/** 直前に失敗したスキル名。別のスキルに切り替わったらカウンタを戻す。 */
@@ -510,12 +537,37 @@ export class MinecraftAgent {
 		this.lastHeardAt = Date.now();
 		this.log(`<${username}> ${message}`);
 		appendChatLog("in", username, message);
+
+		// 自分に向けられていなさそうな発言には、記録だけして返事を作らない。
+		// 以前は聞こえた発言すべてでLLMに「返事すべきか」を判断させていたが、
+		// 人が多い場では誤って割り込む頻度が上がる
+		// （「AI会話に割り込んでくるし枠潰す」という苦情の一因）。
+		if (!this.looksAddressedToSelf(username, message)) return;
+
 		// 返事は思考ループを待たずに、その場で作り始める。
 		void this.replyToChat();
 		// 人の話は次の判断まで30秒待たせない。指示なら尚更で、
 		// 待たせると「聞こえていない」ようにしか見えない。
 		this.humanRequestPending = true;
 		this.requestImmediateThink();
+	}
+
+	/**
+	 * その発言が自分に向けられていそうかを見る。
+	 *
+	 * 名前を呼ばれていれば確実にそう。呼ばれていなくても、直前に自分から
+	 * 話しかけた相手の返事や、自分以外に話している人がいない1対1の場面は
+	 * 自分への発言として扱う。逆に、自分を挟まず2人以上が交互に話している
+	 * 最中なら、それは他人同士の会話であって自分への話しかけではない。
+	 */
+	private looksAddressedToSelf(username: string, message: string): boolean {
+		const name = this.profile.minecraftName;
+		if (name && message.toLowerCase().includes(name.toLowerCase())) return true;
+		if (Date.now() - this.lastSelfSpokeAt < ADDRESSED_FOLLOWUP_MS) return true;
+		const others = this.conversation
+			.recentDistinctSpeakers(OTHERS_CONVERSING_WINDOW_MS)
+			.filter((n) => n !== username);
+		return others.length === 0;
 	}
 
 	/**
@@ -572,6 +624,7 @@ export class MinecraftAgent {
 				// 誰にも拾われず、Node が未処理の拒否としてプロセスごと
 				// 落とす。喋れなかったことはログに出れば足りる。
 				await this.driver.chat(result.reply).catch((e) => this.log(`発言に失敗: ${e}`));
+				this.lastSelfSpokeAt = Date.now();
 				this.conversation.record(this.profile.minecraftName, result.reply, "self");
 				appendChatLog("out", this.profile.minecraftName, result.reply);
 				this.log(`-> ${result.reply}`);
@@ -636,7 +689,11 @@ export class MinecraftAgent {
 	 */
 	private handleSystemMessage(message: string): void {
 		this.log(`[通知] ${message}`);
-		appendChatLog("in", "サーバー", message);
+		// unjへは中継しない。あちらへ流すのは会話ログだけという建て付けで、
+		// キルログ・参加退出は会話ではない。実際に流すと「kusabot2361 が
+		// %entity.zombie.name にやられた」のような未翻訳のシステム文字列が
+		// 延々と積み上がる（死ぬたびに1レス）。ファイルには残す。
+		appendChatLog("in", "サーバー", message, { forwardToUnj: false });
 		// 会話の列には積むが、話しかけられた扱いにはしない。
 		// lastHeardAt を動かさないので、これで喋り出すことはない。
 		this.conversation.record("サーバー", message, "system");
@@ -1569,6 +1626,7 @@ export class MinecraftAgent {
 			);
 			if (isNewChat && this.updateFIFO(this.strategicState.chats, chatMessage)) {
 				await this.driver.chat(chatMessage).catch((e) => this.log(`発言に失敗: ${e}`));
+				this.lastSelfSpokeAt = Date.now();
 				this.conversation.record(this.profile.minecraftName, chatMessage, "self");
 				appendChatLog("out", this.profile.minecraftName, chatMessage);
 			}
@@ -2141,6 +2199,13 @@ export class MinecraftAgent {
 		// 誰かの発言をつい最近受けているなら、本物の会話が始まっている/
 		// 始まりかけている。そこへ挨拶を割り込ませない。
 		if (Date.now() - this.lastHeardAt < GREET_QUIET_AFTER_HEARD_MS) return;
+		// 相手を問わず、直近に自分から声をかけたばかりなら黙る。
+		// これが無いと、近くにいる人数分だけ次々に挨拶して喋りっぱなしになる。
+		if (Date.now() - this.lastGreetAt < GREET_GLOBAL_COOLDOWN_MS) return;
+		// 自分を挟まずに2人以上が交互に話しているなら、他人同士の会話とみなし、
+		// 割り込まない。「AI会話に割り込んでくる」という苦情の主因はこれで、
+		// 発言そのものの間隔だけでは、話者が複数いる場を検知できなかった。
+		if (this.conversation.recentDistinctSpeakers(OTHERS_CONVERSING_WINDOW_MS).length >= 2) return;
 		// 殴ってきた相手がいる状況で愛想よく声をかけるのはおかしい。
 		if (this.wasAttackedByPlayerRecently()) return;
 		// 戦闘中に世間話は始めない。
@@ -2157,6 +2222,7 @@ export class MinecraftAgent {
 		// 先に印を付けておかないと応答が来るまでの間に同じ相手へ何度も
 		// 声をかけようとしてしまう。
 		this.greetedRecently.set(target, now);
+		this.lastGreetAt = now;
 		void this.greetPlayer(target);
 	}
 
@@ -2195,6 +2261,7 @@ export class MinecraftAgent {
 			if (!result.reply) return;
 
 			await this.driver.chat(result.reply).catch((e) => this.log(`発言に失敗: ${e}`));
+			this.lastSelfSpokeAt = Date.now();
 			this.conversation.record(this.profile.minecraftName, result.reply, "self");
 			appendChatLog("out", this.profile.minecraftName, result.reply);
 			this.log(`-> ${result.reply}`);

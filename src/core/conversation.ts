@@ -147,6 +147,22 @@ export class Conversation {
 	}
 
 	/**
+	 * 直近 windowMs 以内に発言した、自分以外の話者の集合（重複なし）。
+	 *
+	 * 2人以上いれば、自分を挟まずに他人同士が会話している可能性が高い。
+	 * そこへ愛想よく割り込むと「AI同士の会話に横入りする」ことになるため、
+	 * 割り込み判定の材料に使う。
+	 */
+	recentDistinctSpeakers(windowMs: number): string[] {
+		const cutoff = Date.now() - windowMs;
+		const names = new Set<string>();
+		for (const t of this.turns) {
+			if (t.kind === "player" && t.at >= cutoff) names.add(t.speaker);
+		}
+		return [...names];
+	}
+
+	/**
 	 * 直近のサーバー通知。会話の列ではなく「今の状況」として渡すためのもの。
 	 *
 	 * 古いものは載せない。「最近のできごと」として渡す以上、1時間前の
