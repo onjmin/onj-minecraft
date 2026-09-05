@@ -117,6 +117,8 @@ function describeSystemMessage(key: string, params: unknown): string {
 			return `${who} が入ってきた`;
 		case "multiplayer.player.left":
 			return `${who} が出ていった`;
+		case "chat.type.sleeping":
+			return `${who} がベッドに入った（就寝中${by}人）`;
 		default:
 			return args.length > 0 ? `${key} (${args.join(", ")})` : key;
 	}
@@ -207,6 +209,8 @@ export class BedrockDriver implements BotDriver {
 	private systemListeners: ((message: string) => void)[] = [];
 	/** 自分を倒したプレイヤーの名前の受け手。 */
 	private attackerListeners: ((name: string) => void)[] = [];
+	/** ベッドで就寝中の人数(自分を含む)の受け手。chat.type.sleeping から拾う。 */
+	private sleepingListeners: ((count: number) => void)[] = [];
 	/** 今サーバーにいる人の名前。 */
 	private online: string[] = [];
 	private playersListeners: ((names: string[]) => void)[] = [];
@@ -331,6 +335,12 @@ export class BedrockDriver implements BotDriver {
 				// 相手に近づき直していた。
 				if (isPlayerKill(message) && args[0] === this.username && args[1]) {
 					for (const l of this.attackerListeners) l(args[1]);
+				}
+				// 誰かが寝ると届く。夜をスキップできるかは全員(自分含む)が
+				// 寝ているかで決まるので、人数を別出しして席を譲る判断に使う。
+				if (message === "chat.type.sleeping" && args[1] !== undefined) {
+					const count = Number(args[1]);
+					if (!Number.isNaN(count)) for (const l of this.sleepingListeners) l(count);
 				}
 				for (const l of this.systemListeners) l(describeSystemMessage(message, d.parameters));
 				return;
@@ -502,6 +512,7 @@ export class BedrockDriver implements BotDriver {
 		if (event === "chat") this.chatListeners.push(listener as any);
 		else if (event === "system") this.systemListeners.push(listener as any);
 		else if (event === "killed_by_player") this.attackerListeners.push(listener as any);
+		else if (event === "sleeping") this.sleepingListeners.push(listener as any);
 		else if (event === "players") this.playersListeners.push(listener as any);
 		else if (event === "end" || event === "kicked") this.endListeners.push(listener as any);
 		// spawn/death/health は現状 workflow 側で使っていないので受けるだけにしない。
@@ -511,6 +522,8 @@ export class BedrockDriver implements BotDriver {
 	off(event: string, listener: (...args: any[]) => void): void {
 		if (event === "chat") {
 			this.chatListeners = this.chatListeners.filter((l) => l !== listener);
+		} else if (event === "sleeping") {
+			this.sleepingListeners = this.sleepingListeners.filter((l) => l !== listener);
 		} else if (event === "end" || event === "kicked") {
 			this.endListeners = this.endListeners.filter((l) => l !== listener);
 		} else {

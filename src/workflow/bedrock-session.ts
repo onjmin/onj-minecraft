@@ -74,3 +74,27 @@ export function shouldYieldSeat(driver: BedrockDriver, selfName: string): boolea
 	const others = driver.onlinePlayers().filter((n) => n !== selfName);
 	return others.length + 1 >= LEAVE_AT_PLAYERS;
 }
+
+/**
+ * 夜、寝たがっている人の邪魔になっていないか。
+ *
+ * 統合版の夜スキップは「ベッドに入っている人数」が「オンライン人数」に
+ * 達すると発生する。ボットは寝られないので、自分以外の全員がベッドに
+ * 入っているのにボットが起きているだけで夜が明けない状態になりうる。
+ *
+ * 2026-09-04 のログで、「クソボットのせいでワイだけ寝ても無理か」と
+ * 言われてからボットは謝るだけで居座り続けた。謝罪では夜は明けない。
+ *
+ * chat.type.sleeping の人数(sleepingCount)は自分を含むサーバー全体の
+ * 集計なので、自分以外の人数と比べて「他の全員が寝ている」かを見る。
+ * 一人もいない(自分だけ)なら邪魔にならないので抜けない。
+ */
+export function shouldYieldForSleep(
+	driver: BedrockDriver,
+	selfName: string,
+	sleepingCount: number,
+): boolean {
+	const others = driver.onlinePlayers().filter((n) => n !== selfName);
+	if (others.length === 0) return false;
+	return sleepingCount >= others.length;
+}

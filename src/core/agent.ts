@@ -152,6 +152,60 @@ const OTHERS_CONVERSING_WINDOW_MS = envNum("OTHERS_CONVERSING_WINDOW_MS", 2 * 60
  * 名前を呼ばれていなくても、直前に自分から話しかけた相手の返事には答える。
  */
 const ADDRESSED_FOLLOWUP_MS = envNum("ADDRESSED_FOLLOWUP_MS", 45_000);
+/**
+ * 名前を呼ばれずに「続きの返信」として答えてよい回数。
+ *
+ * 時間だけで見てはいけない。返事をするたびに「最後に喋った時刻」が
+ * 更新されるので、窓が自分の返事で延び続け、一度喋ったら人が黙るまで
+ * 全発言に返事をする状態になる。実測 19:08〜19:13 は人間の発言すべてに
+ * 返事が付き、他人同士の会話に割り込んで「てめーじゃねえよ」と言われた。
+ * 名前を呼ばれたときだけこの回数を配り直し、使い切ったら黙る。
+ */
+const ADDRESSED_FOLLOWUP_TURNS = envNum("ADDRESSED_FOLLOWUP_TURNS", 2);
+/** 発言数を数える窓と、その窓で許す発言数。喋りすぎそのものを止める歯止め。 */
+const CHAT_RATE_WINDOW_MS = envNum("CHAT_RATE_WINDOW_MS", 60_000);
+const CHAT_RATE_MAX = envNum("CHAT_RATE_MAX", 3);
+/**
+ * 黙るように言われたら、この間は何も喋らない。
+ *
+ * 人格プロンプトに「嫌がられたら従う」とは書いてあるが、書いてあるだけでは
+ * 守られない。実測では「しねbot」の直後に「了解、すぐ近くに行って手伝うよ」と
+ * 返している。言葉ではなく仕組みで黙らせる。
+ */
+const CHAT_MUTE_MS = envNum("CHAT_MUTE_MS", 10 * 60_000);
+/**
+ * 「黙れ」と言われたと見なす言い回し。
+ *
+ * 誤検知しても実害は「しばらく黙る」だけなので、広めに取ってよい。
+ * 逆に取りこぼすと、嫌がられている相手に喋り続けることになる。
+ */
+const MUTE_PATTERNS = [
+	"黙れ",
+	"だまれ",
+	"黙って",
+	"うるさい",
+	"うっさい",
+	"うざい",
+	"ウザい",
+	"邪魔",
+	"じゃま",
+	"しね",
+	"死ね",
+	"消えろ",
+	"来るな",
+	"話しかけるな",
+	"喋るな",
+	"しゃべるな",
+	"止めて",
+	"やめて",
+];
+/** 死にすぎを数える窓と、その窓で「死にすぎ」と見なす回数。 */
+const DEATH_STORM_WINDOW_MS = envNum("DEATH_STORM_WINDOW_MS", 10 * 60_000);
+const DEATH_STORM_LIMIT = envNum("DEATH_STORM_LIMIT", 3);
+/** 誰かがベッドに入ったという知らせを、この間だけ有効とみなす。 */
+const SLEEP_REQUEST_TTL_MS = envNum("SLEEP_REQUEST_TTL_MS", 90_000);
+/** 寝るために探すベッドの範囲。 */
+const BED_SEARCH_RADIUS = envNum("BED_SEARCH_RADIUS", 48);
 
 /**
  * 一回成功したら依頼が消化される類のスキル。
@@ -282,8 +336,26 @@ export class MinecraftAgent {
 	private greetedRecently = new Map<string, number>();
 	/** 直近で自分から声をかけた時刻（相手を問わない）。話しっぱなしを防ぐ。 */
 	private lastGreetAt = 0;
-	/** 自分が最後に何か発言した時刻。直後の返信を「自分への返事」とみなすのに使う。 */
-	private lastSelfSpokeAt = 0;
+	/**
+	 * 「名前を呼ばれずに返事をしてよい相手」と、その残り回数。
+	 *
+	 * 回数は名前を呼ばれたときだけ配り直す。自分の返事では補充しない。
+	 * ここを時刻だけで持つと窓が自分で延び続け、人が黙るまで全発言に
+	 * 返事をする状態になる（ADDRESSED_FOLLOWUP_TURNS の説明を参照）。
+	 */
+	private followUp: { name: string; until: number; left: number } | null = null;
+	/** 直近に喋った時刻の列。窓あたりの発言数を抑えるために持つ。 */
+	private recentUtterances: number[] = [];
+	/** 実際に送った発言の simhash。同じことを言い続けるのを止めるために持つ。 */
+	private outgoingSimhashCache: Map<string, number[]> = new Map();
+	/** これを過ぎるまで何も喋らない。「黙れ」と言われたら立てる。 */
+	private mutedUntil = 0;
+	/** 直近に死んだ時刻の列。死亡ログを撒き散らしていないか見るために持つ。 */
+	private recentDeaths: number[] = [];
+	/** 誰かがベッドに入ったのを最後に見た時刻。0 は未受信。 */
+	private othersSleepingAt = 0;
+	/** 最後にベッドを使った時刻。入り直して自分を起こさないために見る。 */
+	private lastBedActivatedAt = 0;
 	/** 連続失敗回数。待機時間を伸ばして暴走を防ぐのに使う。 */
 	private consecutiveFailures = 0;
 	/** 直前に失敗したスキル名。別のスキルに切り替わったらカウンタを戻す。 */
@@ -403,8 +475,17 @@ export class MinecraftAgent {
 				this.handleSystemMessage(`${d?.name ?? "誰か"} に攻撃された`);
 				this.attackedByPlayerAt = Date.now();
 			});
+			// 誰かがベッドに入ったら覚えておく。統合版は全員が寝ないと朝が
+			// 来ないので、起きているのがボット1体でも他の人は夜を越せない。
+			// 実測で「クソボットのせいでワイだけ寝ても無理か」と言われている。
+			this.driver.on("sleeping", (count: number) => {
+				if (!count || count <= 0) return;
+				this.othersSleepingAt = Date.now();
+				this.log(`[通知] 誰かがベッドに入った(${count}人)`);
+			});
 			// 死んだ場所を控える。持ち物は全部そこに落ちている。
 			this.driver.on("death", () => {
+				this.noteDeath();
 				// 回収に戻った先で殺されたなら、まだ敵がそこにいる。
 				// 諦めはしないが、すぐ戻ると同じことになる。間を置く。
 				// 実測で90秒に4回、ほぼ同じ座標で死に続けた。戻るたびに
@@ -538,6 +619,14 @@ export class MinecraftAgent {
 		this.log(`<${username}> ${message}`);
 		appendChatLog("in", username, message);
 
+		// 黙るように言われたら、宛先の判定より先に黙る。ここで打ち切らないと、
+		// 「黙れ」への返事を生成してから黙ることになり、一番言われたくない
+		// タイミングでもう一度発言することになる。
+		if (this.looksLikeMuteRequest(message) && this.referencesBot(message)) {
+			void this.acceptMute(username);
+			return;
+		}
+
 		// 自分に向けられていなさそうな発言には、記録だけして返事を作らない。
 		// 以前は聞こえた発言すべてでLLMに「返事すべきか」を判断させていたが、
 		// 人が多い場では誤って割り込む頻度が上がる
@@ -561,13 +650,82 @@ export class MinecraftAgent {
 	 * 最中なら、それは他人同士の会話であって自分への話しかけではない。
 	 */
 	private looksAddressedToSelf(username: string, message: string): boolean {
-		const name = this.profile.minecraftName;
-		if (name && message.toLowerCase().includes(name.toLowerCase())) return true;
-		if (Date.now() - this.lastSelfSpokeAt < ADDRESSED_FOLLOWUP_MS) return true;
+		// 名前を呼ばれた。ここでだけ「続きの返信」の回数を配り直す。
+		// 表示名(kusabot2361)とプロフィール名(kusabot)は一致しないので両方見る。
+		if (this.mentionsSelf(message)) {
+			this.followUp = {
+				name: username,
+				until: Date.now() + ADDRESSED_FOLLOWUP_MS,
+				left: ADDRESSED_FOLLOWUP_TURNS,
+			};
+			return true;
+		}
+
+		// 自分以外に喋っている人がいない。1対1なので自分宛とみなしてよい。
+		// 続きの返信の枠より先に見る。ここで消費させると、1対1の会話だけで
+		// 枠が尽きて、他人同士の会話に使う分が残らない。
 		const others = this.conversation
 			.recentDistinctSpeakers(OTHERS_CONVERSING_WINDOW_MS)
 			.filter((n) => n !== username);
-		return others.length === 0;
+		if (others.length === 0) return true;
+
+		// 自分が話しかけた相手からの、名前を呼ばない返事。回数を決めて受ける。
+		// 使い切ったら黙る。ここを「直前に喋ったか」だけで見ると、返事のたびに
+		// 窓が延びて永久に閉じない。
+		const f = this.followUp;
+		if (f && f.name === username && f.left > 0 && Date.now() < f.until) {
+			f.left -= 1;
+			return true;
+		}
+
+		return false;
+	}
+
+	/** 発言の中で自分が名指しされているか。表示名とプロフィール名の両方を見る。 */
+	private mentionsSelf(message: string): boolean {
+		const text = message.toLowerCase();
+		const names = [this.profile.minecraftName, this.driver.getState().username].filter(
+			(n): n is string => Boolean(n),
+		);
+		return names.some((n) => text.includes(n.toLowerCase()));
+	}
+
+	/**
+	 * 自分のことを言っていそうか。名指しより緩く見る。
+	 *
+	 * 嫌がられているときに正確な名前で呼ばれることはない。実測は
+	 * 「botはいったん死ね」「しねbot」「クソボットのせいで」で、どれも
+	 * kusabot2361 とは書いていない。ここを厳密にすると、一番聞くべき
+	 * 場面だけ取りこぼす。返事をするかの判定には使わないこと
+	 * （「このbot」で始まる雑談にまで返事をするようになる）。
+	 */
+	private referencesBot(message: string): boolean {
+		if (this.mentionsSelf(message)) return true;
+		return /bot|ボット|ぼっと/i.test(message);
+	}
+
+	/** 「黙れ」の類か。嫌がられている合図を、言葉ではなく機械的に拾う。 */
+	private looksLikeMuteRequest(message: string): boolean {
+		const text = message.toLowerCase();
+		return MUTE_PATTERNS.some((p) => text.includes(p));
+	}
+
+	/**
+	 * 黙るように言われたので、一度だけ謝ってしばらく黙る。
+	 *
+	 * 謝罪だけは発言数の制限・重複判定・沈黙のすべてを迂回する。ここで
+	 * 抑制すると「うるさい」と言われて無言で消えることになり、かえって
+	 * 感じが悪い。先に黙りを確定させてから、その上で一度だけ謝る。
+	 */
+	private async acceptMute(username: string): Promise<void> {
+		const alreadyMuted = Date.now() < this.mutedUntil;
+		// 先に立てる。謝る間に届いた発言へ返事をしてしまわないため。
+		this.mutedUntil = Date.now() + CHAT_MUTE_MS;
+		this.followUp = null;
+		this.log(`[会話] ${username} に止められた。${CHAT_MUTE_MS / 60_000}分黙る`);
+		// すでに黙っている最中なら、謝り直さない。謝罪を繰り返すのも喋りすぎ。
+		if (alreadyMuted) return;
+		await this.speak("ごめん、しばらく黙るね", null, { force: true, bypassMute: true });
 	}
 
 	/**
@@ -619,19 +777,90 @@ export class MinecraftAgent {
 					continue;
 				}
 
-				// 送信の失敗で返事の記録まで巻き添えにしない。await せずに
-				// 投げっぱなしにすると、サイドカーが落ちている間の reject が
-				// 誰にも拾われず、Node が未処理の拒否としてプロセスごと
-				// 落とす。喋れなかったことはログに出れば足りる。
-				await this.driver.chat(result.reply).catch((e) => this.log(`発言に失敗: ${e}`));
-				this.lastSelfSpokeAt = Date.now();
-				this.conversation.record(this.profile.minecraftName, result.reply, "self");
-				appendChatLog("out", this.profile.minecraftName, result.reply);
-				this.log(`-> ${result.reply}`);
+				await this.speak(result.reply, this.conversation.lastFromOthers()?.speaker ?? null);
 			} while (this.replyAgain);
 		} finally {
 			this.isReplying = false;
 		}
+	}
+
+	/**
+	 * 実際に発言する唯一の口。発言に関する歯止めは全部ここに集める。
+	 *
+	 * 以前は返事・挨拶・思考ループの3か所がそれぞれ driver.chat() を直に
+	 * 呼んでいたため、抑制を入れても1か所ずつ抜けていた。数える場所が
+	 * 分かれていると数えられないので、口を1つにする。
+	 *
+	 * 送信の失敗で記録まで巻き添えにしない。await せずに投げっぱなしに
+	 * すると、サイドカーが落ちている間の reject が誰にも拾われず、Node が
+	 * 未処理の拒否としてプロセスごと落とす。喋れなかったことはログに出れば足りる。
+	 *
+	 * @param addressee この発言の宛先。名前を呼ばれずに返事をしてよい相手の記録に使う。
+	 * @param opts force は発言数の制限と重複判定を、bypassMute は沈黙を迂回する。
+	 *             使ってよいのは「黙れ」への謝罪だけ。
+	 * @returns 実際に送ったら true。抑制されたら false。
+	 */
+	private async speak(
+		text: string,
+		addressee: string | null,
+		opts?: { force?: boolean; bypassMute?: boolean },
+	): Promise<boolean> {
+		const message = text.trim();
+		if (!message) return false;
+
+		const now = Date.now();
+
+		// 黙れと言われている間は喋らない。迂回できるのは、その「黙れ」に
+		// 対する謝罪だけ（acceptMute からの bypassMute）。
+		if (!opts?.bypassMute && now < this.mutedUntil) {
+			this.log(`(黙っている間なので飲み込んだ) ${message}`);
+			return false;
+		}
+
+		if (!opts?.force) {
+			this.recentUtterances = this.recentUtterances.filter((t) => now - t < CHAT_RATE_WINDOW_MS);
+			if (this.recentUtterances.length >= CHAT_RATE_MAX) {
+				this.log(
+					`(喋りすぎなので飲み込んだ: ${CHAT_RATE_WINDOW_MS / 1000}秒で${CHAT_RATE_MAX}回) ${message}`,
+				);
+				return false;
+			}
+
+			// 「今から木集めてくるよ」を何度も送るのを止める。プロンプトの
+			// 「同じ返事を繰り返さないこと」は守られない。実測で1時間に
+			// ほぼ同じ文面を15回送っていた。
+			if (isSameSimhash(message, this.profile.minecraftName, this.outgoingSimhashCache)) {
+				this.log(`(直前と同じ内容なので飲み込んだ) ${message}`);
+				return false;
+			}
+		}
+
+		await this.driver.chat(message).catch((e) => this.log(`発言に失敗: ${e}`));
+		this.recentUtterances.push(now);
+		this.conversation.record(this.profile.minecraftName, message, "self");
+		appendChatLog("out", this.profile.minecraftName, message);
+		this.log(`-> ${message}`);
+		this.noteAddressed(addressee);
+		return true;
+	}
+
+	/**
+	 * 誰に向かって喋ったかを控える。
+	 *
+	 * 同じ相手に喋り続けても回数は増やさない。増やすと自分の返事で枠が
+	 * 補充され、窓が閉じなくなる。回数を配り直すのは名前を呼ばれたときだけ。
+	 */
+	private noteAddressed(addressee: string | null): void {
+		if (!addressee) {
+			this.followUp = null;
+			return;
+		}
+		const until = Date.now() + ADDRESSED_FOLLOWUP_MS;
+		if (this.followUp?.name === addressee) {
+			this.followUp.until = until;
+			return;
+		}
+		this.followUp = { name: addressee, until, left: ADDRESSED_FOLLOWUP_TURNS };
 	}
 
 	/** 返事を書くために渡す「今の状況」。嘘を言わせないための材料。 */
@@ -746,6 +975,8 @@ export class MinecraftAgent {
 
 		// --- 状態監視（重複登録を避けるためここで行う） ---
 		this.bot.on("health", () => this.handleHealthChange());
+		// 死亡ログは周りの全員のチャット欄に流れる。撒き散らしていないか数える。
+		this.bot.on("death", () => this.noteDeath());
 		this.bot.on("entityHurt", (entity) => this.handleEntityHurt(entity));
 		this.bot.on("move", () => this.handleEnvironmentCheck());
 
@@ -1625,10 +1856,9 @@ export class MinecraftAgent {
 				this.chatSimhashCache,
 			);
 			if (isNewChat && this.updateFIFO(this.strategicState.chats, chatMessage)) {
-				await this.driver.chat(chatMessage).catch((e) => this.log(`発言に失敗: ${e}`));
-				this.lastSelfSpokeAt = Date.now();
-				this.conversation.record(this.profile.minecraftName, chatMessage, "self");
-				appendChatLog("out", this.profile.minecraftName, chatMessage);
+				// 独り言なので宛先は無い。宛先を渡すと、返事でもないのに
+				// 「続きの返信」の枠が開いてしまう。
+				await this.speak(chatMessage, null);
 			}
 		}
 
@@ -2176,6 +2406,8 @@ export class MinecraftAgent {
 			// ここで待つと反射ループそのものが詰まる。結果は後続の反射に
 			// 依存しないので、投げっぱなしで構わない。
 			this.maybeGreetNearbyPlayer();
+			// 寝るのが先。潜って夜をやり過ごすと、他の人は朝を迎えられない。
+			if (await this.sleepIfOthersSleeping(signal)) return;
 			if (await this.shelterAtNight(signal)) return;
 			await this.escapeIfBoxedIn(signal);
 		} catch (e) {
@@ -2194,6 +2426,9 @@ export class MinecraftAgent {
 	 */
 	private maybeGreetNearbyPlayer(): void {
 		if (this.isReplying) return;
+		// 黙るように言われている間は、自分から話しかけない。返事を控えるだけで
+		// 挨拶を続けたら、黙ったことにならない。
+		if (Date.now() < this.mutedUntil) return;
 		const state = this.driver.getState();
 		if (!state.isReady || state.health <= 0) return;
 		// 誰かの発言をつい最近受けているなら、本物の会話が始まっている/
@@ -2260,11 +2495,7 @@ export class MinecraftAgent {
 
 			if (!result.reply) return;
 
-			await this.driver.chat(result.reply).catch((e) => this.log(`発言に失敗: ${e}`));
-			this.lastSelfSpokeAt = Date.now();
-			this.conversation.record(this.profile.minecraftName, result.reply, "self");
-			appendChatLog("out", this.profile.minecraftName, result.reply);
-			this.log(`-> ${result.reply}`);
+			await this.speak(result.reply, target);
 		} finally {
 			this.isReplying = false;
 		}
@@ -2436,6 +2667,76 @@ export class MinecraftAgent {
 		return sheltering;
 	}
 
+	/**
+	 * 誰かがベッドに入っていたら、自分も寝る。
+	 *
+	 * 統合版は全員が寝ないと夜を飛ばせない。起きているのがボット1体でも
+	 * 他の人は朝を迎えられず、これは会話の割り込みより実害が大きい。
+	 * 自分のベッドは持っていないので、近くにある人のベッドを借りる
+	 * （バニラでは他人のベッドでも寝られる。リスポーン地点が移るだけ）。
+	 *
+	 * 戻り値が true なら、この周の他の反射は行わない。
+	 */
+	private async sleepIfOthersSleeping(signal: AbortSignal): Promise<boolean> {
+		if (Date.now() - this.othersSleepingAt > SLEEP_REQUEST_TTL_MS) return false;
+
+		// もう入っている。ベッドをもう一度叩くと自分が起きてしまうので、
+		// 寝ている扱いのまま何もしない。就寝の通知は自分がベッドに入った
+		// ときにも飛んでくるため、この歯止めが無いと寝る・起きるを繰り返す。
+		if (Date.now() - this.lastBedActivatedAt < SLEEP_REQUEST_TTL_MS) return true;
+
+		const state = this.driver.getState();
+		if (!state.isReady || state.health <= 0) return false;
+		// ネザーとエンドでベッドを使うと爆発する。寝る話ではない。
+		if (state.dimension && !state.dimension.includes("overworld")) return false;
+
+		const beds = this.driver.world.findBlocksMatching(
+			(name) => name === "bed" || name.endsWith("_bed"),
+			BED_SEARCH_RADIUS,
+			1,
+		);
+		const bed = beds[0];
+		if (!bed) {
+			// 無いものは探し直しても無い。毎周探して報告し続けないよう、
+			// 知らせを消してこの夜は諦める。
+			this.othersSleepingAt = 0;
+			this.log("[反射] 誰か寝ているが、届く範囲にベッドが無い");
+			return false;
+		}
+
+		this.log("[反射] 誰かが寝ている。ベッドへ向かう");
+		try {
+			await this.driver.goto(signal, { kind: "getToBlock", position: bed.position });
+			await this.driver.activateBlock(bed.position);
+			this.lastBedActivatedAt = Date.now();
+		} catch (e) {
+			if (!signal.aborted) this.log(`ベッドに入れなかった: ${e}`);
+			// 一度失敗したら諦める。夜が明けるまで往復し続ける方が邪魔になる。
+			this.othersSleepingAt = 0;
+			return false;
+		}
+		return true;
+	}
+
+	/** 死んだ時刻を控える。死にすぎていないかを見るために持つ。 */
+	private noteDeath(): void {
+		this.recentDeaths.push(Date.now());
+		if (this.recentDeaths.length > 32) this.recentDeaths.splice(0, this.recentDeaths.length - 32);
+	}
+
+	/**
+	 * 短い間に死に続けているか。
+	 *
+	 * 死ぬたびにサーバーの死亡ログが全員のチャット欄に流れる。実測では
+	 * 1日で141行、他の人の画面はほぼこれで埋まっていた。装備が揃っていても、
+	 * 死に続けているなら夜歩きをやめさせる根拠になる。
+	 */
+	private isDyingRepeatedly(): boolean {
+		const cutoff = Date.now() - DEATH_STORM_WINDOW_MS;
+		this.recentDeaths = this.recentDeaths.filter((t) => t >= cutoff);
+		return this.recentDeaths.length >= DEATH_STORM_LIMIT;
+	}
+
 	/** 潜るべきか判断し、必要なら実際に潜る。戻り値は「今潜っている扱いか」。 */
 	private async decideShelter(signal: AbortSignal): Promise<boolean> {
 		const state = this.driver.getState();
@@ -2449,7 +2750,10 @@ export class MinecraftAgent {
 		const hurt =
 			state.health <= SHELTER_HEALTH &&
 			this.driver.nearbyEntities(12).some((e) => isHostileMob(e.name));
-		if (!night && !hurt) return false;
+		// 装備が揃っていても、死に続けているなら出歩かせない。死亡ログは
+		// 死んだ本人ではなく、周りの全員のチャット欄を潰す。
+		const dying = this.isDyingRepeatedly();
+		if (!night && !hurt && !dying) return false;
 
 		const armed = this.hasWeapon();
 		// 着ている防具は items() に出てこない。持ち物だけを見ると、
@@ -2458,8 +2762,8 @@ export class MinecraftAgent {
 		const armored =
 			this.driver.inventory.armor().some((i) => i !== null) ||
 			this.driver.inventory.items().some((i) => ARMOR_SUFFIXES.some((suf) => i.name.endsWith(suf)));
-		// 傷ついているときは装備の有無に関わらず退く。
-		if (!hurt && (armed || armored)) return false;
+		// 傷ついているとき、死に続けているときは、装備の有無に関わらず退く。
+		if (!hurt && !dying && (armed || armored)) return false;
 
 		// 既に潜れているなら、そのまま待つ。
 		const pos = state.position;
@@ -2471,7 +2775,11 @@ export class MinecraftAgent {
 		if (Date.now() - this.lastBurrowAt < BURROW_COOLDOWN_MS) return true;
 
 		this.log(
-			hurt ? `[反射] 体力 ${state.health}。潜って回復を待つ` : "[反射] 夜で丸腰。潜ってやり過ごす",
+			dying
+				? `[反射] ${DEATH_STORM_WINDOW_MS / 60_000}分で${this.recentDeaths.length}回死んだ。潜って止める`
+				: hurt
+					? `[反射] 体力 ${state.health}。潜って回復を待つ`
+					: "[反射] 夜で丸腰。潜ってやり過ごす",
 		);
 		this.lastBurrowAt = Date.now();
 		await this.burrow(signal);

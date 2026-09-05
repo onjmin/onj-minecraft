@@ -31,7 +31,7 @@ import { gotoDeathPointSkill } from "../skills/goto/death";
 import { gotoPlayerSkill } from "../skills/goto/player";
 import { gotoSurfaceSkill } from "../skills/goto/surface";
 import { giveItemSkill } from "../skills/social/give";
-import { isLeaveRequest, shouldYieldSeat } from "./bedrock-session";
+import { isLeaveRequest, shouldYieldForSleep, shouldYieldSeat } from "./bedrock-session";
 
 // 統合版でもスキルは一通り動く。Driver 層が Java 版との差を吸収しているので
 // skills/ 側は共通のものをそのまま使う。
@@ -114,6 +114,15 @@ async function main() {
 	driver.on("chat", (from: string, message: string) => {
 		if (isLeaveRequest(message)) {
 			void yieldSeat(`${from} に退出を頼まれた`);
+		}
+	});
+
+	// 自分以外の全員がベッドに入ったら、寝られない自分が夜明けの邪魔をして
+	// いることになる。謝るだけで居座らず、席を譲って夜を明けさせる。
+	driver.on("sleeping", (count: number) => {
+		const self = driver.getState().username;
+		if (shouldYieldForSleep(driver, self, count)) {
+			void yieldSeat("他の全員が就寝した");
 		}
 	});
 

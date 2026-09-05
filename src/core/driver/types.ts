@@ -246,6 +246,10 @@ export interface BotDriver {
 			| "killed_by_player"
 			// サーバーにいる人の一覧が変わった
 			| "players"
+			// 誰かがベッドに入った。引数は就寝中の人数(自分を含む)。
+			// 統合版のみが発火する。Java版(mineflayer)にこの通知は無く、
+			// 購読しても呼ばれないだけで害は無い。
+			| "sleeping"
 			| "kicked"
 			| "end",
 		listener: (...args: any[]) => void,
