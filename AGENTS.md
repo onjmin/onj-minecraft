@@ -35,6 +35,14 @@ docker run --rm -v $(pwd)/node_modules:/output onj-minecraft cp -r /app/node_mod
 - エージェントの狀態管理
 - スキル実装のパターン
 
+### コード改修時の反映ルール
+
+ボット稼働中に TypeScript / ソースコードを改修した場合：
+1. `npx tsc --noEmit` および `npx biome check` で型と構文を検証する。
+2. ホットリロードはサイドカー残留や `duplicate_login` を引き起こすため使用しない。
+3. **指示を待たずに `bash scripts/run-bedrock.sh` で再起動して反映すること。**
+4. 改修タスクの完了条件には「再起動とプロセスの稼働確認（アカウントが `kusabot2361` であること）」までを含む。
+
 ## 統合版(Bedrock)の動かし方
 
 ### 本番 Realms に繋ぐ

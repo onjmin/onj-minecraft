@@ -37,6 +37,13 @@ export interface ChatSituation {
 	 * 人ではなくキルログに返事をする。事実としては要るので、状況として渡す。
 	 */
 	recentEvents?: string[];
+	/**
+	 * Minecraft Wiki等から取得した参考知識（レシピ、Mobの出現確率、アイテム仕様など）。
+	 * 質問されたときに回答の材料として使う。
+	 */
+	minecraftKnowledge?: string;
+	/** 冷笑モードが有効かどうか */
+	isCynicalMode?: boolean;
 }
 
 /**
@@ -82,6 +89,8 @@ export class Conversation {
 	private turns: ChatTurn[] = [];
 	/** サーバーからの通知。会話とは別の入れ物に持つ。 */
 	private events: ChatTurn[] = [];
+	/** 冷笑モードの有効状態 */
+	private cynicalMode = false;
 
 	/**
 	 * modelOverride はモデルを比べるとき用。本番では渡さず、
@@ -91,6 +100,14 @@ export class Conversation {
 		private profile: AgentProfile,
 		private modelOverride?: string,
 	) {}
+
+	get isCynicalMode(): boolean {
+		return this.cynicalMode;
+	}
+
+	setCynicalMode(enabled: boolean): void {
+		this.cynicalMode = enabled;
+	}
 
 	/**
 	 * 発言を記録する。相手のものも自分のものも、同じ列に時系列で積む。
@@ -258,6 +275,33 @@ export class Conversation {
 					.filter(Boolean)
 					.join("\n"),
 			);
+		}
+		const isCynical = s.isCynicalMode ?? this.cynicalMode;
+
+		if (isCynical) {
+			sections.push(
+				[
+					"=== 冷笑モード有効中（冷笑構文ミーム） ===",
+					"現在、あなたは【冷笑モード】です。ネットミームとしての冷笑構文を使い、相手の発言や状況を軽く茶化してシニカルに受け流してください。",
+					"- 相手を直接的に傷つける罵倒・汚言（死ね・カス等）ではなく、配信やSNSで使われる定型の冷笑フレーズを使って一言返してください。",
+					"- 1〜2文、長くても50文字程度。短く切れ味よく返すこと。",
+					"",
+					"【参考語彙・フレーズ】",
+					"  - 基本: 「うおw」「どわーｗ」「ったく…w」",
+					"  - あきれ・達観: 「あぁ、そういうノリ...w」「えー！すっーご！そこまで！？」「ど、どした？笑」「ちょw1回落ち着けw」",
+					"  - からかい・ツッコミ: 「ええてw」「ちょwお前必死やんww」「すごいなあキミww」「きちーw」「冗談ですやんw」「おもろいなあw」「かっこよw」「えぐー！笑」",
+					"",
+					"- 通常ルールの「煽り・茶化し禁止」「素直にお礼だけ言う」は解除されます。冷笑構文によるシニカルな受け流しを優先してください。",
+					"- ただし Minecraft の知識（レシピ、出現確率、仕様等）を聞かれた場合は、冷笑構文のノリを交えつつ正確に教えてあげてください（例: 「うおw 金床は鉄ブロック3個と鉄インゴット4個やで笑」「青いウーパールーパーは繁殖で1/1200の確率やでw」）。これは作業依頼ではないので断らないこと。",
+					"- 相手が不快感を示したり（「不快」「嫌だ」「やめて」「感じ悪い」など）、通常に戻すよう言ってきた場合は、シニカルな返答を直ちにやめ、「ごめん、普通に戻すね」のように素直に謝って通常の話し方に戻してください。",
+					"- 自分の名前を先頭に付けないでください。発言の中身だけを書くこと。",
+					"- 絵文字（😅等）や特殊記号は文字化けを防ぐため使わず、上記のようなテキスト（w、笑など）を使ってください。",
+					lang ? `- ${lang}で書いてください。` : "",
+					"- 自分に向けられていない雑談なら、黙っていてよいです（Reply を none にする）。",
+				]
+					.filter(Boolean)
+					.join("\n"),
+			);
 		} else {
 			sections.push(
 				[
@@ -266,7 +310,8 @@ export class Conversation {
 					"- 1〜2文、長くても60文字程度。ゲーム内チャットなので長文は読まれません。",
 					"- 「今の状況」に書かれていないことを、あるかのように言わないでください。",
 					"  座標・持ち物・体力を聞かれたら、上の値をそのまま使うこと。",
-					"- できないことを頼まれたら、正直に断ってください。",
+					"- ただし Minecraft のゲーム知識（レシピ、アイテムの作り方、Mobの出現条件・確率、ゲームの仕様など）を聞かれた場合は、「参考知識」や一般的な知識を使って短く親切に答えてください。これは作業依頼ではないので断らないこと。",
+					"- できないことの作業を頼まれたら、正直に断ってください。",
 					"- 同じ返事を繰り返さないこと。前と同じことを聞かれたら言い方を変えるか、",
 					"  「さっきも言ったけど」と前置きしてください。",
 					"- これからやることを予告しないでください。「今から◯◯してくるよ」「待っててね」は",
@@ -297,10 +342,11 @@ export class Conversation {
 				"Reply: (実際に喋る一言。黙るなら none)",
 				opts?.mode === "greet"
 					? "Request: (自分から申し出た作業を一文で要約。何も申し出ないなら none)"
-					: "Request: (相手から受けた作業の依頼を一文で要約。依頼でなければ none)",
+					: "Request: (相手から受けた作業の依頼を一文で要約。レシピや知識の質問など依頼でなければ none)",
 				"",
 				"Request は、断った場合や今できない場合でもそのまま書いてください。",
 				"できるかどうかを決めるのは別の担当で、ここは「何を頼まれたか」を残す欄です。",
+				"相手がゲーム知識や作り方・情報を質問しているだけの場合は作業依頼ではないので、Request は none にしてください。",
 			].join("\n"),
 		);
 
@@ -357,6 +403,9 @@ function describeSituation(s: ChatSituation): string {
 	if (s.skillNames?.length) {
 		lines.push(`できること: ${s.skillNames.join(", ")}`);
 		lines.push("これ以外のことは頼まれてもできません。");
+	}
+	if (s.minecraftKnowledge) {
+		lines.push(`=== Minecraft の参考知識 ===\n${s.minecraftKnowledge}`);
 	}
 
 	return lines.join("\n");
@@ -423,7 +472,7 @@ export function sanitizeUtterance(raw: string, selfName: string): string {
 
 	// Markdown の強調と囲み引用符
 	text = text.replace(/\*\*(.*?)\*\*/g, "$1").replace(/[*_`]/g, "");
-	text = text.replace(/^["'“「](.*)["'”」]$/s, "$1").trim();
+	text = text.replace(/^["'“「『《«](.*)["'”」』》»]$/s, "$1").trim();
 
 	if (isNone(text)) return "";
 

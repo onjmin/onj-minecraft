@@ -13,6 +13,7 @@ import { type ChatSituation, Conversation } from "./conversation";
 import { EAT_BELOW_FOOD, pickFood } from "./driver/food";
 import { JavaDriver } from "./driver/java";
 import type { BotDriver, Position } from "./driver/types";
+import { fetchMinecraftKnowledge } from "./knowledge/wiki";
 import { chatLlm, llm } from "./llm-client";
 import { parseLlmOutput } from "./llm-output-parser";
 import { createPerceptionSnapshot, type DamageInfo } from "./perception";
@@ -451,6 +452,10 @@ export class MinecraftAgent {
 		activeAgents.push(this);
 		this.skills = new Map(skillList.map((t) => [t.name, t]));
 		this.conversation = new Conversation(profile);
+		if (process.env.REISHO_MODE === "true" || process.env.CYNICAL_MODE === "true") {
+			this.conversation.setCynicalMode(true);
+			console.log("[Conversation] Cynical (冷笑) mode enabled by environment variable");
+		}
 		console.log(`[Chat] model=${chatLlm.modelName} endpoint=${chatLlm.endpoint}`);
 
 		if (injectedDriver) {
@@ -627,6 +632,12 @@ export class MinecraftAgent {
 			return;
 		}
 
+		// 冷笑モードの切り替え・不快反応による解除
+		if (this.isCynicalModeToggle(username, message)) {
+			void this.handleCynicalModeToggle(username, message);
+			return;
+		}
+
 		// 自分に向けられていなさそうな発言には、記録だけして返事を作らない。
 		// 以前は聞こえた発言すべてでLLMに「返事すべきか」を判断させていたが、
 		// 人が多い場では誤って割り込む頻度が上がる
@@ -722,10 +733,189 @@ export class MinecraftAgent {
 		// 先に立てる。謝る間に届いた発言へ返事をしてしまわないため。
 		this.mutedUntil = Date.now() + CHAT_MUTE_MS;
 		this.followUp = null;
+		if (this.conversation.isCynicalMode) {
+			this.conversation.setCynicalMode(false);
+			this.log(`[会話] ${username} から苦情があったため冷笑モードを解除`);
+		}
 		this.log(`[会話] ${username} に止められた。${CHAT_MUTE_MS / 60_000}分黙る`);
 		// すでに黙っている最中なら、謝り直さない。謝罪を繰り返すのも喋りすぎ。
 		if (alreadyMuted) return;
 		await this.speak("ごめん、しばらく黙るね", null, { force: true, bypassMute: true });
+	}
+
+	/**
+	 * 冷笑モード有効化の指示かどうかを判定する。
+	 * 例: 「これから冷笑してください」「冷笑して」「冷笑モードにして」「!reisho on」など
+	 */
+	private isCynicalModeEnableRequest(username: string, message: string): boolean {
+		const text = message.trim();
+		const lower = text.toLowerCase();
+		if (
+			lower === "!reisho on" ||
+			lower === "!cynical on" ||
+			lower === "!reisho 1" ||
+			lower === "!cynical 1"
+		) {
+			return true;
+		}
+		if (lower === "!reisho" || lower === "!cynical") {
+			return !this.conversation.isCynicalMode;
+		}
+
+		// 「冷笑」「シニカル」が含まれているか
+		if (/(冷笑|シニカル)/.test(text)) {
+			// 解除・否定語が含まれている場合は除外
+			if (
+				/(やめ|解除|オフ|off|戻|終了|おしまい|終わり|ストップ|いらない|不要|嫌|禁止)/.test(text)
+			) {
+				return false;
+			}
+			// 有効化・指示表現（「これから冷笑してください」「冷笑して」「冷笑モードで」「冷笑で話して」等）
+			if (
+				/(して|モード|キャラ|路線|頼む|お願い|よろしく|やって|いって|オン|on|開始|スタート|移行|で話|で喋|で返)/.test(
+					text,
+				)
+			) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * 冷笑モードの解除・通常復帰要求、または不快・苦情の反応かどうかを判定する。
+	 * 例: 「不快」「感じ悪い」「煽るな」「冷笑やめて」「通常モードにして」「!reisho off」など
+	 */
+	private isDispleasureOrRevertRequest(
+		username: string,
+		message: string,
+	): { matches: boolean; isDispleasure: boolean } {
+		const text = message.trim();
+		const lower = text.toLowerCase();
+		if (
+			lower === "!reisho off" ||
+			lower === "!cynical off" ||
+			lower === "!reisho 0" ||
+			lower === "!normal"
+		) {
+			return { matches: true, isDispleasure: false };
+		}
+		if (lower === "!reisho" || lower === "!cynical") {
+			if (this.conversation.isCynicalMode) {
+				return { matches: true, isDispleasure: false };
+			}
+		}
+
+		// 明示的な冷笑停止・通常復帰要求
+		if (
+			/(冷笑|シニカル).*(やめて|やめろ|やめ|解除|オフ|off|終了|おしまい|終わり|戻して|いらない|不要|ストップ)/.test(
+				text,
+			)
+		) {
+			return { matches: true, isDispleasure: false };
+		}
+		if (/(通常|普通|ノーマル).*(モード|[でにも]話|[でにも]喋|[でにも]戻|にして)/.test(text)) {
+			return { matches: true, isDispleasure: false };
+		}
+
+		// 冷笑モード稼働中に「不快」「嫌悪」「苦情」が反応された場合
+		if (this.conversation.isCynicalMode) {
+			const displeasureKeywords = [
+				"不快",
+				"不愉快",
+				"気分悪",
+				"感じ悪",
+				"態度悪",
+				"性格悪",
+				"煽るな",
+				"煽らないで",
+				"茶化すな",
+				"茶化さないで",
+				"バカにするな",
+				"馬鹿にするな",
+				"見下すな",
+				"面白くない",
+				"おもしろくない",
+				"つまらん",
+				"つまらない",
+				"滑ってる",
+				"すべってる",
+				"寒い",
+				"サムい",
+				"キモい",
+				"きもい",
+				"ウザい",
+				"うざい",
+				"うざ",
+				"嫌味",
+				"嫌だ",
+				"嫌なんだけど",
+				"ムカつく",
+				"むかつく",
+				"イラつく",
+				"いらつく",
+				"腹立つ",
+				"真面目に",
+				"まじめに",
+				"きつい",
+				"ノリがきつい",
+			];
+			if (displeasureKeywords.some((k) => text.includes(k))) {
+				return { matches: true, isDispleasure: true };
+			}
+		}
+
+		return { matches: false, isDispleasure: false };
+	}
+
+	/**
+	 * 発言が冷笑モードの切り替え要求・不快反応かどうかを判定する。
+	 */
+	private isCynicalModeToggle(username: string, message: string): boolean {
+		const revert = this.isDispleasureOrRevertRequest(username, message);
+		if (revert.matches) return true;
+
+		return this.isCynicalModeEnableRequest(username, message);
+	}
+
+	/**
+	 * 冷笑モードの切り替えや不快時の通常復帰を実行し、ゲーム内チャットで案内する。
+	 */
+	private async handleCynicalModeToggle(username: string, message: string): Promise<void> {
+		const revert = this.isDispleasureOrRevertRequest(username, message);
+		if (revert.matches) {
+			if (this.conversation.isCynicalMode) {
+				this.conversation.setCynicalMode(false);
+				if (revert.isDispleasure) {
+					this.log(`[会話] ${username} の反応（不快感・苦情）を検知して冷笑モードを解除`);
+					await this.speak("ごめんね、嫌な思いさせちゃって。普通の話し方に戻るよ", username, {
+						force: true,
+					});
+				} else {
+					this.log(`[会話] ${username} の指示で冷笑モードを解除`);
+					await this.speak("冷笑モード解除したよ。通常モードに戻るね", username, { force: true });
+				}
+			} else {
+				await this.speak("今はすでに通常モードだよ", username, { force: true });
+			}
+			return;
+		}
+
+		if (this.isCynicalModeEnableRequest(username, message)) {
+			if (this.conversation.isCynicalMode) {
+				await this.speak("あぁ、そういうノリ...w もう冷笑モード入ってるで笑", username, {
+					force: true,
+				});
+			} else {
+				this.conversation.setCynicalMode(true);
+				this.log(`[会話] ${username} の指示で冷笑モードを有効化`);
+				await this.speak("あぁ、そういうノリ...w これから冷笑モードいくで笑", username, {
+					force: true,
+				});
+			}
+			return;
+		}
 	}
 
 	/**
@@ -746,9 +936,15 @@ export class MinecraftAgent {
 				this.replyAgain = false;
 				const heardAt = this.lastHeardAt;
 
+				const lastOther = this.conversation.lastFromOthers();
+				const knowledge = lastOther ? await fetchMinecraftKnowledge(lastOther.message) : null;
+				if (knowledge) {
+					this.log(`[Wiki検索] ${lastOther?.message} -> 参考知識を取得`);
+				}
+
 				let result: { reply: string; request: string | null };
 				try {
-					result = await this.conversation.respond(this.getChatSituation());
+					result = await this.conversation.respond(this.getChatSituation(knowledge ?? undefined));
 				} catch (err) {
 					this.log(`Chat error: ${err}`);
 					return;
@@ -775,6 +971,21 @@ export class MinecraftAgent {
 				if (!result.reply) {
 					this.log("(返事なしと判断した)");
 					continue;
+				}
+
+				// LLM応答によるモード同期のセーフティネット
+				if (
+					this.conversation.isCynicalMode &&
+					/(通常モード|普通の話し方|普通に話す|普通に戻|通常に戻)/.test(result.reply)
+				) {
+					this.conversation.setCynicalMode(false);
+					this.log("[会話] LLM応答に基づき冷笑モードを解除");
+				} else if (
+					!this.conversation.isCynicalMode &&
+					/冷笑.*(いく|入る|始める|オン)/.test(result.reply)
+				) {
+					this.conversation.setCynicalMode(true);
+					this.log("[会話] LLM応答に基づき冷笑モードを有効化");
 				}
 
 				await this.speak(result.reply, this.conversation.lastFromOthers()?.speaker ?? null);
@@ -864,7 +1075,7 @@ export class MinecraftAgent {
 	}
 
 	/** 返事を書くために渡す「今の状況」。嘘を言わせないための材料。 */
-	private getChatSituation(): ChatSituation {
+	private getChatSituation(minecraftKnowledge?: string): ChatSituation {
 		const state = this.driver.getState();
 		const ready = state.isReady;
 		const inventory = this.driver.inventory
@@ -885,6 +1096,8 @@ export class MinecraftAgent {
 			nearbyPlayers: ready ? this.nearbyPlayerNames() : [],
 			// 通知は会話の列ではなくこちらで渡す。返事の宛先にはさせない。
 			recentEvents: this.conversation.recentEvents(),
+			minecraftKnowledge,
+			isCynicalMode: this.conversation.isCynicalMode,
 		};
 	}
 
