@@ -1,0 +1,59 @@
+# 開発用のローカル統合版サーバー。
+#
+# 本番の Realms は他プレイヤーが常時いるため、採掘や設置のような世界を壊す検証を
+# そこで回すわけにはいかない。同じプロトコルのサーバーを手元に立てて、そちらで
+# 作り込む。
+#
+# 接続経路は本番と異なる点に注意。Realms は NetherNet(WebRTC) だが、ここは
+# RakNet(UDP) なので、サイドカーは -address で直に繋ぐ。認証も通らないので
+# online-mode は切ってある。プロトコルより上の層（チャンク解析・採掘・設置）は
+# 両者で共通なので、その開発には使える。
+#
+# 起動:
+#   docker compose -f docker-compose.bedrock-dev.yml up -d
+# 接続確認:
+#   npx tsx src/core/driver/bedrock-check.ts   (BEDROCK_ADDRESS=127.0.0.1:19132)
+# 片付け:
+#   docker compose -f docker-compose.bedrock-dev.yml down
+services:
+  bedrock-dev:
+    image: itzg/minecraft-bedrock-server
+    container_name: onj-bedrock-dev
+    # サイドカーの gophertunnel は protocol 2169 (1.26.45) に固定されている。
+    # ここがずれると接続すらできない。Java 側で 26.2 に上げて繋がらなくなった
+    # のと同じ失敗なので、必ず突き合わせてから上げること。
+    environment:
+      EULA: "TRUE"
+      VERSION: "1.26.45.1"
+      # 認証を通さずに繋ぐため。開発専用で、外部に開けないこと。
+      ONLINE_MODE: "false"
+      # online-mode を切ると allow-list は使えない（サーバーが起動を拒否する）。
+      ALLOW_LIST: "false"
+      SERVER_NAME: "onj-bedrock-dev"
+      GAMEMODE: "survival"
+      DIFFICULTY: "easy"
+      # 検証の下準備にコマンドを使いたいので有効にする（本番 Realm は無効）。
+      ALLOW_CHEATS: "true"
+      # 既定は平地。起伏や木があると移動速度の素の値が測れず、採掘・設置の
+      # 検証も足場が一定な方が読みやすい。経路探索を試すときだけ DEFAULT にする。
+      LEVEL_TYPE: "${BEDROCK_LEVEL_TYPE:-FLAT}"
+      # 毎回同じ地形にして、掘る/置くの検証を再現可能にする。
+      LEVEL_SEED: "12345"
+      LEVEL_NAME: "${BEDROCK_LEVEL_NAME:-onj-flat2}"
+      # ボット1体しか繋がないので広くする必要はない。
+      MAX_PLAYERS: "4"
+      VIEW_DISTANCE: "8"
+      TICK_DISTANCE: "4"
+      # 夜や敵に邪魔されると検証が安定しないため。
+      DEFAULT_PLAYER_PERMISSION_LEVEL: "operator"
+    ports:
+      # Windows で直接サーバーを動かすときと併存できるよう、外側は差し替え可能。
+      - "${BEDROCK_PORT:-19132}:19132/udp"
+    volumes:
+      - bedrock-dev-data:/data
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+
+volumes:
+  bedrock-dev-data:

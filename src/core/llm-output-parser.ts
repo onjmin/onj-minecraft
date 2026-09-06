@@ -78,12 +78,21 @@ export function parseSkillField(rawSkill: string) {
 	// 1行目を取得して処理
 	const line = rawSkill.split("\n")[0].trim();
 
+	// 「skillName(a: 1, b: 2)」の関数呼び出し形。ローカルモデルが最もよく出す形で、
+	// カンマで頭と尾に割ると最初の引数が head 側に埋もれて丸ごと落ちる。
+	// 括弧の中身をまとめて引数として扱う。
+	const callForm = line.match(/^([a-zA-Z0-9._-]+)\s*\(([\s\S]*)\)\s*$/);
+
 	// 「skillName, json...」のパターンを検出
 	const firstComma = line.indexOf(",");
 	const head = firstComma === -1 ? line : line.slice(0, firstComma).trim();
-	const tail = firstComma === -1 ? "" : line.slice(firstComma + 1).trim();
+	const tail = callForm
+		? callForm[2].trim()
+		: firstComma === -1
+			? ""
+			: line.slice(firstComma + 1).trim();
 
-	const skillNameMatch = head.match(/^([a-zA-Z0-9._-]+)/);
+	const skillNameMatch = (callForm ? callForm[1] : head).match(/^([a-zA-Z0-9._-]+)/);
 	const name = skillNameMatch ? skillNameMatch[1] : null;
 	let args: Record<string, any> = {};
 
@@ -105,13 +114,47 @@ export function parseSkillField(rawSkill: string) {
 		}
 	}
 
-	return { name, args };
+	// キー名が付いていれば位置引数は見ない。両方あるときは名前付きの方が確実。
+	const positional = tail && Object.keys(args).length === 0 ? parsePositionalArgs(tail) : [];
+
+	return { name, args, positional };
+}
+
+/** "-926" → -926、"true" → true。それ以外は文字列のまま。 */
+function coerceValue(rawVal: string): unknown {
+	// 負数と小数も数値として扱う。座標は普通に負になるので、
+	// ここで弾くと文字列のまま渡って検証に落ちる。
+	if (/^[+-]?\d+(?:\.\d+)?$/.test(rawVal)) return Number(rawVal);
+	if (/^(true|false)$/i.test(rawVal)) return rawVal.toLowerCase() === "true";
+	return rawVal;
+}
+
+/**
+ * キー名の無い引数を並び順のまま取り出す。
+ *
+ * `goto.coords(586, 0, -923)` のように位置引数だけで書かれることがある。
+ * 対応するキー名はスキルの inputSchema にしかないので、ここでは値の並びだけを
+ * 返し、名前の割り当ては呼び出し側(agent)に任せる。
+ */
+function parsePositionalArgs(argStr: string): unknown[] {
+	return argStr
+		.split(",")
+		.map((part) =>
+			part
+				.trim()
+				.replace(/^[("']+|[)"']+$/g, "")
+				.trim(),
+		)
+		.filter((part) => part.length > 0 && !/[:=]/.test(part))
+		.map(coerceValue);
 }
 
 function parseKeyValueArgs(argStr: string) {
 	const parsed: Record<string, any> = {};
 	// key: "value" か key: 'value' か key: value のいずれかにマッチ
-	const kvRegex = /(\w+)\s*[:=]\s*(?:"([^"]*)"|'([^']*)'|([^\s,]+))/g;
+	// 括弧やカンマは値に含めない。含めると "-926)" のような値ができ、
+	// 数値判定にも Number() にも通らないまま座標として使われる。
+	const kvRegex = /(\w+)\s*[:=]\s*(?:"([^"]*)"|'([^']*)'|([^\s,()]+))/g;
 	let m: RegExpExecArray | null;
 
 	while (true) {
@@ -121,15 +164,7 @@ function parseKeyValueArgs(argStr: string) {
 		const key = m[1];
 		const rawVal = m[2] ?? m[3] ?? m[4] ?? "";
 
-		let val: unknown = rawVal;
-
-		if (/^\d+$/.test(rawVal)) {
-			val = Number(rawVal);
-		} else if (/^(true|false)$/i.test(rawVal)) {
-			val = rawVal.toLowerCase() === "true";
-		}
-
-		parsed[key] = val;
+		parsed[key] = coerceValue(rawVal);
 	}
 	return parsed;
 }
@@ -139,6 +174,11 @@ export interface ParsedThought {
 	action?: {
 		name: string;
 		args?: Record<string, any>;
+		/**
+		 * キー名の無い引数を並び順のまま渡す。スキルの inputSchema と
+		 * 突き合わせて名前を付けるのは agent の仕事。
+		 */
+		positional?: unknown[];
 	};
 	memory?: string;
 }
@@ -160,11 +200,12 @@ export function parseLlmOutput(rawContent: string): ParsedThought {
 	}
 
 	// ③ Skill → action
-	const { name, args } = parseSkillField(sections.skill);
+	const { name, args, positional } = parseSkillField(sections.skill);
 	if (name) {
 		result.action = {
 			name,
 			args,
+			positional,
 		};
 	}
 

@@ -137,3 +137,15 @@ dist
 # Vite logs files
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# 統合版の認証トークンキャッシュ
+.bedrock-auth/
+
+# サイドカーのビルド成果物（20MB超・scripts/build-sidecar.sh で再生成する）
+sidecar/bedrock/bin/
+
+# ブロック状態表（2.4MB・scripts/build-sidecar.sh が取得する）
+sidecar/bedrock/data/block_states.nbt
+
+# Claude Code のローカル許可設定
+.claude/settings.local.json

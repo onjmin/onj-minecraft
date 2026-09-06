@@ -1,0 +1,252 @@
+/**
+ * 全スキルを直接呼んで、Driver 層が実サーバー上で動くことを確認するハーネス。
+ *
+ * LLM の思考ループに任せると、どのスキルが選ばれるかが運任せになり
+ * 網羅性が担保できない。ここではボットを1体だけ繋ぎ、
+ * DISABLE_AUTONOMY=1 でループを止めた上で各スキルを順に直接呼ぶ。
+ *
+ * 実行(Java版):
+ *   DISABLE_AUTONOMY=1 npx tsx src/core/driver/skillcheck.ts
+ * 実行(統合版・ローカル開発サーバー):
+ *   DISABLE_AUTONOMY=1 BEDROCK_ADDRESS=127.0.0.1:19132 npx tsx src/core/driver/skillcheck.ts
+ * 実行(統合版・本番 Realms):
+ *   DISABLE_AUTONOMY=1 REALM_INVITE=https://realms.gg/xxxx  *     npx tsx --env-file=.env src/core/driver/skillcheck.ts
+ *
+ * 本番を回す意味: ローカルの開発サーバーは平地・単一バイオーム・チート有効で、
+ * 木も鉱石も動物も無い。そこで通ったことは本番で通ることを意味しない。
+ * 本番は他プレイヤーの建築物があり、地形も持ち物も毎回違う。
+ *
+ * 判定について:
+ *   スキルが「失敗」を返すこと自体は異常ではない（材料が無い等）。
+ *   検出したいのは TypeError や "is not a function" のような
+ *   Driver 層の実装漏れ・移行漏れによるクラッシュ。
+ */
+
+import { profiles } from "../../profiles";
+import { buildingBaseSkill } from "../../skills/building/base";
+import { collectDirtSkill } from "../../skills/collecting/dirt";
+import { huntAnimalsSkill } from "../../skills/collecting/hunting";
+import { mineOresSkill } from "../../skills/collecting/mining";
+import { stealFromChestSkill } from "../../skills/collecting/stealing";
+import { collectStoneSkill } from "../../skills/collecting/stone";
+import { collectWoodSkill } from "../../skills/collecting/wood";
+import { craftSmeltingSkill } from "../../skills/crafting/smelting";
+import { craftToolSkill } from "../../skills/crafting/tool";
+import { craftTorchSkill } from "../../skills/crafting/torch";
+import { craftWeaponSkill } from "../../skills/crafting/weapon";
+import { exploreLandSkill } from "../../skills/exploring/land";
+import { gotoBaseSkill } from "../../skills/goto/base";
+import { gotoCoordsSkill } from "../../skills/goto/coords";
+import { gotoPlayerSkill } from "../../skills/goto/player";
+import { gotoSurfaceSkill } from "../../skills/goto/surface";
+import { MinecraftAgent } from "../agent";
+import { BedrockDriver } from "./bedrock";
+
+/** 指定すると統合版のローカルサーバーへ繋ぐ。無ければ Java 版。 */
+const BEDROCK_ADDRESS = process.env.BEDROCK_ADDRESS ?? "";
+/** 指定すると統合版の本番 Realm へ繋ぐ。BEDROCK_ADDRESS より優先。 */
+const REALM_INVITE = process.env.REALM_INVITE ?? "";
+const VIA_WSL = (process.env.BEDROCK_WSL ?? (process.platform === "win32" ? "1" : "0")) === "1";
+
+// 1スキルあたりの上限。設置系は tryPlaceBlock が候補ごとに待機を挟むため長めが要る。
+const PER_SKILL_TIMEOUT_MS = Number(process.env.SKILLCHECK_TIMEOUT_MS ?? 25_000);
+/** 中断を投げたあと、そのスキルが実際に止まるのを待つ上限。 */
+const SETTLE_TIMEOUT_MS = Number(process.env.SKILLCHECK_SETTLE_MS ?? 20_000);
+
+// SKILLCHECK_ONLY にカンマ区切りでスキル名を指定すると、そのスキルだけ実行する。
+// 一部だけ追試したいときに全部回さずに済む。
+const ONLY = (process.env.SKILLCHECK_ONLY ?? "")
+	.split(",")
+	.map((v) => v.trim())
+	.filter(Boolean);
+
+type Outcome = {
+	name: string;
+	verdict: "ok" | "skill-fail" | "crash" | "timeout";
+	detail: string;
+	ms: number;
+};
+
+/** Driver 層の実装漏れを示すエラーかどうか。 */
+function looksLikeDriverBug(message: string): boolean {
+	return /is not a function|Cannot read propert|undefined is not|TypeError|ReferenceError/i.test(
+		message,
+	);
+}
+
+async function main() {
+	const profile = Object.values(profiles)[0];
+
+	let agent: MinecraftAgent;
+	if (REALM_INVITE || BEDROCK_ADDRESS) {
+		// 統合版はドライバが接続を握るので、注入してから自分で繋ぐ。
+		// 本番 Realm では表示名を選べない(アカウントのゲーマータグになる)ので
+		// name と viaWsl はローカルへ繋ぐときだけ渡す。
+		const driver = new BedrockDriver({
+			realmInvite: REALM_INVITE || undefined,
+			address: REALM_INVITE ? undefined : BEDROCK_ADDRESS,
+			name: REALM_INVITE ? undefined : "skillcheck",
+			viaWsl: REALM_INVITE ? false : VIA_WSL,
+			onMsaCode: (m) => console.log("要サインイン:", m),
+		});
+		agent = new MinecraftAgent(profile, [], driver);
+		console.log(`[skillcheck] 統合版 ${REALM_INVITE ? "本番 Realm" : BEDROCK_ADDRESS} へ接続中...`);
+		await driver.connect();
+	} else {
+		agent = new MinecraftAgent(profile, []);
+		console.log(`[skillcheck] ${profile.minecraftName} で接続中...`);
+		await new Promise<void>((resolve, reject) => {
+			const t = setTimeout(() => reject(new Error("spawn タイムアウト(60秒)")), 60_000);
+			agent.bot.once("spawn", () => {
+				clearTimeout(t);
+				resolve();
+			});
+			agent.bot.once("error", (e) => {
+				clearTimeout(t);
+				reject(e);
+			});
+		});
+	}
+	// スポーン直後はチャンクが揃っていないので少し待つ。
+	// 外部から RCON で材料を配る場合はこの間に行うため、長めに指定できるようにしている。
+	const warmupMs = Number(process.env.SKILLCHECK_WARMUP_MS ?? 3000);
+	console.log(`[skillcheck] ウォームアップ ${warmupMs}ms ...`);
+	await new Promise((r) => setTimeout(r, warmupMs));
+
+	const state = agent.driver.getState();
+	console.log(
+		`[skillcheck] スポーン完了 pos=(${state.position.x.toFixed(1)}, ${state.position.y.toFixed(1)}, ${state.position.z.toFixed(1)}) dim=${state.dimension}`,
+	);
+
+	// goto.coords は引数が要るので、現在地の少し先を目標にする
+	const cases: { skill: any; args?: any }[] = [
+		{ skill: exploreLandSkill },
+		{ skill: gotoSurfaceSkill },
+		{
+			skill: gotoCoordsSkill,
+			args: {
+				x: Math.floor(state.position.x) + 5,
+				y: Math.floor(state.position.y),
+				z: Math.floor(state.position.z) + 5,
+			},
+		},
+		{ skill: gotoPlayerSkill },
+		{ skill: gotoBaseSkill },
+		{ skill: collectWoodSkill },
+		{ skill: collectDirtSkill },
+		{ skill: collectStoneSkill },
+		{ skill: mineOresSkill },
+		{ skill: huntAnimalsSkill },
+		{ skill: stealFromChestSkill },
+		{ skill: craftToolSkill },
+		{ skill: craftWeaponSkill },
+		{ skill: craftTorchSkill },
+		{ skill: craftSmeltingSkill },
+		{ skill: buildingBaseSkill },
+	];
+
+	const targets = ONLY.length > 0 ? cases.filter((c) => ONLY.includes(c.skill.name)) : cases;
+	if (ONLY.length > 0) {
+		console.log(`[skillcheck] 対象を ${targets.length} 件に絞り込み: ${ONLY.join(", ")}`);
+	}
+
+	const results: Outcome[] = [];
+
+	for (const { skill, args } of targets) {
+		const controller = new AbortController();
+		const t0 = Date.now();
+		let outcome: Outcome;
+
+		// 打ち切っても handler は走り続ける。放置したまま次のスキルへ進むと、
+		// 前のスキルの採掘が後のスキルの採掘を奪い、後続が
+		// 「新しい採掘で置き換えられた」で巻き添えに失敗する。実際に
+		// collecting.wood のタイムアウト後、dirt と stone がそれで潰れていた。
+		// 参照を持っておき、打ち切ったあと実際に止まるまで待つ。
+		const running = skill.handler({ agent, signal: controller.signal, args: args ?? {} });
+		// 待つ前に例外が出ると未処理拒否になるので、先に受け皿を付ける。
+		running.catch(() => {});
+
+		try {
+			const timer = setTimeout(() => controller.abort(), PER_SKILL_TIMEOUT_MS);
+			const res = await Promise.race([
+				running,
+				new Promise((_, rej) =>
+					setTimeout(() => rej(new Error("__TIMEOUT__")), PER_SKILL_TIMEOUT_MS + 5000),
+				),
+			]);
+			clearTimeout(timer);
+			outcome = {
+				name: skill.name,
+				verdict: res.success ? "ok" : "skill-fail",
+				detail: res.success ? res.summary : (res.error ?? res.summary),
+				ms: Date.now() - t0,
+			};
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : String(e);
+			outcome = {
+				name: skill.name,
+				verdict:
+					msg === "__TIMEOUT__" ? "timeout" : looksLikeDriverBug(msg) ? "crash" : "skill-fail",
+				detail: msg,
+				ms: Date.now() - t0,
+			};
+		}
+
+		if (outcome.verdict === "timeout") {
+			// 中断を投げたあと、実際に手を止めるまで待つ。
+			const settled = await Promise.race([
+				running.then(
+					() => true,
+					() => true,
+				),
+				new Promise<boolean>((r) => setTimeout(() => r(false), SETTLE_TIMEOUT_MS)),
+			]);
+			if (!settled) {
+				console.log(
+					`     ${skill.name} は中断しても ${SETTLE_TIMEOUT_MS / 1000}秒 止まらなかった。以降の結果は信用しないこと。`,
+				);
+			}
+		}
+
+		results.push(outcome);
+		const mark = { ok: "✅", "skill-fail": "⚠️ ", crash: "❌", timeout: "⏱ " }[outcome.verdict];
+		console.log(
+			`  ${mark} ${outcome.name.padEnd(28)} ${String(outcome.ms).padStart(6)}ms  ${outcome.detail.slice(0, 90)}`,
+		);
+
+		// 次のスキルへ影響しないよう停止させる
+		agent.cancelAllTasks();
+		await new Promise((r) => setTimeout(r, 1200));
+	}
+
+	console.log("\n================ 結果 ================");
+	const crashes = results.filter((r) => r.verdict === "crash");
+	const oks = results.filter((r) => r.verdict === "ok");
+	const fails = results.filter((r) => r.verdict === "skill-fail");
+	const timeouts = results.filter((r) => r.verdict === "timeout");
+
+	console.log(`成功         : ${oks.length}`);
+	console.log(`スキル失敗   : ${fails.length}  (材料不足など。Driver層の問題ではない)`);
+	console.log(`タイムアウト : ${timeouts.length}`);
+	console.log(`クラッシュ   : ${crashes.length}  <- Driver層の実装漏れ`);
+
+	if (crashes.length > 0) {
+		console.log("\n--- クラッシュ詳細 ---");
+		for (const c of crashes) console.log(`  ${c.name}: ${c.detail}`);
+	}
+
+	// 統合版は mineflayer のボットを持たないので、ドライバ側で切る。
+	// 接続の判定と揃えること。BEDROCK_ADDRESS だけを見ていたため、
+	// 本番 Realm で回すと agent.bot が undefined で落ちていた。
+	if (REALM_INVITE || BEDROCK_ADDRESS) {
+		await agent.driver.disconnect();
+	} else {
+		agent.bot.quit();
+	}
+	process.exit(crashes.length === 0 ? 0 : 1);
+}
+
+main().catch((e) => {
+	console.error("[skillcheck] 起動に失敗:", e);
+	process.exit(2);
+});

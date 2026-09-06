@@ -1,4 +1,3 @@
-import { goals } from "mineflayer-pathfinder";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
 /**
@@ -14,17 +13,10 @@ export const stealFromChestSkill = createSkill<void, { itemsCount: number; conta
 			agent,
 			signal,
 		}): Promise<SkillResponse<{ itemsCount: number; containerType: string }>> => {
-			const { bot } = agent;
+			const { driver } = agent;
 
 			// 1. 周辺のコンテナ（チェスト、樽、トラップチェスト）をスキャン
-			const containerBlock = bot.findBlock({
-				matching: [
-					bot.registry.blocksByName.chest.id,
-					bot.registry.blocksByName.barrel.id,
-					bot.registry.blocksByName.trapped_chest.id,
-				],
-				maxDistance: 16,
-			});
+			const containerBlock = driver.world.findBlock(["chest", "barrel", "trapped_chest"], 16);
 
 			if (!containerBlock) {
 				return skillResult.fail("No chests or barrels found nearby.");
@@ -32,36 +24,17 @@ export const stealFromChestSkill = createSkill<void, { itemsCount: number; conta
 
 			try {
 				// 2. ターゲットへ移動
-				await agent.abortableGoto(
-					signal,
-					new goals.GoalGetToBlock(
-						containerBlock.position.x,
-						containerBlock.position.y,
-						containerBlock.position.z,
-					),
-				);
+				await driver.goto(signal, { kind: "getToBlock", position: containerBlock.position });
 
-				// 3. コンテナを開く
-				const container = await bot.openContainer(containerBlock);
-				const containerItems = container.containerItems();
-				const itemsCount = containerItems.length;
+				// 3-4. コンテナを開いて中身を回収する（開閉はDriverに閉じ込めている）
+				const itemsCount = await driver.takeAllFromContainer(signal, containerBlock.position);
 
 				if (itemsCount === 0) {
-					container.close();
 					return skillResult.ok("The container was empty.", {
 						itemsCount: 0,
 						containerType: containerBlock.name,
 					});
 				}
-
-				// 4. すべてのアイテムを回収 (1つずつ引き出す)
-				for (const item of containerItems) {
-					// インベントリがいっぱいの場合は途中で停止
-					if (bot.inventory.emptySlotCount() === 0) break;
-					await container.withdraw(item.type, null, item.count);
-				}
-
-				container.close();
 
 				return skillResult.ok(`Stole ${itemsCount} items from ${containerBlock.name}.`, {
 					itemsCount,

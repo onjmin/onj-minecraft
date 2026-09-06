@@ -1,4 +1,3 @@
-import { goals } from "mineflayer-pathfinder";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
 export const gotoPlayerSkill = createSkill<void, { target: string; distance: number }>({
@@ -10,11 +9,25 @@ export const gotoPlayerSkill = createSkill<void, { target: string; distance: num
 		agent,
 		signal,
 	}): Promise<SkillResponse<{ target: string; distance: number }>> => {
-		const { bot } = agent;
+		// 殴られた直後に人へ近づくのは自殺行為。実測で10分に17回死に、
+		// うち14回がプレイヤーによるものだった。その間もこのスキルが
+		// 19回選ばれ、殺してくる相手に自分から歩いて行っていた。
+		if (agent.wasAttackedByPlayerRecently()) {
+			return skillResult.fail("A player attacked you recently. Stay away from players for now.");
+		}
 
-		const players = Object.values(bot.players);
-		if (!bot.entity) return skillResult.fail("Bot entity not loaded");
-		const botPos = bot.entity.position;
+		const { driver } = agent;
+		const state = driver.getState();
+		if (!state.isReady) return skillResult.fail("Bot entity not loaded");
+		const botPos = state.position;
+
+		// 自分自身を除外したプレイヤーのみを対象にする
+		const players = driver
+			.nearbyEntities(128)
+			.filter(
+				(e): e is typeof e & { username: string } =>
+					e.kind === "player" && Boolean(e.username) && e.username !== state.username,
+			);
 
 		if (players.length === 0) {
 			return skillResult.fail("No other players found nearby.");
@@ -24,31 +37,34 @@ export const gotoPlayerSkill = createSkill<void, { target: string; distance: num
 		let minDist = Infinity;
 
 		for (const player of players) {
-			// 自分自身を除外
-			if (player.username === bot.username) continue;
-			if (!player.entity) continue;
-			const dist = botPos.distanceTo(player.entity.position);
+			const dist = Math.hypot(
+				player.position.x - botPos.x,
+				player.position.y - botPos.y,
+				player.position.z - botPos.z,
+			);
 			if (dist < minDist) {
 				minDist = dist;
 				nearest = player;
 			}
 		}
 
-		if (!nearest || !nearest.entity) {
+		if (!nearest) {
 			return skillResult.fail("Could not find nearest player entity.");
 		}
 
-		const targetPos = nearest.entity.position;
+		const targetPos = nearest.position;
 		agent.log(`[goto.player] Target: ${nearest.username} at distance ${minDist.toFixed(1)}`);
 
 		try {
-			const goal = new goals.GoalNear(
-				Math.floor(targetPos.x),
-				Math.floor(targetPos.y),
-				Math.floor(targetPos.z),
-				2,
-			);
-			await agent.abortableGoto(signal, goal);
+			await driver.goto(signal, {
+				kind: "near",
+				position: {
+					x: Math.floor(targetPos.x),
+					y: Math.floor(targetPos.y),
+					z: Math.floor(targetPos.z),
+				},
+				distance: 2,
+			});
 			return skillResult.ok(`Moved to player ${nearest.username}.`, {
 				target: nearest.username,
 				distance: Math.floor(minDist),

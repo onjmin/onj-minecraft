@@ -1,6 +1,5 @@
-import { goals } from "mineflayer-pathfinder";
-import type { Vec3 } from "vec3";
-import type { SafeBot } from "../../core/types";
+import type { BlockInfo, BotDriver } from "../../core/driver/types";
+import { describeGain, gainedSince, snapshotInventory, totalGain } from "../inventory-delta";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
 export const mineOresSkill = createSkill<void, { minedCount: number }>({
@@ -11,34 +10,54 @@ export const mineOresSkill = createSkill<void, { minedCount: number }>({
 		"If you lack a pickaxe, craft one first instead of using this skill.",
 	inputSchema: {} as any,
 	handler: async ({ agent, signal }): Promise<SkillResponse<{ minedCount: number }>> => {
-		const { bot } = agent;
+		const { driver } = agent;
 
-		const orePositions = miningScanner.findNearbyOres(bot);
+		const orePositions = miningScanner.findNearbyOres(driver);
 
 		if (orePositions.length === 0) {
 			return skillResult.fail("No valuable ores found nearby. Try moving to a different location.");
 		}
 
 		let minedCount = 0;
-		const toolPlugin = (bot as any).tool;
+		// 成果は壊した数ではなく増えた持ち物で測る。素手で鉱石を割っても
+		// 何も落ちないので、壊した数を返すと持っていない鉱石を前提に
+		// 次の行動が組まれてしまう。
+		const before = snapshotInventory(driver);
 
 		try {
-			for (const pos of orePositions.slice(0, 3)) {
-				const goal = new goals.GoalNear(pos.x, pos.y, pos.z, 2);
-				await agent.abortableGoto(signal, goal);
+			for (const ore of orePositions.slice(0, 3)) {
+				// 詰め切れなくても諦めない。採掘は6ブロックまで届く。
+				try {
+					await driver.goto(signal, { kind: "near", position: ore.position, distance: 2 });
+				} catch (moveErr) {
+					if (signal.aborted) throw moveErr;
+				}
 
-				const block = bot.blockAt(pos);
+				// 移動中にブロックが変わっていないか取り直して確認する
+				const block = driver.world.blockAt(ore.position);
 				if (block && (block.name.includes("ore") || block.name.includes("raw"))) {
-					if (toolPlugin) {
-						await toolPlugin.equipForBlock(block);
+					await driver.equipBestTool(block.position);
+					try {
+						await driver.dig(signal, block.position);
+					} catch (digErr) {
+						if (signal.aborted) throw digErr;
+						continue;
 					}
-					await agent.abortableDig(signal, block);
 					minedCount++;
 				}
 			}
+			await driver.pickupNearbyItems(signal);
 
-			return skillResult.ok(`Successfully extracted ${minedCount} ore blocks from the area.`, {
-				minedCount,
+			const gained = gainedSince(driver, before);
+			if (totalGain(gained) === 0) {
+				return skillResult.fail(
+					minedCount > 0
+						? `Broke ${minedCount} ore blocks but obtained nothing. Ores need a pickaxe to drop; craft one first.`
+						: "No ores could be mined.",
+				);
+			}
+			return skillResult.ok(`Extracted ${describeGain(gained)}.`, {
+				minedCount: totalGain(gained),
 			});
 		} catch (err) {
 			const errorMsg = err instanceof Error ? err.message : String(err);
@@ -51,7 +70,7 @@ export const mineOresSkill = createSkill<void, { minedCount: number }>({
 });
 
 export const miningScanner = {
-	findNearbyOres: (bot: SafeBot, radius = 16): Vec3[] => {
+	findNearbyOres: (driver: BotDriver, radius = 16): BlockInfo[] => {
 		const targetOres = [
 			"coal_ore",
 			"iron_ore",
@@ -69,10 +88,6 @@ export const miningScanner = {
 			"deepslate_redstone_ore",
 		];
 
-		return bot.findBlocks({
-			matching: (block: any) => targetOres.includes(block.name),
-			maxDistance: radius,
-			count: 10,
-		});
+		return driver.world.findBlocks(targetOres, radius, 10);
 	},
 };

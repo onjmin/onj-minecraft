@@ -3,14 +3,25 @@ import path from "node:path";
 import mineflayer, { type ControlState } from "mineflayer";
 import { goals, Movements, pathfinder } from "mineflayer-pathfinder";
 import type { AgentProfile } from "../profiles/types";
+import { craftWeaponSkill } from "../skills/crafting/weapon";
 import { exploreLandSkill } from "../skills/exploring/land";
+import { gotoDeathPointSkill } from "../skills/goto/death";
+import { gotoSurfaceSkill } from "../skills/goto/surface";
+import { giveItemSkill } from "../skills/social/give";
 import type { SkillResponse } from "../skills/types";
-import { llm } from "./llm-client";
+import { type ChatSituation, Conversation } from "./conversation";
+import { EAT_BELOW_FOOD, pickFood } from "./driver/food";
+import { JavaDriver } from "./driver/java";
+import type { BotDriver, Position } from "./driver/types";
+import { fetchMinecraftKnowledge } from "./knowledge/wiki";
+import { chatLlm, llm } from "./llm-client";
 import { parseLlmOutput } from "./llm-output-parser";
 import { createPerceptionSnapshot, type DamageInfo } from "./perception";
 import { buildThinkingPrompt } from "./prompt-builder";
 import type { SafeBot } from "./types";
+import { appendChatLog } from "./utils/chat-log";
 import { emitDiscordWebhook, translateWithRoleplay } from "./utils/discord-webhook";
+import { envNum } from "./utils/env";
 import { isSameSimhash } from "./utils/simhash";
 
 const tryLoad = (bot: any, name: string, mod: any) => {
@@ -38,17 +49,221 @@ const tryLoad = (bot: any, name: string, mod: any) => {
 
 let lastDiscordEmitAt = 0;
 
+/**
+ * 同じ行動を中断せずに続けてよい上限。
+ *
+ * 思考ループが同じスキルを選び直した場合は実行中のものを続けさせるが、
+ * それだけだとハングしたスキルに永久に居座られる。以前は30秒ごとの無条件中断が
+ * 結果的にその番人を兼ねていたので、代わりの上限をここで持つ。
+ */
+const MAX_UNINTERRUPTED_MS = envNum("SKILL_MAX_RUN_MS", 300_000);
+
+/**
+ * 実行中の行動を、別の行動に乗り換えるために中断してよくなるまでの時間。
+ *
+ * 思考ループは30秒ごとに判断し直す。それより長くかかる行動は、毎回そこで
+ * 切られて最初からやり直しになり、永久に完了しない。本番の Realm で
+ * goto.surface が中断なしなら34秒で成功する一方、ループ内では27秒前後で
+ * 5回とも切られていた。
+ *
+ * 代償として、行動の乗り換えが最大でこの時間だけ遅れる。ただし発言は
+ * この判定より前で処理されるので、話しかけへの返答は遅れない。
+ * 戦闘や体力低下の割り込みも別経路なので影響しない。
+ */
+const MIN_UNINTERRUPTED_MS = envNum("SKILL_MIN_RUN_MS", 60_000);
+
+/** これを下回ったら戦わずに逃げる。 */
+const FLEE_HEALTH = envNum("FLEE_HEALTH", 10);
+/** 死亡地点の落とし物を追いかける制限時間。落下物は5分ほどで消える。 */
+const DEATH_LOOT_WINDOW_MS = envNum("DEATH_LOOT_WINDOW_MS", 240_000);
+/** 回収に戻って返り討ちに遭ったあと、次に試すまで置く間隔。 */
+const RECOVER_COOLDOWN_MS = envNum("RECOVER_COOLDOWN_MS", 45_000);
+/** プレイヤーに殴られてから、人に近づかないでおく時間。 */
+const PLAYER_HOSTILITY_MS = envNum("PLAYER_HOSTILITY_MS", 120_000);
+/** 一度の反射で振る回数。振り続けて本来の行動を止めない程度に。 */
+const ATTACK_SWINGS = 4;
+/** 頭上の蓋に使える物。何でもよいが、貴重な物を使わないよう絞る。 */
+const PLACEABLE_COVER = ["dirt", "cobblestone", "stone", "_planks", "gravel", "sand", "netherrack"];
+/** 防具かどうかの判定に使う。 */
+const ARMOR_SUFFIXES = ["_helmet", "_chestplate", "_leggings", "_boots"];
+/**
+ * 防具の部位と装備先。並びは driver.inventory.armor() が返す順（頭・胴・脚・足）
+ * と一致させること。突き合わせに添字を使っている。
+ */
+const ARMOR_PIECES: { suffix: string; destination: string }[] = [
+	{ suffix: "_helmet", destination: "head" },
+	{ suffix: "_chestplate", destination: "torso" },
+	{ suffix: "_leggings", destination: "legs" },
+	{ suffix: "_boots", destination: "feet" },
+];
+/** 素材の等級。小さいほど良い。表に無いものは最下位に置く。 */
+const ARMOR_MATERIALS = ["netherite", "diamond", "iron", "chainmail", "golden", "leather"];
+
+function armorRank(itemName: string): number {
+	const i = ARMOR_MATERIALS.findIndex((m) => itemName.startsWith(m));
+	return i < 0 ? 99 : i;
+}
+/** この体力を下回ったら、昼でも潜って回復を待つ。 */
+const SHELTER_HEALTH = envNum("SHELTER_HEALTH", 8);
+/** 一度潜ったら、次に潜り直すまで置く間隔。掘り進み続けないための歯止め。 */
+const BURROW_COOLDOWN_MS = envNum("BURROW_COOLDOWN_MS", 60_000);
+/** 埋まっているかを見る高さ。屋根はこの範囲に収まる前提。 */
+const BURIED_SCAN_HEIGHT = 32;
+/** 頭上にこれだけ固いものが積まっていたら「埋まっている」と見なす。
+ *  木の葉や庇は1〜2枚なので、それでは発動しない厚さにする。 */
+const BURIED_THICKNESS = envNum("BURIED_THICKNESS", 4);
+/** これだけ続けて一瞬で終わったら、乗り換えの猶予を外す。 */
+const SPIN_LIMIT = envNum("SKILL_SPIN_LIMIT", 3);
+
+/**
+ * 人から受けた依頼を追いかける制限時間。
+ *
+ * 依頼は一度受けたら忘れないでほしいが、永久に残すと「もう終わった話」を
+ * 延々と追い続ける。会話の中で新しい依頼が来れば上書きされる。
+ */
+const REQUEST_TTL_MS = envNum("CHAT_REQUEST_TTL_MS", 10 * 60_000);
+
+/**
+ * 近くの人に自分から声をかけるまで、直近の発言からこれだけ間を空ける。
+ * 実際の会話が始まった/始まりかけている最中に横から挨拶を割り込ませないため。
+ *
+ * 以前は20秒だった。AI同士の会話は考える時間があるぶん間が空きやすく、
+ * その間を「静かになった」と誤認して割り込んでいた
+ * （「AI会話に割り込んでくる」という苦情の主因）。返信に時間がかかる
+ * 相手を想定し、大きく空ける。
+ */
+const GREET_QUIET_AFTER_HEARD_MS = envNum("GREET_QUIET_AFTER_HEARD_MS", 3 * 60_000);
+/** 同じ人には、この間隔を空けてからでないと自分から声をかけない。しつこくしない。 */
+const GREET_COOLDOWN_MS = envNum("GREET_COOLDOWN_MS", 15 * 60_000);
+/**
+ * 相手が誰であっても、自分から声をかけるのはこの間隔を空けてから。
+ * GREET_COOLDOWN_MS は相手ごとの制限なので、これが無いと near にいる
+ * 人数分だけ次々に声をかけてしまい、しゃべりっぱなしになる
+ * （「枠を潰す」という苦情の一因）。
+ */
+const GREET_GLOBAL_COOLDOWN_MS = envNum("GREET_GLOBAL_COOLDOWN_MS", 5 * 60_000);
+/**
+ * 自分を挟まずに他人同士が会話しているとみなす、直近の発言者数のしきい値。
+ * 2人以上が交互に話していれば、それは自分向けの雑談ではなく他人同士の
+ * 会話である可能性が高い。そこには割り込まない。
+ */
+const OTHERS_CONVERSING_WINDOW_MS = envNum("OTHERS_CONVERSING_WINDOW_MS", 2 * 60_000);
+/**
+ * 自分が発言してからこの間に届いた発言は、その続きの返信とみなす。
+ * 名前を呼ばれていなくても、直前に自分から話しかけた相手の返事には答える。
+ */
+const ADDRESSED_FOLLOWUP_MS = envNum("ADDRESSED_FOLLOWUP_MS", 45_000);
+/**
+ * 名前を呼ばれずに「続きの返信」として答えてよい回数。
+ *
+ * 時間だけで見てはいけない。返事をするたびに「最後に喋った時刻」が
+ * 更新されるので、窓が自分の返事で延び続け、一度喋ったら人が黙るまで
+ * 全発言に返事をする状態になる。実測 19:08〜19:13 は人間の発言すべてに
+ * 返事が付き、他人同士の会話に割り込んで「てめーじゃねえよ」と言われた。
+ * 名前を呼ばれたときだけこの回数を配り直し、使い切ったら黙る。
+ */
+const ADDRESSED_FOLLOWUP_TURNS = envNum("ADDRESSED_FOLLOWUP_TURNS", 2);
+/** 発言数を数える窓と、その窓で許す発言数。喋りすぎそのものを止める歯止め。 */
+const CHAT_RATE_WINDOW_MS = envNum("CHAT_RATE_WINDOW_MS", 60_000);
+const CHAT_RATE_MAX = envNum("CHAT_RATE_MAX", 3);
+/**
+ * 黙るように言われたら、この間は何も喋らない。
+ *
+ * 人格プロンプトに「嫌がられたら従う」とは書いてあるが、書いてあるだけでは
+ * 守られない。実測では「しねbot」の直後に「了解、すぐ近くに行って手伝うよ」と
+ * 返している。言葉ではなく仕組みで黙らせる。
+ */
+const CHAT_MUTE_MS = envNum("CHAT_MUTE_MS", 10 * 60_000);
+/**
+ * 「黙れ」と言われたと見なす言い回し。
+ *
+ * 誤検知しても実害は「しばらく黙る」だけなので、広めに取ってよい。
+ * 逆に取りこぼすと、嫌がられている相手に喋り続けることになる。
+ */
+const MUTE_PATTERNS = [
+	"黙れ",
+	"だまれ",
+	"黙って",
+	"うるさい",
+	"うっさい",
+	"うざい",
+	"ウザい",
+	"邪魔",
+	"じゃま",
+	"しね",
+	"死ね",
+	"消えろ",
+	"来るな",
+	"話しかけるな",
+	"喋るな",
+	"しゃべるな",
+	"止めて",
+	"やめて",
+];
+/** 死にすぎを数える窓と、その窓で「死にすぎ」と見なす回数。 */
+const DEATH_STORM_WINDOW_MS = envNum("DEATH_STORM_WINDOW_MS", 10 * 60_000);
+const DEATH_STORM_LIMIT = envNum("DEATH_STORM_LIMIT", 3);
+/** 誰かがベッドに入ったという知らせを、この間だけ有効とみなす。 */
+const SLEEP_REQUEST_TTL_MS = envNum("SLEEP_REQUEST_TTL_MS", 90_000);
+/** 寝るために探すベッドの範囲。 */
+const BED_SEARCH_RADIUS = envNum("BED_SEARCH_RADIUS", 48);
+
+/**
+ * 一回成功したら依頼が消化される類のスキル。
+ *
+ * ほとんどのスキルは何周もかけて進める前提(木を集めて→何度も
+ * collecting.wood を選び直す)なので、依頼は簡単には消さない方がよい。
+ * ここに載っているものは逆で、1回の成功が「頼まれたことをやり切った」を
+ * 意味する。載せずにいると、pendingRequest の TTL(10分)が切れるまで
+ * 同じ依頼を思考プロンプトが見せ続け、同じ行為を繰り返してしまう。
+ * 集める系は多めに集めても実害が薄いが、渡す系は渡しすぎると
+ * 持ち物を無駄に失うだけなので、ここに含める。
+ */
+const ONE_SHOT_REQUEST_SKILLS = new Set<string>([giveItemSkill.name]);
+
+/** 攻撃してくる相手かどうか。名前で判断する。 */
+function isHostileMob(name: string): boolean {
+	const hostile = [
+		"zombie",
+		"skeleton",
+		"creeper",
+		"spider",
+		"enderman",
+		"witch",
+		"drowned",
+		"husk",
+		"stray",
+		"phantom",
+		"slime",
+		"magma_cube",
+		"pillager",
+		"vindicator",
+		"ravager",
+		"evocation_illager",
+		"blaze",
+		"piglin",
+		"hoglin",
+		"wither",
+		"guardian",
+		"silverfish",
+		"endermite",
+		"vex",
+	];
+	return hostile.some((h) => name.includes(h));
+}
+
+function distanceTo(
+	a: { x: number; y: number; z: number },
+	b: { x: number; y: number; z: number },
+) {
+	return Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+
 type ObservationRecord = {
 	action: string;
 	rationale: string;
 	result: "Success" | "Fail";
 	message: string;
-};
-
-type ChatLog = {
-	username: string;
-	message: string;
-	timestamp: number;
 };
 
 type StrategicState = {
@@ -57,8 +272,27 @@ type StrategicState = {
 	chats: string[]; // FIFO 3 (自分自身の過去発言)
 };
 
+/**
+ * 起動中の全エージェント。unj-relay.ts が「unjの人間発言を誰の口で喋らせるか」を
+ * 選ぶために参照する（agent.tsからunj-bridge.tsへは依存させたくないので、
+ * ポーリングと発話先の選択はunj-relay.ts側に置き、ここはレジストリだけ持つ）。
+ */
+export const activeAgents: MinecraftAgent[] = [];
+
 export class MinecraftAgent {
-	public bot: SafeBot;
+	/**
+	 * mineflayer のボット本体。Java版でのみ生成される。
+	 * 統合版では Driver を注入するため未定義になるので、
+	 * これを直接触る処理は必ず isJava で守ること。
+	 */
+	public bot!: SafeBot;
+	/** mineflayer 由来の機能（経路探索プラグイン・pvp・ブロック読み取り）が使えるか */
+	public readonly isJava: boolean;
+	/**
+	 * エディション差を吸収する操作層。skills/ からは bot ではなく driver を使うこと。
+	 * Java版は JavaDriver、統合版は BedrockDriver に差し替える。
+	 */
+	public driver: BotDriver;
 	private profile: AgentProfile;
 	private skills: Map<string, any>;
 	private currentTaskName: string = "idle";
@@ -72,8 +306,61 @@ export class MinecraftAgent {
 	private shouldStopSkill: boolean = false;
 	private combatTarget: any = null;
 
-	private chatHistory: ChatLog[] = [];
-	private maxChatHistory = 3;
+	/**
+	 * 会話の担当。返答は思考ループとは別経路で作る。
+	 * 詳しい理由は conversation.ts の冒頭に書いてある。
+	 */
+	private conversation: Conversation;
+	/** 返事を作っている最中か。二重に喋らせないための鍵。 */
+	private isReplying = false;
+	/** 返事を作っている間に届いた発言があるか。作り終えたら作り直す。 */
+	private replyAgain = false;
+	/**
+	 * 人から受けた作業の依頼。思考ループに渡して行動へ落とす。
+	 *
+	 * 会話履歴（直近3件）だけでは、少し喋っただけで依頼が押し出されて
+	 * 消える。「木を集めて」と言われたことを覚えておく場所が要る。
+	 *
+	 * selfInitiated が立っているものは、人から頼まれたのではなく
+	 * greetPlayer() で自分から申し出た内容。思考プロンプトでの言い回しを
+	 * 変えるためだけの印で、実行の扱いは依頼と同じにする。
+	 */
+	private pendingRequest: {
+		text: string;
+		from: string;
+		at: number;
+		selfInitiated?: boolean;
+	} | null = null;
+	/** 他プレイヤーの発言を最後に受け取った時刻。0 は未受信。 */
+	private lastHeardAt = 0;
+	/** 自分から挨拶して申し出た相手と、その時刻。しつこく繰り返さないための記録。 */
+	private greetedRecently = new Map<string, number>();
+	/** 直近で自分から声をかけた時刻（相手を問わない）。話しっぱなしを防ぐ。 */
+	private lastGreetAt = 0;
+	/**
+	 * 「名前を呼ばれずに返事をしてよい相手」と、その残り回数。
+	 *
+	 * 回数は名前を呼ばれたときだけ配り直す。自分の返事では補充しない。
+	 * ここを時刻だけで持つと窓が自分で延び続け、人が黙るまで全発言に
+	 * 返事をする状態になる（ADDRESSED_FOLLOWUP_TURNS の説明を参照）。
+	 */
+	private followUp: { name: string; until: number; left: number } | null = null;
+	/** 直近に喋った時刻の列。窓あたりの発言数を抑えるために持つ。 */
+	private recentUtterances: number[] = [];
+	/** 実際に送った発言の simhash。同じことを言い続けるのを止めるために持つ。 */
+	private outgoingSimhashCache: Map<string, number[]> = new Map();
+	/** これを過ぎるまで何も喋らない。「黙れ」と言われたら立てる。 */
+	private mutedUntil = 0;
+	/** 直近に死んだ時刻の列。死亡ログを撒き散らしていないか見るために持つ。 */
+	private recentDeaths: number[] = [];
+	/** 誰かがベッドに入ったのを最後に見た時刻。0 は未受信。 */
+	private othersSleepingAt = 0;
+	/** 最後にベッドを使った時刻。入り直して自分を起こさないために見る。 */
+	private lastBedActivatedAt = 0;
+	/** 連続失敗回数。待機時間を伸ばして暴走を防ぐのに使う。 */
+	private consecutiveFailures = 0;
+	/** 直前に失敗したスキル名。別のスキルに切り替わったらカウンタを戻す。 */
+	private lastFailedTask = "";
 
 	private chatSimhashCache: Map<string, number[]> = new Map();
 	private rationaleSimhashCache: Map<string, number[]> = new Map();
@@ -85,6 +372,40 @@ export class MinecraftAgent {
 
 	private currentAbort?: AbortController;
 	private currentSkillArgs: Record<string, any> = {};
+	/** 今の実行を開始した時刻。ハングの検出に使う（1回の実行が長すぎないか）。 */
+	private currentExecutionStartedAt = 0;
+	/** 今のスキルを担当し始めた時刻。乗り換えてよいかの判断に使う。 */
+	private currentTaskSince = 0;
+	/** 一瞬で終わる行動が続いた回数。空回りの間隔を空けるのに使う。 */
+	private instantRepeats = 0;
+	/**
+	 * 死んだ場所と時刻。持ち物はそこに落ちているので、取りに戻る手掛かり。
+	 * 落下物は5分ほどで消えるため、古くなったら捨てる。
+	 */
+	private deathPoint: { position: Position; at: number; retryAfter?: number } | null = null;
+	/** 最後にプレイヤーから殴られた時刻。人に近づいてよいかの判断に使う。 */
+	private attackedByPlayerAt = 0;
+	/** 最後に潜った時刻。掘り進み続けるのを止めるために見る。 */
+	private lastBurrowAt = 0;
+	/**
+	 * 今わざと潜っているか。
+	 *
+	 * shelterAtNight が立て、returnToSurfaceIfBuried が読む。自分で作った
+	 * 隠れ穴を「埋まっている」と誤読して掘り返すのを止めるためのもの。
+	 */
+	private sheltering = false;
+	/** 人から話しかけられて、次の判断を急ぎたいときに立てる。 */
+	private humanRequestPending = false;
+	/** 思考ループの待ちを途中で切り上げるための呼び出し口。 */
+	private wakeThinking: (() => void) | null = null;
+	/**
+	 * スキルごとの成否の記録。
+	 *
+	 * 「成功と報告するが何も得ていない」スキルを、実績で落とすために持つ。
+	 * 本番では collecting.stone が「10個収集」と返しながら持ち物が空だった。
+	 * ああいうものを人が気付くまで選ばせ続けるのは無駄が大きい。
+	 */
+	private skillStats = new Map<string, { ok: number; fail: number }>();
 
 	private bases: {
 		id: string;
@@ -122,16 +443,105 @@ export class MinecraftAgent {
 		return true;
 	}
 
-	constructor(profile: AgentProfile, skillList: any[]) {
+	/**
+	 * @param injectedDriver 指定するとそのDriverを使い、mineflayer のボットを作らない。
+	 *                       統合版(BedrockDriver)を動かすための入り口。
+	 */
+	constructor(profile: AgentProfile, skillList: any[], injectedDriver?: BotDriver) {
 		this.profile = profile;
+		activeAgents.push(this);
 		this.skills = new Map(skillList.map((t) => [t.name, t]));
+		this.conversation = new Conversation(profile);
+		if (process.env.REISHO_MODE === "true" || process.env.CYNICAL_MODE === "true") {
+			this.conversation.setCynicalMode(true);
+			console.log("[Conversation] Cynical (冷笑) mode enabled by environment variable");
+		}
+		console.log(`[Chat] model=${chatLlm.modelName} endpoint=${chatLlm.endpoint}`);
 
+		if (injectedDriver) {
+			this.isJava = false;
+			this.driver = injectedDriver;
+			// 他プレイヤーとの意思疎通のため、発言の受信だけは共通で購読する
+			this.driver.on("chat", (username: string, message: string) =>
+				this.handleIncomingChat(username, message),
+			);
+			// サーバーからの通知。誰が誰にやられたか、誰が入ってきたか。
+			// 返答はさせない。全部に反応すると場の空気を悪くする。
+			// 判断の材料として履歴に残すだけにする。
+			this.driver.on("system", (message: string) => this.handleSystemMessage(message));
+			// 殴られた相手から逃げるのはサイドカーの反射が担当する。
+			// ここでは記録だけ。人に殴られたことは覚えておく価値がある。
+			// 倒された相手はキルログに名前が出る。推測より確実。
+			this.driver.on("killed_by_player", (name: string) => {
+				this.log(`[通知] ${name} に倒された。しばらく人に近づかない`);
+				this.attackedByPlayerAt = Date.now();
+			});
+			this.driver.on("attacked_by_player", (d: any) => {
+				this.handleSystemMessage(`${d?.name ?? "誰か"} に攻撃された`);
+				this.attackedByPlayerAt = Date.now();
+			});
+			// 誰かがベッドに入ったら覚えておく。統合版は全員が寝ないと朝が
+			// 来ないので、起きているのがボット1体でも他の人は夜を越せない。
+			// 実測で「クソボットのせいでワイだけ寝ても無理か」と言われている。
+			this.driver.on("sleeping", (count: number) => {
+				if (!count || count <= 0) return;
+				this.othersSleepingAt = Date.now();
+				this.log(`[通知] 誰かがベッドに入った(${count}人)`);
+			});
+			// 死んだ場所を控える。持ち物は全部そこに落ちている。
+			this.driver.on("death", () => {
+				this.noteDeath();
+				// 回収に戻った先で殺されたなら、まだ敵がそこにいる。
+				// 諦めはしないが、すぐ戻ると同じことになる。間を置く。
+				// 実測で90秒に4回、ほぼ同じ座標で死に続けた。戻るたびに
+				// 拾い直した物をまた落とすので、往復するほど損をする。
+				if (this.currentTaskName === gotoDeathPointSkill.name && this.deathPoint) {
+					this.log("[反射] 回収に戻った先で死んだ。敵が離れるまで待つ");
+					this.deathPoint.retryAfter = Date.now() + RECOVER_COOLDOWN_MS;
+					this.currentTaskName = exploreLandSkill.name;
+					this.currentTaskSince = Date.now();
+					return;
+				}
+				this.deathPoint = { position: { ...this.driver.getState().position }, at: Date.now() };
+				this.log(
+					`死亡地点を記録: (${this.deathPoint.position.x.toFixed(0)}, ${this.deathPoint.position.y.toFixed(0)}, ${this.deathPoint.position.z.toFixed(0)})`,
+				);
+			});
+			// 復帰したら、まず落とし物を取りに行かせる。放っておくと消える。
+			//
+			// ただし getDeathPoint() で見ること。生のフィールドを見ると、直前の
+			// death ハンドラが置いた待ち時間(retryAfter)を無視して回収に戻す。
+			// death は respawn の直前に来るので、「返り討ちに遭ったから間を置く」
+			// と決めて exploring に切り替えた判断が、毎回ここで上書きされていた。
+			// 実測で 01:13〜01:17 の4分間に15回、ほぼ同じ場所で死に続けている。
+			this.driver.on("respawn", () => {
+				if (!this.getDeathPoint()) return;
+				this.currentTaskName = gotoDeathPointSkill.name;
+				this.currentTaskSince = Date.now();
+				this.requestImmediateThink();
+			});
+			// mineflayer 固有の初期化（プラグイン・経路探索設定・イベント配線）は行わない。
+			// ループの起動は接続完了後に startLoops() を呼び出す側の責務とする。
+			return;
+		}
+
+		this.isJava = true;
 		this.bot = mineflayer.createBot({
 			host: process.env.MINECRAFT_HOST,
 			port: Number(process.env.MINECRAFT_PORT),
 			username: profile.minecraftName,
 			auth: "offline",
+			// 未指定なら mineflayer の自動判定に任せる。
+			// 自動判定はサーバーのプロトコル番号から minecraftVersion を1つ選ぶが、
+			// 同一プロトコルに複数バージョンがぶら下がる場合、
+			// minecraft-data にデータが無い方を引いて "No data available" で落ちることがある。
+			// 例: protocol 775 は 26.1 / 26.1.1 / 26.1.2 が該当し、データがあるのは 26.1 のみ。
+			// その場合は MINECRAFT_VERSION でデータのある版を明示する。
+			...(process.env.MINECRAFT_VERSION ? { version: process.env.MINECRAFT_VERSION } : {}),
 		});
+
+		// エディション差を吸収する操作層。Java版なので JavaDriver を割り当てる。
+		this.driver = new JavaDriver(this);
 
 		// インスタンス作成時に一度だけプラグインをロード
 		this.bot.loadPlugin(pathfinder);
@@ -174,6 +584,578 @@ export class MinecraftAgent {
 		this.initEvents();
 	}
 
+	/** 表示名。unj-relay.ts が発話先のエージェントを名前で選ぶために使う。 */
+	get minecraftName(): string {
+		return this.profile.minecraftName;
+	}
+
+	/**
+	 * unjから中継された発言をそのままゲーム内チャットへ流す。LLMは使わない
+	 * （思考ループ・会話履歴を経由しない直送）。appendChatLogはforwardToUnj:falseで
+	 * 呼び、unjへ投稿し返してエコーしないようにする。
+	 */
+	public async relaySpeak(message: string): Promise<void> {
+		await this.driver.chat(message);
+		appendChatLog("out", this.profile.minecraftName, message, { forwardToUnj: false });
+	}
+
+	/**
+	 * 反射ループと思考ループを起動する。多重起動はしない。
+	 *
+	 * Java版は spawn 時に自動で呼ばれる。統合版は接続の完了タイミングを
+	 * 呼び出し側が握っているため、接続後に明示的に呼ぶこと。
+	 *
+	 * DISABLE_AUTONOMY=1 のときは起動しない。スキルを外部から直接呼んで
+	 * 検証する用途で、割り込みを防ぐために使う。
+	 */
+	/**
+	 * 他プレイヤーの発言を受け取る。エディションに依らず同じ扱いにする。
+	 * ここで積んだ履歴が思考プロンプトに載り、返答の材料になる。
+	 */
+	private handleIncomingChat(username: string, message: string): void {
+		if (!username) return;
+		// 統合版の表示名は Xbox アカウント側で決まりプロフィールと一致しないため、
+		// Driver が把握している実際のユーザー名でも自己発言を弾く
+		const selfNames = [this.profile.minecraftName, this.driver.getState().username].filter(Boolean);
+		if (selfNames.includes(username)) return;
+
+		this.conversation.record(username, message, "player");
+		this.lastHeardAt = Date.now();
+		this.log(`<${username}> ${message}`);
+		appendChatLog("in", username, message);
+
+		// 黙るように言われたら、宛先の判定より先に黙る。ここで打ち切らないと、
+		// 「黙れ」への返事を生成してから黙ることになり、一番言われたくない
+		// タイミングでもう一度発言することになる。
+		if (this.looksLikeMuteRequest(message) && this.referencesBot(message)) {
+			void this.acceptMute(username);
+			return;
+		}
+
+		// 冷笑モードの切り替え・不快反応による解除
+		if (this.isCynicalModeToggle(username, message)) {
+			void this.handleCynicalModeToggle(username, message);
+			return;
+		}
+
+		// 自分に向けられていなさそうな発言には、記録だけして返事を作らない。
+		// 以前は聞こえた発言すべてでLLMに「返事すべきか」を判断させていたが、
+		// 人が多い場では誤って割り込む頻度が上がる
+		// （「AI会話に割り込んでくるし枠潰す」という苦情の一因）。
+		if (!this.looksAddressedToSelf(username, message)) return;
+
+		// 返事は思考ループを待たずに、その場で作り始める。
+		void this.replyToChat();
+		// 人の話は次の判断まで30秒待たせない。指示なら尚更で、
+		// 待たせると「聞こえていない」ようにしか見えない。
+		this.humanRequestPending = true;
+		this.requestImmediateThink();
+	}
+
+	/**
+	 * その発言が自分に向けられていそうかを見る。
+	 *
+	 * 名前を呼ばれていれば確実にそう。呼ばれていなくても、直前に自分から
+	 * 話しかけた相手の返事や、自分以外に話している人がいない1対1の場面は
+	 * 自分への発言として扱う。逆に、自分を挟まず2人以上が交互に話している
+	 * 最中なら、それは他人同士の会話であって自分への話しかけではない。
+	 */
+	private looksAddressedToSelf(username: string, message: string): boolean {
+		// 名前を呼ばれた。ここでだけ「続きの返信」の回数を配り直す。
+		// 表示名(kusabot2361)とプロフィール名(kusabot)は一致しないので両方見る。
+		if (this.mentionsSelf(message)) {
+			this.followUp = {
+				name: username,
+				until: Date.now() + ADDRESSED_FOLLOWUP_MS,
+				left: ADDRESSED_FOLLOWUP_TURNS,
+			};
+			return true;
+		}
+
+		// 自分以外に喋っている人がいない。1対1なので自分宛とみなしてよい。
+		// 続きの返信の枠より先に見る。ここで消費させると、1対1の会話だけで
+		// 枠が尽きて、他人同士の会話に使う分が残らない。
+		const others = this.conversation
+			.recentDistinctSpeakers(OTHERS_CONVERSING_WINDOW_MS)
+			.filter((n) => n !== username);
+		if (others.length === 0) return true;
+
+		// 自分が話しかけた相手からの、名前を呼ばない返事。回数を決めて受ける。
+		// 使い切ったら黙る。ここを「直前に喋ったか」だけで見ると、返事のたびに
+		// 窓が延びて永久に閉じない。
+		const f = this.followUp;
+		if (f && f.name === username && f.left > 0 && Date.now() < f.until) {
+			f.left -= 1;
+			return true;
+		}
+
+		return false;
+	}
+
+	/** 発言の中で自分が名指しされているか。表示名とプロフィール名の両方を見る。 */
+	private mentionsSelf(message: string): boolean {
+		const text = message.toLowerCase();
+		const names = [this.profile.minecraftName, this.driver.getState().username].filter(
+			(n): n is string => Boolean(n),
+		);
+		return names.some((n) => text.includes(n.toLowerCase()));
+	}
+
+	/**
+	 * 自分のことを言っていそうか。名指しより緩く見る。
+	 *
+	 * 嫌がられているときに正確な名前で呼ばれることはない。実測は
+	 * 「botはいったん死ね」「しねbot」「クソボットのせいで」で、どれも
+	 * kusabot2361 とは書いていない。ここを厳密にすると、一番聞くべき
+	 * 場面だけ取りこぼす。返事をするかの判定には使わないこと
+	 * （「このbot」で始まる雑談にまで返事をするようになる）。
+	 */
+	private referencesBot(message: string): boolean {
+		if (this.mentionsSelf(message)) return true;
+		return /bot|ボット|ぼっと/i.test(message);
+	}
+
+	/** 「黙れ」の類か。嫌がられている合図を、言葉ではなく機械的に拾う。 */
+	private looksLikeMuteRequest(message: string): boolean {
+		const text = message.toLowerCase();
+		return MUTE_PATTERNS.some((p) => text.includes(p));
+	}
+
+	/**
+	 * 黙るように言われたので、一度だけ謝ってしばらく黙る。
+	 *
+	 * 謝罪だけは発言数の制限・重複判定・沈黙のすべてを迂回する。ここで
+	 * 抑制すると「うるさい」と言われて無言で消えることになり、かえって
+	 * 感じが悪い。先に黙りを確定させてから、その上で一度だけ謝る。
+	 */
+	private async acceptMute(username: string): Promise<void> {
+		const alreadyMuted = Date.now() < this.mutedUntil;
+		// 先に立てる。謝る間に届いた発言へ返事をしてしまわないため。
+		this.mutedUntil = Date.now() + CHAT_MUTE_MS;
+		this.followUp = null;
+		if (this.conversation.isCynicalMode) {
+			this.conversation.setCynicalMode(false);
+			this.log(`[会話] ${username} から苦情があったため冷笑モードを解除`);
+		}
+		this.log(`[会話] ${username} に止められた。${CHAT_MUTE_MS / 60_000}分黙る`);
+		// すでに黙っている最中なら、謝り直さない。謝罪を繰り返すのも喋りすぎ。
+		if (alreadyMuted) return;
+		await this.speak("ごめん、しばらく黙るね", null, { force: true, bypassMute: true });
+	}
+
+	/**
+	 * 冷笑モード有効化の指示かどうかを判定する。
+	 * 例: 「これから冷笑してください」「冷笑して」「冷笑モードにして」「!reisho on」など
+	 */
+	private isCynicalModeEnableRequest(username: string, message: string): boolean {
+		const text = message.trim();
+		const lower = text.toLowerCase();
+		if (
+			lower === "!reisho on" ||
+			lower === "!cynical on" ||
+			lower === "!reisho 1" ||
+			lower === "!cynical 1"
+		) {
+			return true;
+		}
+		if (lower === "!reisho" || lower === "!cynical") {
+			return !this.conversation.isCynicalMode;
+		}
+
+		// 「冷笑」「シニカル」が含まれているか
+		if (/(冷笑|シニカル)/.test(text)) {
+			// 解除・否定語が含まれている場合は除外
+			if (
+				/(やめ|解除|オフ|off|戻|終了|おしまい|終わり|ストップ|いらない|不要|嫌|禁止)/.test(text)
+			) {
+				return false;
+			}
+			// 有効化・指示表現（「これから冷笑してください」「冷笑して」「冷笑モードで」「冷笑で話して」等）
+			if (
+				/(して|モード|キャラ|路線|頼む|お願い|よろしく|やって|いって|オン|on|開始|スタート|移行|で話|で喋|で返)/.test(
+					text,
+				)
+			) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * 冷笑モードの解除・通常復帰要求、または不快・苦情の反応かどうかを判定する。
+	 * 例: 「不快」「感じ悪い」「煽るな」「冷笑やめて」「通常モードにして」「!reisho off」など
+	 */
+	private isDispleasureOrRevertRequest(
+		username: string,
+		message: string,
+	): { matches: boolean; isDispleasure: boolean } {
+		const text = message.trim();
+		const lower = text.toLowerCase();
+		if (
+			lower === "!reisho off" ||
+			lower === "!cynical off" ||
+			lower === "!reisho 0" ||
+			lower === "!normal"
+		) {
+			return { matches: true, isDispleasure: false };
+		}
+		if (lower === "!reisho" || lower === "!cynical") {
+			if (this.conversation.isCynicalMode) {
+				return { matches: true, isDispleasure: false };
+			}
+		}
+
+		// 明示的な冷笑停止・通常復帰要求
+		if (
+			/(冷笑|シニカル).*(やめて|やめろ|やめ|解除|オフ|off|終了|おしまい|終わり|戻して|いらない|不要|ストップ)/.test(
+				text,
+			)
+		) {
+			return { matches: true, isDispleasure: false };
+		}
+		if (/(通常|普通|ノーマル).*(モード|[でにも]話|[でにも]喋|[でにも]戻|にして)/.test(text)) {
+			return { matches: true, isDispleasure: false };
+		}
+
+		// 冷笑モード稼働中に「不快」「嫌悪」「苦情」が反応された場合
+		if (this.conversation.isCynicalMode) {
+			const displeasureKeywords = [
+				"不快",
+				"不愉快",
+				"気分悪",
+				"感じ悪",
+				"態度悪",
+				"性格悪",
+				"煽るな",
+				"煽らないで",
+				"茶化すな",
+				"茶化さないで",
+				"バカにするな",
+				"馬鹿にするな",
+				"見下すな",
+				"面白くない",
+				"おもしろくない",
+				"つまらん",
+				"つまらない",
+				"滑ってる",
+				"すべってる",
+				"寒い",
+				"サムい",
+				"キモい",
+				"きもい",
+				"ウザい",
+				"うざい",
+				"うざ",
+				"嫌味",
+				"嫌だ",
+				"嫌なんだけど",
+				"ムカつく",
+				"むかつく",
+				"イラつく",
+				"いらつく",
+				"腹立つ",
+				"真面目に",
+				"まじめに",
+				"きつい",
+				"ノリがきつい",
+			];
+			if (displeasureKeywords.some((k) => text.includes(k))) {
+				return { matches: true, isDispleasure: true };
+			}
+		}
+
+		return { matches: false, isDispleasure: false };
+	}
+
+	/**
+	 * 発言が冷笑モードの切り替え要求・不快反応かどうかを判定する。
+	 */
+	private isCynicalModeToggle(username: string, message: string): boolean {
+		const revert = this.isDispleasureOrRevertRequest(username, message);
+		if (revert.matches) return true;
+
+		return this.isCynicalModeEnableRequest(username, message);
+	}
+
+	/**
+	 * 冷笑モードの切り替えや不快時の通常復帰を実行し、ゲーム内チャットで案内する。
+	 */
+	private async handleCynicalModeToggle(username: string, message: string): Promise<void> {
+		const revert = this.isDispleasureOrRevertRequest(username, message);
+		if (revert.matches) {
+			if (this.conversation.isCynicalMode) {
+				this.conversation.setCynicalMode(false);
+				if (revert.isDispleasure) {
+					this.log(`[会話] ${username} の反応（不快感・苦情）を検知して冷笑モードを解除`);
+					await this.speak("ごめんね、嫌な思いさせちゃって。普通の話し方に戻るよ", username, {
+						force: true,
+					});
+				} else {
+					this.log(`[会話] ${username} の指示で冷笑モードを解除`);
+					await this.speak("冷笑モード解除したよ。通常モードに戻るね", username, { force: true });
+				}
+			} else {
+				await this.speak("今はすでに通常モードだよ", username, { force: true });
+			}
+			return;
+		}
+
+		if (this.isCynicalModeEnableRequest(username, message)) {
+			if (this.conversation.isCynicalMode) {
+				await this.speak("あぁ、そういうノリ...w もう冷笑モード入ってるで笑", username, {
+					force: true,
+				});
+			} else {
+				this.conversation.setCynicalMode(true);
+				this.log(`[会話] ${username} の指示で冷笑モードを有効化`);
+				await this.speak("あぁ、そういうノリ...w これから冷笑モードいくで笑", username, {
+					force: true,
+				});
+			}
+			return;
+		}
+	}
+
+	/**
+	 * 話しかけに返事をする。行動決定とは独立に動く。
+	 *
+	 * 作っている最中に次の発言が来たら、作り直す。古い発言への返事を
+	 * 出してから新しい方に答えるより、まとめて今の話に答える方がよい。
+	 */
+	private async replyToChat(): Promise<void> {
+		if (this.isReplying) {
+			this.replyAgain = true;
+			return;
+		}
+		this.isReplying = true;
+
+		try {
+			do {
+				this.replyAgain = false;
+				const heardAt = this.lastHeardAt;
+
+				const lastOther = this.conversation.lastFromOthers();
+				const knowledge = lastOther ? await fetchMinecraftKnowledge(lastOther.message) : null;
+				if (knowledge) {
+					this.log(`[Wiki検索] ${lastOther?.message} -> 参考知識を取得`);
+				}
+
+				let result: { reply: string; request: string | null };
+				try {
+					result = await this.conversation.respond(this.getChatSituation(knowledge ?? undefined));
+				} catch (err) {
+					this.log(`Chat error: ${err}`);
+					return;
+				}
+
+				// 待っている間に次の発言が来ていたら、この返事は捨てて作り直す。
+				if (this.lastHeardAt !== heardAt) {
+					this.replyAgain = true;
+					continue;
+				}
+
+				if (result.request) {
+					this.pendingRequest = {
+						text: result.request,
+						from: this.conversation.lastFromOthers()?.speaker ?? "player",
+						at: Date.now(),
+					};
+					this.log(`依頼を受け取った: ${result.request}`);
+					// 依頼が固まった時点でもう一度起こす。行動に移すのを早める。
+					this.humanRequestPending = true;
+					this.requestImmediateThink();
+				}
+
+				if (!result.reply) {
+					this.log("(返事なしと判断した)");
+					continue;
+				}
+
+				// LLM応答によるモード同期のセーフティネット
+				if (
+					this.conversation.isCynicalMode &&
+					/(通常モード|普通の話し方|普通に話す|普通に戻|通常に戻)/.test(result.reply)
+				) {
+					this.conversation.setCynicalMode(false);
+					this.log("[会話] LLM応答に基づき冷笑モードを解除");
+				} else if (
+					!this.conversation.isCynicalMode &&
+					/冷笑.*(いく|入る|始める|オン)/.test(result.reply)
+				) {
+					this.conversation.setCynicalMode(true);
+					this.log("[会話] LLM応答に基づき冷笑モードを有効化");
+				}
+
+				await this.speak(result.reply, this.conversation.lastFromOthers()?.speaker ?? null);
+			} while (this.replyAgain);
+		} finally {
+			this.isReplying = false;
+		}
+	}
+
+	/**
+	 * 実際に発言する唯一の口。発言に関する歯止めは全部ここに集める。
+	 *
+	 * 以前は返事・挨拶・思考ループの3か所がそれぞれ driver.chat() を直に
+	 * 呼んでいたため、抑制を入れても1か所ずつ抜けていた。数える場所が
+	 * 分かれていると数えられないので、口を1つにする。
+	 *
+	 * 送信の失敗で記録まで巻き添えにしない。await せずに投げっぱなしに
+	 * すると、サイドカーが落ちている間の reject が誰にも拾われず、Node が
+	 * 未処理の拒否としてプロセスごと落とす。喋れなかったことはログに出れば足りる。
+	 *
+	 * @param addressee この発言の宛先。名前を呼ばれずに返事をしてよい相手の記録に使う。
+	 * @param opts force は発言数の制限と重複判定を、bypassMute は沈黙を迂回する。
+	 *             使ってよいのは「黙れ」への謝罪だけ。
+	 * @returns 実際に送ったら true。抑制されたら false。
+	 */
+	private async speak(
+		text: string,
+		addressee: string | null,
+		opts?: { force?: boolean; bypassMute?: boolean },
+	): Promise<boolean> {
+		const message = text.trim();
+		if (!message) return false;
+
+		const now = Date.now();
+
+		// 黙れと言われている間は喋らない。迂回できるのは、その「黙れ」に
+		// 対する謝罪だけ（acceptMute からの bypassMute）。
+		if (!opts?.bypassMute && now < this.mutedUntil) {
+			this.log(`(黙っている間なので飲み込んだ) ${message}`);
+			return false;
+		}
+
+		if (!opts?.force) {
+			this.recentUtterances = this.recentUtterances.filter((t) => now - t < CHAT_RATE_WINDOW_MS);
+			if (this.recentUtterances.length >= CHAT_RATE_MAX) {
+				this.log(
+					`(喋りすぎなので飲み込んだ: ${CHAT_RATE_WINDOW_MS / 1000}秒で${CHAT_RATE_MAX}回) ${message}`,
+				);
+				return false;
+			}
+
+			// 「今から木集めてくるよ」を何度も送るのを止める。プロンプトの
+			// 「同じ返事を繰り返さないこと」は守られない。実測で1時間に
+			// ほぼ同じ文面を15回送っていた。
+			if (isSameSimhash(message, this.profile.minecraftName, this.outgoingSimhashCache)) {
+				this.log(`(直前と同じ内容なので飲み込んだ) ${message}`);
+				return false;
+			}
+		}
+
+		await this.driver.chat(message).catch((e) => this.log(`発言に失敗: ${e}`));
+		this.recentUtterances.push(now);
+		this.conversation.record(this.profile.minecraftName, message, "self");
+		appendChatLog("out", this.profile.minecraftName, message);
+		this.log(`-> ${message}`);
+		this.noteAddressed(addressee);
+		return true;
+	}
+
+	/**
+	 * 誰に向かって喋ったかを控える。
+	 *
+	 * 同じ相手に喋り続けても回数は増やさない。増やすと自分の返事で枠が
+	 * 補充され、窓が閉じなくなる。回数を配り直すのは名前を呼ばれたときだけ。
+	 */
+	private noteAddressed(addressee: string | null): void {
+		if (!addressee) {
+			this.followUp = null;
+			return;
+		}
+		const until = Date.now() + ADDRESSED_FOLLOWUP_MS;
+		if (this.followUp?.name === addressee) {
+			this.followUp.until = until;
+			return;
+		}
+		this.followUp = { name: addressee, until, left: ADDRESSED_FOLLOWUP_TURNS };
+	}
+
+	/** 返事を書くために渡す「今の状況」。嘘を言わせないための材料。 */
+	private getChatSituation(minecraftKnowledge?: string): ChatSituation {
+		const state = this.driver.getState();
+		const ready = state.isReady;
+		const inventory = this.driver.inventory
+			.items()
+			.map((i) => `${i.name} x${i.count}`)
+			.join(", ");
+
+		return {
+			position: ready ? state.position : undefined,
+			health: ready ? state.health : undefined,
+			hunger: ready ? state.food : undefined,
+			inventorySummary: inventory,
+			currentTask: this.currentTaskName,
+			recentResults: this.observationHistory
+				.slice(-3)
+				.map((h) => `${h.action}: ${h.result} (${h.message})`),
+			skillNames: Array.from(this.skills.keys()),
+			nearbyPlayers: ready ? this.nearbyPlayerNames() : [],
+			// 通知は会話の列ではなくこちらで渡す。返事の宛先にはさせない。
+			recentEvents: this.conversation.recentEvents(),
+			minecraftKnowledge,
+			isCynicalMode: this.conversation.isCynicalMode,
+		};
+	}
+
+	/** 近くにいる人の名前。分からないエディションでは空で返す。 */
+	private nearbyPlayerNames(): string[] {
+		try {
+			return createPerceptionSnapshot(this.driver, this.lastDamageCause).environment.nearbyPlayers;
+		} catch {
+			return [];
+		}
+	}
+
+	/** 依頼が新しいうちだけ返す。古い依頼を延々と追わせない。 */
+	private getPendingRequest(): string | null {
+		if (!this.pendingRequest) return null;
+		if (Date.now() - this.pendingRequest.at > REQUEST_TTL_MS) {
+			this.pendingRequest = null;
+			return null;
+		}
+		if (this.pendingRequest.selfInitiated) {
+			return `自分から${this.pendingRequest.from}に申し出た: ${this.pendingRequest.text}`;
+		}
+		return `${this.pendingRequest.from} からの依頼: ${this.pendingRequest.text}`;
+	}
+
+	/**
+	 * サーバーからの通知を受ける。キルログ・死亡ログ・参加退出。
+	 *
+	 * 話しかけられたことにはしない。これに返事を始めると、誰かが死ぬたびに
+	 * 喋るボットになって場が荒れる。記録と、次の判断の材料に留める。
+	 */
+	private handleSystemMessage(message: string): void {
+		this.log(`[通知] ${message}`);
+		// unjへは中継しない。あちらへ流すのは会話ログだけという建て付けで、
+		// キルログ・参加退出は会話ではない。実際に流すと「kusabot2361 が
+		// %entity.zombie.name にやられた」のような未翻訳のシステム文字列が
+		// 延々と積み上がる（死ぬたびに1レス）。ファイルには残す。
+		appendChatLog("in", "サーバー", message, { forwardToUnj: false });
+		// 会話の列には積むが、話しかけられた扱いにはしない。
+		// lastHeardAt を動かさないので、これで喋り出すことはない。
+		this.conversation.record("サーバー", message, "system");
+	}
+
+	/** 思考ループの待ちを切り上げて、すぐ考え直させる。 */
+	private requestImmediateThink(): void {
+		const wake = this.wakeThinking;
+		this.wakeThinking = null;
+		if (wake) wake();
+	}
+
+	public startLoops(): void {
+		if (this.hasStartedLoops) return;
+		if (process.env.DISABLE_AUTONOMY === "1") return;
+		this.hasStartedLoops = true;
+		this.startReflexLoop();
+		this.startThinkingLoop();
+	}
+
 	public log(...outputs: unknown[]) {
 		const time = new Intl.DateTimeFormat("ja-JP", {
 			hour: "2-digit",
@@ -196,11 +1178,7 @@ export class MinecraftAgent {
 			this.log("First spawn - Initializing pathfinder");
 			this.setupPathfinderConfig();
 
-			if (!this.hasStartedLoops) {
-				this.hasStartedLoops = true;
-				this.startReflexLoop();
-				this.startThinkingLoop();
-			}
+			this.startLoops();
 		});
 
 		this.bot.on("spawn", () => {
@@ -210,6 +1188,8 @@ export class MinecraftAgent {
 
 		// --- 状態監視（重複登録を避けるためここで行う） ---
 		this.bot.on("health", () => this.handleHealthChange());
+		// 死亡ログは周りの全員のチャット欄に流れる。撒き散らしていないか数える。
+		this.bot.on("death", () => this.noteDeath());
 		this.bot.on("entityHurt", (entity) => this.handleEntityHurt(entity));
 		this.bot.on("move", () => this.handleEnvironmentCheck());
 
@@ -221,22 +1201,13 @@ export class MinecraftAgent {
 			}
 		});
 
-		this.bot.on("chat", (username, message) => {
-			// ログに追加
-			this.chatHistory.push({
-				username,
-				message,
-				timestamp: Date.now(),
-			});
+		this.bot.on("chat", (username, message) => this.handleIncomingChat(username, message));
 
-			// 履歴制限
-			if (this.chatHistory.length > this.maxChatHistory) {
-				this.chatHistory.shift();
-			}
-		});
-
-		this.bot.on("kicked", (reason: string, loggedIn: boolean) => {
-			this.log(`Kicked from server: ${reason}, loggedIn: ${loggedIn}`);
+		this.bot.on("kicked", (reason: unknown, loggedIn: boolean) => {
+			// kick 理由は文字列ではなく JSON テキストコンポーネントで届くため、
+			// そのまま埋め込むと [object Object] になって原因が追えない。
+			const text = typeof reason === "string" ? reason : JSON.stringify(reason);
+			this.log(`Kicked from server: ${text}, loggedIn: ${loggedIn}`);
 			this.handleDisconnect("kicked");
 		});
 
@@ -268,6 +1239,13 @@ export class MinecraftAgent {
 		const RECONNECT_DELAY = 5000;
 		const MAX_RETRIES = 10;
 
+		// 古い接続を残したまま同名で繋ぎ直すと、サーバーに二重ログインと判定され
+		// multiplayer.disconnect.duplicate_login で蹴られ続ける。先に確実に切る。
+		try {
+			this.bot.removeAllListeners();
+			this.bot.quit();
+		} catch {}
+
 		this.log(`Reconnecting in ${RECONNECT_DELAY / 1000} seconds...`);
 
 		for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
@@ -281,6 +1259,9 @@ export class MinecraftAgent {
 					port: Number(process.env.MINECRAFT_PORT),
 					username: this.profile.minecraftName,
 					auth: "offline",
+					// 初回接続と同じ条件で繋ぐ。ここを揃えないと再接続時だけ
+					// 自動判定になり "No data available" で失敗しうる。
+					...(process.env.MINECRAFT_VERSION ? { version: process.env.MINECRAFT_VERSION } : {}),
 				});
 
 				this.bot.loadPlugin(pathfinder);
@@ -431,7 +1412,8 @@ export class MinecraftAgent {
 			this.log(`Setting skin: ${this.profile.skinUrl}`);
 			// スポーン直後の安定を待ってから一度だけ実行
 			setTimeout(() => {
-				this.bot.chat(`/skin url "${this.profile.skinUrl}" slim`);
+				// /skin は Java サーバー側プラグイン(SkinsRestorer)のコマンド
+				if (this.isJava) this.bot.chat(`/skin url "${this.profile.skinUrl}" slim`);
 				this.hasSetSkin = true;
 			}, 5000);
 		}
@@ -505,6 +1487,12 @@ export class MinecraftAgent {
 		}
 
 		try {
+			this.driver.stopMoving();
+		} catch {}
+
+		if (!this.isJava) return;
+
+		try {
 			this.bot.pathfinder.setGoal(null);
 		} catch {}
 
@@ -524,7 +1512,11 @@ export class MinecraftAgent {
 			(this.bot as any).pvp?.stop();
 		} catch {}
 
-		this.bot.clearControlStates();
+		// spawn 前に切断されると bot がまだ初期化されておらず
+		// clearControlStates が存在しない。他の停止処理と同様に握りつぶす。
+		try {
+			this.bot.clearControlStates();
+		} catch {}
 	}
 
 	private handleEnvironmentCheck() {
@@ -550,6 +1542,116 @@ export class MinecraftAgent {
 		}
 	}
 
+	/**
+	 * 直近でプレイヤーに殴られたか。
+	 *
+	 * 殴られた直後に人へ近づくのは自殺行為。実測で10分に17回死に、
+	 * うち14回がプレイヤーによるもので、その間 goto.player が19回選ばれて
+	 * いた。殺してくる相手に自分から歩いて行っていた。
+	 */
+	public wasAttackedByPlayerRecently(withinMs = PLAYER_HOSTILITY_MS): boolean {
+		return this.attackedByPlayerAt > 0 && Date.now() - this.attackedByPlayerAt < withinMs;
+	}
+
+	/** 死んだ場所。取りに行く価値があるうちだけ返す。 */
+	public getDeathPoint(): Position | null {
+		if (!this.deathPoint) return null;
+		if (Date.now() - this.deathPoint.at > DEATH_LOOT_WINDOW_MS) {
+			// 落下物はもう消えている。追いかけるだけ無駄。
+			this.deathPoint = null;
+			return null;
+		}
+		// 直前に返り討ちに遭ったなら、少し置いてから。
+		if (this.deathPoint.retryAfter && Date.now() < this.deathPoint.retryAfter) return null;
+		return this.deathPoint.position;
+	}
+
+	public clearDeathPoint(): void {
+		this.deathPoint = null;
+	}
+
+	/**
+	 * いま提示する価値があるスキルか。
+	 *
+	 * 前提が明らかに満たせないものを一覧から外す。LLM に選ばせて即失敗
+	 * させるのは、思考を1周まるごと捨てるのと同じ。
+	 */
+	private skillIsWorthOffering(name: string): boolean {
+		switch (name) {
+			case gotoDeathPointSkill.name:
+				// 落とし物が無いなら行き先が無い。
+				return this.getDeathPoint() !== null;
+			case "collecting.hunting": {
+				// 動物が見えないなら狩れない。
+				const prey = ["cow", "pig", "sheep", "chicken", "rabbit"];
+				return this.driver.nearbyEntities(32).some((e) => prey.includes(e.name));
+			}
+			case "crafting.tool":
+			case "crafting.weapon":
+			case "crafting.torch": {
+				// 棒か、棒になる木を持っていなければ何も作れない。
+				// 実測で crafting.tool が10分に21回選ばれ、全部
+				// 「棒が要る」で即失敗していた。
+				return this.driver.inventory.items().some(
+					(i) =>
+						i.name === "stick" ||
+						i.name.endsWith("_planks") ||
+						i.name.endsWith("_log") ||
+						i.name.endsWith("_wood") ||
+						// ネザーの木(crimson_stem / warped_stem)も板材になる。
+						// ここだけ抜けていたので、ネザーの木しか持っていないと
+						// クラフト系が一覧から丸ごと消えていた。
+						i.name.endsWith("_stem"),
+				);
+			}
+			case "crafting.smelting": {
+				// かまどか、かまどになる丸石が要る。
+				const items = this.driver.inventory.items();
+				return items.some(
+					(i) => i.name === "furnace" || i.name === "cobblestone" || i.name === "blackstone",
+				);
+			}
+			case "goto.player": {
+				// 殴られた直後は近づかない。誰もいないなら行き先が無い。
+				if (this.wasAttackedByPlayerRecently()) return false;
+				return this.driver.nearbyEntities(64).some((e) => e.kind === "player");
+			}
+			case "social.give": {
+				// 渡す相手も渡す物も無いなら選ばせない。空の持ち物で
+				// 「渡そうか」と申し出て、実行の段になって初めて
+				// 「何も持っていません」で失敗するのを避ける。
+				if (this.wasAttackedByPlayerRecently()) return false;
+				const hasPlayer = this.driver.nearbyEntities(64).some((e) => e.kind === "player");
+				const hasItem = this.driver.inventory.items().length > 0;
+				return hasPlayer && hasItem;
+			}
+			default:
+				return true;
+		}
+	}
+
+	private recordSkillOutcome(name: string, ok: boolean) {
+		const st = this.skillStats.get(name) ?? { ok: 0, fail: 0 };
+		if (ok) st.ok++;
+		else st.fail++;
+		this.skillStats.set(name, st);
+	}
+
+	/**
+	 * そのスキルを見限ってよいか。
+	 *
+	 * 試行が十分あって、ほとんど成功しないもの。材料不足のような一時的な
+	 * 失敗と区別できないので、外すのではなくプロンプトで注意を促すに留める。
+	 * 完全に外すと、材料が揃った後も二度と選ばれなくなる。
+	 */
+	private skillReliability(name: string): { tried: number; rate: number } | null {
+		const st = this.skillStats.get(name);
+		if (!st) return null;
+		const tried = st.ok + st.fail;
+		if (tried === 0) return null;
+		return { tried, rate: st.ok / tried };
+	}
+
 	private pushHistory(record: ObservationRecord) {
 		this.observationHistory.push(record);
 		if (this.observationHistory.length > this.maxHistory) this.observationHistory.shift();
@@ -568,7 +1670,7 @@ export class MinecraftAgent {
 		this.log(`ReflexLoop started.`);
 		await new Promise((r) => setTimeout(r, Math.random() * 2000));
 
-		while (this.bot && this.bot.entity) {
+		while (this.driver.getState().isReady) {
 			if (this.isInCombat) {
 				await this.checkCombatStatus();
 				await new Promise((r) => setTimeout(r, 500));
@@ -592,15 +1694,23 @@ export class MinecraftAgent {
 					this.currentAbort = controller;
 
 					await this.ensureOnLand(controller.signal);
+					await this.reflexSurvival(controller.signal);
 
 					let result: SkillResponse | undefined;
 
 					const args = this.currentSkillArgs[skill.name] || {};
+					let executionBeganAt = 0;
+					// 実行に入れた時点で暴走カウンタは戻す（結果の成否は下で扱う）
+					if (this.consecutiveFailures > 0 && this.currentTaskName !== this.lastFailedTask) {
+						this.consecutiveFailures = 0;
+					}
 
 					try {
 						this.log(
 							`${skill.name} start${Object.keys(args).length > 0 ? ` with args: ${JSON.stringify(args)}` : ""}`,
 						);
+						this.currentExecutionStartedAt = Date.now();
+						executionBeganAt = this.currentExecutionStartedAt;
 						result = await skill.handler({
 							agent: this,
 							signal: controller.signal,
@@ -611,6 +1721,15 @@ export class MinecraftAgent {
 						if (err instanceof Error && err?.message !== "Aborted") {
 							throw err;
 						}
+					} finally {
+						// 終わったものを「長く走っている」と誤判定しないよう戻す。
+						//
+						// finally でないと駄目。ここを try の外に置くと、スキルが
+						// 中断以外の例外を投げて上の catch へ抜けた場合に素通りし、
+						// 開始時刻が残り続ける。残ったまま MAX_UNINTERRUPTED_MS を
+						// 過ぎると ranTooLong が永久に真になり、乗り換えの猶予
+						// (MIN_UNINTERRUPTED_MS) が二度と効かなくなる。
+						this.currentExecutionStartedAt = 0;
 					}
 					this.log(`${skill.name} end`);
 
@@ -619,6 +1738,19 @@ export class MinecraftAgent {
 						continue;
 					}
 
+					this.recordSkillOutcome(skill.name, result.success);
+					// 依頼を果たしたら消す。pendingRequest は TTL(10分)か新しい
+					// 依頼で上書きされるまで残り続ける仕組みで、これ自体は
+					// 「木を集めて」のように何周もかけて進める依頼には都合がいい
+					// (1周目で消えると、続きをやる理由が思考プロンプトから消える)。
+					// だが social.give のような一回で完結する行為には向かない。
+					// 消さずに置くと、同じ「◯◯に渡そうか」という自分の申し出を
+					// 消費し続けてしまい、渡すたびにまた同じ申し出が見え、また
+					// 渡す、を TTL が切れるまで繰り返す。集める系は多く集めすぎても
+					// 損はないが、渡す系は渡しすぎるとただ持ち物を失うだけになる。
+					if (result.success && ONE_SHOT_REQUEST_SKILLS.has(skill.name)) {
+						this.pendingRequest = null;
+					}
 					this.pushHistory({
 						action: this.currentTaskName,
 						rationale: this.latestRationale || "Continuing task",
@@ -626,20 +1758,59 @@ export class MinecraftAgent {
 						message: result.summary,
 					});
 					if (!result.success) await new Promise((r) => setTimeout(r, 2000));
+
+					// 一瞬で終わる行動を全速力で回し続けない。
+					// goto.surface のように「既に条件を満たしている」と即座に返すものは、
+					// 次の思考まで秒1回近い頻度で呼ばれ、ログを埋めるだけになる。
+					// 実際に5分で98回叩いていた。
+					const elapsed = executionBeganAt > 0 ? Date.now() - executionBeganAt : Infinity;
+					this.instantRepeats = elapsed < 1000 ? this.instantRepeats + 1 : 0;
 				} catch (e) {
 					const errorMsg = e instanceof Error ? e.message : String(e);
+					// 中断は異常ではない。思考ループが別の行動へ乗り換えたときや、
+					// 反射が割り込んだときに必ず出る。これを失敗として数えると
+					// 暴走カウンタが上がり、意味の無い待機が積み上がる。
+					if (errorMsg.includes("中断された") || errorMsg === "Aborted") {
+						continue;
+					}
 					this.log(`Reflex Error: ${errorMsg}`);
-					if (errorMsg.includes("No path")) await new Promise((r) => setTimeout(r, 2000));
+					this.lastFailedTask = this.currentTaskName;
+					// 同じ失敗を即座に繰り返すとログを埋め尽くして CPU も食う。
+					// 未実装の機能を踏んだ場合など、回復の見込みがない失敗ほど待つ。
+					this.consecutiveFailures++;
+					const backoff = Math.min(30_000, 1000 * 2 ** Math.min(this.consecutiveFailures, 5));
+					if (errorMsg.includes("まだ実装されていません")) {
+						this.log(`未実装の機能のため ${backoff / 1000}秒待機します`);
+					}
+					await new Promise((r) => setTimeout(r, backoff));
 				}
 			} else {
-				this.currentTaskName = exploreLandSkill.name;
+				// 指定されたスキルが手元に無い場合の待機先。
+				// 探索スキルがあればそれを、無ければ渡された中の最初のものを使う。
+				// エディションによって使えるスキルが違うためハードコードしない。
+				const fallback = this.skills.has(exploreLandSkill.name)
+					? exploreLandSkill.name
+					: (this.skills.keys().next().value ?? "idle");
+				if (this.currentTaskName === fallback) {
+					// 代替先すら無い（または既にそれを指している）なら空回りするので待つ
+					await new Promise((r) => setTimeout(r, 2000));
+				}
+				this.currentTaskName = fallback;
 			}
 
-			await new Promise((r) => setTimeout(r, 1000 + Math.random() * 500));
+			// 空回りしているぶんだけ間隔を空ける。思考ループが次の行動を決めれば
+			// そこで 0 に戻るので、待ちが積み上がったままにはならない。
+			const idleBackoff = Math.min(8000, this.instantRepeats * 1000);
+			await new Promise((r) => setTimeout(r, 1000 + Math.random() * 500 + idleBackoff));
 		}
 	}
 
 	private async checkCombatStatus() {
+		// pvp プラグインと bot.entities に依存するため Java 版限定
+		if (!this.isJava) {
+			this.isInCombat = false;
+			return;
+		}
 		const pvpBot = this.bot as any;
 
 		if (pvpBot.pvp?.target) {
@@ -671,7 +1842,7 @@ export class MinecraftAgent {
 	}
 
 	private async startThinkingLoop() {
-		while (this.bot && this.bot.entity) {
+		while (this.driver.getState().isReady) {
 			try {
 				const state = this.getAgentStateForThinking();
 				const prompt = buildThinkingPrompt(state);
@@ -697,49 +1868,75 @@ export class MinecraftAgent {
 				this.log(`Thinking error: ${err}`);
 			}
 
-			await new Promise((r) => setTimeout(r, 30000));
+			// 途中で起こされたら待たずに次を考える。
+			await new Promise<void>((resolve) => {
+				const timer = setTimeout(() => {
+					this.wakeThinking = null;
+					resolve();
+				}, 30000);
+				this.wakeThinking = () => {
+					clearTimeout(timer);
+					resolve();
+				};
+			});
 		}
 	}
 
 	private getAgentStateForThinking() {
-		const skillsContext = Array.from(this.skills.values()).map((t) => {
-			const hasArgs = t.inputSchema && Object.keys(t.inputSchema).length > 0;
-			const argsInfo = hasArgs
-				? Object.entries(t.inputSchema)
-						.map(([k, v]) => `${k}: ${(v as any).description}`)
-						.join(", ")
-				: "";
-			return {
-				name: t.name,
-				description: t.description,
-				args: argsInfo,
-			};
-		});
+		const skillsContext = Array.from(this.skills.values())
+			// いま成立しないものは見せない。見せれば LLM は選び、即失敗して
+			// 枠を1つ潰す。実測で collecting.hunting が周りに動物がいないのに
+			// 20回選ばれ、goto.death_point が落とし物も無いのに20回選ばれた。
+			// 前提が満たせるかどうかは、こちらで分かるものはこちらで判断する。
+			.filter((t) => this.skillIsWorthOffering(t.name))
+			.map((t) => {
+				const hasArgs = t.inputSchema && Object.keys(t.inputSchema).length > 0;
+				const argsInfo = hasArgs
+					? Object.entries(t.inputSchema)
+							.map(([k, v]) => `${k}: ${(v as any).description}`)
+							.join(", ")
+					: "";
+				// これまでの実績を添える。うまくいっていない手段を避けられる。
+				const rel = this.skillReliability(t.name);
+				const note =
+					rel && rel.tried >= 3
+						? ` [これまで ${rel.tried} 回試して成功率 ${Math.round(rel.rate * 100)}%${
+								rel.rate < 0.2 ? "。ほぼ失敗している。別の手を先に試すこと" : ""
+							}]`
+						: "";
+				return {
+					name: t.name,
+					description: t.description + note,
+					args: argsInfo,
+				};
+			});
 
 		const historyText = this.getHistoryContext();
 		const inventory =
-			this.bot.inventory
+			this.driver.inventory
 				.items()
 				.map((i) => `${i.name} x${i.count}`)
 				.join(", ") || "Empty";
 
-		const heldItem = this.bot.heldItem ? this.bot.heldItem.name : "bare_hands";
+		const heldItem = this.driver.inventory.heldItem()?.name ?? "bare_hands";
 
-		const chatLogContext =
-			this.chatHistory.map((c) => `<${c.username}> ${c.message}`).join("\n") ||
-			"No recent conversations.";
+		// 自分の発言も含めた履歴を渡す。何を約束したかが行動側にも要る。
+		const chatLogContext = this.conversation.lines().join("\n") || "No recent conversations.";
+		const pendingRequest = this.getPendingRequest() ?? undefined;
 
 		// Use perception module
-		const perception = createPerceptionSnapshot(this.bot, this.lastDamageCause);
+		const perception = createPerceptionSnapshot(this.driver, this.lastDamageCause);
 
 		// Nearby blocks sampling (radius 8, random 10 points)
 		const sampleRadius = 8;
 		const sampledBlocks: string[] = [];
-		if (!this.bot.entity) {
+		if (!this.driver.getState().isReady) {
 			return {
 				profile: {
 					name: this.profile.minecraftName,
 					personality: this.profile.personality,
+					roleplay: this.profile.roleplayPrompt,
+					chatLanguage: this.profile.chatLanguage,
 				},
 				environment: {
 					biome: "unknown",
@@ -760,18 +1957,28 @@ export class MinecraftAgent {
 				bases: [],
 				skills: skillsContext,
 				chatHistory: [chatLogContext],
+				pendingRequest,
 				lastDamageCause: this.lastDamageCause,
 				memorySummary: historyText,
 			};
 		}
+		// 統合版は world 未実装なので、引けない場合は周辺ブロックなしとして扱う
+		const origin = this.driver.getState().position;
 		for (let i = 0; i < 10; i++) {
 			const dx = Math.floor(Math.random() * sampleRadius * 2 - sampleRadius);
 			const dy = Math.floor(Math.random() * sampleRadius * 2 - sampleRadius);
 			const dz = Math.floor(Math.random() * sampleRadius * 2 - sampleRadius);
-			const pos = this.bot.entity.position.offset(dx, dy, dz);
-			const block = this.bot.blockAt(pos);
-			if (block && block.name !== "air") {
-				sampledBlocks.push(block.name);
+			try {
+				const block = this.driver.world.blockAt({
+					x: Math.floor(origin.x) + dx,
+					y: Math.floor(origin.y) + dy,
+					z: Math.floor(origin.z) + dz,
+				});
+				if (block && block.name !== "air") {
+					sampledBlocks.push(block.name);
+				}
+			} catch {
+				break;
 			}
 		}
 		const nearbyBlocksText = [...new Set(sampledBlocks)].slice(0, 10).join(", ") || "None";
@@ -780,6 +1987,8 @@ export class MinecraftAgent {
 			profile: {
 				name: this.profile.minecraftName,
 				personality: this.profile.personality,
+				roleplay: this.profile.roleplayPrompt,
+				chatLanguage: this.profile.chatLanguage,
 			},
 			environment: {
 				biome: perception.environment.biome,
@@ -807,6 +2016,7 @@ export class MinecraftAgent {
 			),
 			skills: skillsContext,
 			chatHistory: [chatLogContext],
+			pendingRequest,
 			lastDamageCause: this.lastDamageCause,
 			memorySummary: historyText,
 		};
@@ -825,9 +2035,22 @@ export class MinecraftAgent {
 			this.updateFIFO(this.strategicState.achievements, achievementMatch[1].trim());
 		}
 
+		// この判断で使い切る。次の周からは通常の猶予に戻す。
+		// 以降は this.humanRequestPending ではなくこの控えを見ること。
+		// ここで false に戻すので、後段で参照しても必ず偽になる。
+		const wasHumanRequest = this.humanRequestPending;
+		this.humanRequestPending = false;
+
 		const rationale = result.memory || "No reasoning.";
 		const foundSkillName = result.action?.name;
-		const parsedArgs = result.action?.args || {};
+		const parsedArgs = this.nameParsedArgs(
+			foundSkillName,
+			result.action?.args || {},
+			result.action?.positional || [],
+		);
+
+		// 中断の要否を引数の変化でも判断するので、上書きする前に控える。
+		const previousArgs = foundSkillName ? this.currentSkillArgs[foundSkillName] : undefined;
 
 		if (foundSkillName) {
 			this.currentSkillArgs[foundSkillName] = parsedArgs;
@@ -835,20 +2058,72 @@ export class MinecraftAgent {
 
 		this.log(`${foundSkillName ?? "no-skill"} ${rationale}`);
 
+		// 話しかけへの返答は conversation が担当する。ここで喋るのは
+		// ENABLE_CHAT=1 のときの自発的な発言（複数体で会話させる場合）だけ。
+		// 両方が喋ると、1つの問いかけに2回answerする。
 		const chatMessage = result.speak || "";
-		const isNewChat = !isSameSimhash(
-			chatMessage,
-			this.profile.minecraftName,
-			this.chatSimhashCache,
-		);
-		if (isNewChat && chatMessage && this.updateFIFO(this.strategicState.chats, chatMessage)) {
-			this.bot.chat(chatMessage);
+		if (process.env.ENABLE_CHAT === "1" && chatMessage) {
+			const isNewChat = !isSameSimhash(
+				chatMessage,
+				this.profile.minecraftName,
+				this.chatSimhashCache,
+			);
+			if (isNewChat && this.updateFIFO(this.strategicState.chats, chatMessage)) {
+				// 独り言なので宛先は無い。宛先を渡すと、返事でもないのに
+				// 「続きの返信」の枠が開いてしまう。
+				await this.speak(chatMessage, null);
+			}
 		}
 
 		if (foundSkillName && this.skills.has(foundSkillName)) {
-			this.cancelCurrentExecution();
+			// 同じスキルを同じ引数で選び直しただけなら、実行中のものを続けさせる。
+			// 無条件に中断すると、思考ループの間隔(30秒)より長くかかる行動が
+			// 構造的に完了できない。本番の Realm で goto.surface が5回とも
+			// 29,28,28,29,29秒で中断され、一度も地表に着けなかったのがこれ。
+			const isSameTask =
+				this.currentTaskName === foundSkillName &&
+				JSON.stringify(previousArgs ?? {}) === JSON.stringify(parsedArgs);
+			const runningMs =
+				this.currentExecutionStartedAt > 0 ? Date.now() - this.currentExecutionStartedAt : 0;
+			const ranTooLong = runningMs > MAX_UNINTERRUPTED_MS;
+
+			// 担当し始めたばかりの行動は、別の行動のために止めない。
+			// 30秒では終わらない行動が最初からやり直しになり続けるため。
+			//
+			// 「今の実行の経過」ではなく「そのスキルを担当してからの経過」で測る。
+			// 実行ごとに測ると、16秒で終わって再実行される exploring.explore_land の
+			// ような短い行動が常に猶予内に入り、永久に乗り換えられなくなる。
+			const owningMs = this.currentTaskSince > 0 ? Date.now() - this.currentTaskSince : 0;
+			// 人に話しかけられた直後の判断は待たせない。指示に従うのが遅れると
+			// 何度も言い直させることになる。
+			// 空振りを繰り返しているものは猶予で守らない。猶予は「時間のかかる
+			// 行動を最後までやらせる」ためのもので、一瞬で失敗し続ける行動を
+			// 抱え込むためではない。実測で collecting.hunting が10分に149回
+			// 即失敗し、その間ほかの行動が一切選ばれなかった。
+			const spinning = this.instantRepeats >= SPIN_LIMIT;
+			const tooEarlyToSwitch =
+				!isSameTask &&
+				!wasHumanRequest &&
+				!spinning &&
+				this.currentTaskSince > 0 &&
+				owningMs < MIN_UNINTERRUPTED_MS;
+			if (tooEarlyToSwitch && !ranTooLong) {
+				this.log(
+					`${this.currentTaskName} を継続します（担当 ${Math.round(owningMs / 1000)}秒、${foundSkillName} への切り替えは保留）`,
+				);
+				return;
+			}
+
+			if (!isSameTask || ranTooLong) {
+				if (isSameTask) {
+					this.log(`${foundSkillName} が長すぎるため中断します`);
+				}
+				this.cancelCurrentExecution();
+			}
 			if (this.currentTaskName !== foundSkillName) {
 				this.currentTaskName = foundSkillName;
+				this.currentTaskSince = Date.now();
+				this.instantRepeats = 0;
 				this.latestRationale = rationale;
 
 				const now = Date.now();
@@ -875,10 +2150,47 @@ export class MinecraftAgent {
 		}
 	}
 
+	/**
+	 * キー名の無い引数にスキル定義の名前を割り当てる。
+	 *
+	 * `goto.coords(586, 0, -923)` のように位置引数だけで書かれると、パーサは
+	 * 値の並びしか返せない。どの名前に対応するかを知っているのは inputSchema
+	 * だけなので、突き合わせはここで行う。名前付きの引数が既にあるときは
+	 * そちらを信じて何もしない。
+	 */
+	private nameParsedArgs(
+		skillName: string | undefined,
+		args: Record<string, any>,
+		positional: unknown[],
+	): Record<string, any> {
+		if (!skillName || positional.length === 0 || Object.keys(args).length > 0) return args;
+
+		const schema = this.skills.get(skillName)?.inputSchema;
+		if (!schema) return args;
+
+		// オブジェクトのキー順は定義順。inputSchema は x, y, z のように
+		// 呼び出し順で書かれているので、そのまま対応させられる。
+		const keys = Object.keys(schema);
+		if (keys.length === 0) return args;
+
+		const named: Record<string, any> = {};
+		for (let i = 0; i < Math.min(keys.length, positional.length); i++) {
+			named[keys[i]] = positional[i];
+		}
+		return named;
+	}
+
 	private cancelCurrentExecution() {
 		if (this.currentAbort) {
 			this.currentAbort.abort("New task assigned by thinking loop");
 		}
+
+		try {
+			this.driver.stopMoving();
+			this.driver.clearControlStates();
+		} catch {}
+
+		if (!this.isJava) return;
 
 		try {
 			this.bot.pathfinder.setGoal(null);
@@ -891,10 +2203,6 @@ export class MinecraftAgent {
 		try {
 			this.bot.stopDigging();
 		} catch {}
-
-		for (const key of Object.keys(this.bot.controlState)) {
-			this.bot.setControlState(key as any, false);
-		}
 	}
 
 	private isMoving: boolean = false;
@@ -984,8 +2292,9 @@ export class MinecraftAgent {
 		hasStorage: boolean;
 	} | null {
 		if (this.bases.length === 0) return null;
-		if (!this.bot.entity) return null;
-		const pos = this.bot.entity.position;
+		const state = this.driver.getState();
+		if (!state.isReady) return null;
+		const pos = state.position;
 		let nearest = this.bases[0];
 		let minDist = Infinity;
 		for (const base of this.bases) {
@@ -1105,11 +2414,16 @@ export class MinecraftAgent {
 
 		const attackPromise = attackLoop();
 
+		// 中断されたら止める。ここで bot.attack(target) を呼んでいたので、
+		// 「やめろ」と言われた瞬間にもう一発殴っていた。攻撃の停止は
+		// pvp プラグイン側に持たせる。
 		if (signal) {
 			signal.addEventListener(
 				"abort",
 				() => {
-					bot.attack(target);
+					try {
+						(bot as any).pvp?.stop();
+					} catch {}
 				},
 				{ once: true },
 			);
@@ -1282,7 +2596,565 @@ export class MinecraftAgent {
 		}
 	}
 
+	/**
+	 * LLM の判断を待たずに済ませる生存行動。
+	 *
+	 * 防具を着る・囲まれたら掘って出る、といった「考えるまでもないが、
+	 * やらないと詰む」もの。思考ループは30秒に1回しか回らないので、
+	 * ここに置かないと判断待ちの間ずっと不利なままになる。
+	 * 本番のスポーン地点は壁に囲まれており、実際にそこで動けなくなっていた。
+	 */
+	private async reflexSurvival(signal: AbortSignal): Promise<void> {
+		try {
+			await this.recoverDeathLootIfAlive();
+			this.returnToSurfaceIfBuried();
+			await this.wearBestArmor();
+			// 食事は籠るより先。籠っても満腹度が足りなければ体力は戻らないので、
+			// 先に食べておかないと「隠れたのに回復しない」まま夜を越すことになる。
+			await this.eatIfHungry(signal);
+			// 丸腰で木があるなら、まず剣。籠るより前に置くのは、
+			// 剣さえあれば籠らずに済む場面が多いため。
+			this.craftSwordIfUnarmed();
+			// 待たせず自分から動く。await しない: LLM 呼び出しを含むので、
+			// ここで待つと反射ループそのものが詰まる。結果は後続の反射に
+			// 依存しないので、投げっぱなしで構わない。
+			this.maybeGreetNearbyPlayer();
+			// 寝るのが先。潜って夜をやり過ごすと、他の人は朝を迎えられない。
+			if (await this.sleepIfOthersSleeping(signal)) return;
+			if (await this.shelterAtNight(signal)) return;
+			await this.escapeIfBoxedIn(signal);
+		} catch (e) {
+			// 反射行動で本来の行動を止めない。
+			if (!signal.aborted) this.log(`反射行動でつまずいた: ${e}`);
+		}
+	}
+
+	/**
+	 * 近くに人がいれば、自分から挨拶して手伝いを申し出る。
+	 *
+	 * 「話しかけられるまで喋らない」だけでは、召使い風の人格なのに
+	 * 突っ立って待っているだけに見える。会話中に横から割り込まないよう
+	 * 直近の発言からの間隔と、戦闘中でないことを見てから声をかける。
+	 * 同じ相手には GREET_COOLDOWN_MS を空けるまで繰り返さない。
+	 */
+	private maybeGreetNearbyPlayer(): void {
+		if (this.isReplying) return;
+		// 黙るように言われている間は、自分から話しかけない。返事を控えるだけで
+		// 挨拶を続けたら、黙ったことにならない。
+		if (Date.now() < this.mutedUntil) return;
+		const state = this.driver.getState();
+		if (!state.isReady || state.health <= 0) return;
+		// 誰かの発言をつい最近受けているなら、本物の会話が始まっている/
+		// 始まりかけている。そこへ挨拶を割り込ませない。
+		if (Date.now() - this.lastHeardAt < GREET_QUIET_AFTER_HEARD_MS) return;
+		// 相手を問わず、直近に自分から声をかけたばかりなら黙る。
+		// これが無いと、近くにいる人数分だけ次々に挨拶して喋りっぱなしになる。
+		if (Date.now() - this.lastGreetAt < GREET_GLOBAL_COOLDOWN_MS) return;
+		// 自分を挟まずに2人以上が交互に話しているなら、他人同士の会話とみなし、
+		// 割り込まない。「AI会話に割り込んでくる」という苦情の主因はこれで、
+		// 発言そのものの間隔だけでは、話者が複数いる場を検知できなかった。
+		if (this.conversation.recentDistinctSpeakers(OTHERS_CONVERSING_WINDOW_MS).length >= 2) return;
+		// 殴ってきた相手がいる状況で愛想よく声をかけるのはおかしい。
+		if (this.wasAttackedByPlayerRecently()) return;
+		// 戦闘中に世間話は始めない。
+		if (this.driver.nearbyEntities(10).some((e) => isHostileMob(e.name))) return;
+
+		const names = this.nearbyPlayerNames();
+		if (names.length === 0) return;
+
+		const now = Date.now();
+		const target = names.find((n) => now - (this.greetedRecently.get(n) ?? 0) > GREET_COOLDOWN_MS);
+		if (!target) return;
+
+		// 呼び出し前に記録する。LLM 応答を待つ間に反射ループが何周も回るので、
+		// 先に印を付けておかないと応答が来るまでの間に同じ相手へ何度も
+		// 声をかけようとしてしまう。
+		this.greetedRecently.set(target, now);
+		this.lastGreetAt = now;
+		void this.greetPlayer(target);
+	}
+
+	/**
+	 * 近くにいる人へ、自分から挨拶して手伝いを申し出る。
+	 *
+	 * 申し出た内容は pendingRequest にそのまま積み、思考ループへ渡す。
+	 * 「言うだけで動かない」のでは有能に見えない。返事の生成と実行は
+	 * replyToChat と同じ isReplying の鍵を共有し、二重に喋らせない。
+	 */
+	private async greetPlayer(target: string): Promise<void> {
+		if (this.isReplying) return;
+		this.isReplying = true;
+
+		try {
+			let result: { reply: string; request: string | null };
+			try {
+				result = await this.conversation.greet(this.getChatSituation(), target);
+			} catch (err) {
+				this.log(`Greet error: ${err}`);
+				return;
+			}
+
+			if (result.request) {
+				this.pendingRequest = {
+					text: result.request,
+					from: target,
+					at: Date.now(),
+					selfInitiated: true,
+				};
+				this.log(`[自分から申し出た] ${result.request}`);
+				this.humanRequestPending = true;
+				this.requestImmediateThink();
+			}
+
+			if (!result.reply) return;
+
+			await this.speak(result.reply, target);
+		} finally {
+			this.isReplying = false;
+		}
+	}
+
+	/**
+	 * 生き返っていて落とし物が残っているなら、取りに行く手配をする。
+	 *
+	 * サーバーが復帰の通知を返さないことがあるので、イベントに頼らず
+	 * 「死亡地点を控えている・体力がある」で判断する。
+	 */
+	/**
+	 * 腹が減っていて食べ物があるなら食べる。
+	 *
+	 * 長いあいだ、食べる手段そのものが無かった。満腹度は知覚まで通っていて
+	 * 思考プロンプトに「Hunger: n」と出るのに、減ったものを戻す口がどこにも
+	 * 無い。満腹度が18を切ると体力が自然回復しなくなるため、狩って焼いた肉を
+	 * 持ったまま回復できず、削られては死ぬ、を繰り返していた。
+	 *
+	 * LLM に選ばせない。腹が減ったら食べるのは判断ではなく前提で、
+	 * 30秒に1回の思考を待つ類のものでもない。
+	 */
+	private async eatIfHungry(signal: AbortSignal): Promise<void> {
+		const state = this.driver.getState();
+		if (!state.isReady || state.health <= 0) return;
+		if (state.food >= EAT_BELOW_FOOD) return;
+		// 食べている間は動けない。敵が目の前にいるなら、まず逃げる方が先。
+		if (this.driver.nearbyEntities(6).some((e) => isHostileMob(e.name))) return;
+		if (!pickFood(this.driver.inventory.items().map((i) => i.name))) return;
+
+		const ate = await this.driver.eat(signal);
+		if (ate) {
+			this.log(`[反射] 食事をとった (満腹度 ${state.food} → ${this.driver.getState().food})`);
+		}
+	}
+
+	/**
+	 * 丸腰で、木が手元にあるなら、剣を作ることを最優先にする。
+	 *
+	 * 「木が手に入ったら剣を最優先」はプロンプトの AGENT RULES に文章として
+	 * 書いてあるだけで、実際には守られていなかった。本番で spruce_log を5本
+	 * 持ち、素手のまま exploring.explore_land を3回続けて選び、その間に
+	 * ゾンビに繰り返し殺されている。板材6枚あれば剣は作れるので、材料は
+	 * 足りていた。
+	 *
+	 * しかも explore_land は「目的地に着いた」ので毎回 Success を返す。
+	 * 失敗が続いたときの停滞判定は成功では発火しないため、何も得ない行動を
+	 * 成功として無限に繰り返せてしまう。だからここは判断に任せず前提として置く。
+	 *
+	 * 敵が近いときはやらない。クラフトの最中は無防備で、作りかけで殺されると
+	 * 材料ごと落とすことになる。その場合は籠る側の反射に任せる。
+	 */
+	private craftSwordIfUnarmed(): void {
+		if (!this.skills.has(craftWeaponSkill.name)) return;
+		if (this.currentTaskName === craftWeaponSkill.name) return;
+		// 既に何か作っている最中なら邪魔しない。
+		if (this.currentTaskName.startsWith("crafting.")) return;
+		if (this.hasWeapon()) return;
+
+		const state = this.driver.getState();
+		if (!state.isReady || state.health <= 0) return;
+		if (this.driver.nearbyEntities(10).some((e) => isHostileMob(e.name))) return;
+
+		// 剣2枚＋作業台4枚で板材6枚。原木1本が板材4枚になる。
+		const items = this.driver.inventory.items();
+		const planks = items
+			.filter((i) => i.name.endsWith("_planks"))
+			.reduce((sum, i) => sum + i.count, 0);
+		const logs = items
+			.filter(
+				(i) => i.name.endsWith("_log") || i.name.endsWith("_stem") || i.name.endsWith("_wood"),
+			)
+			.reduce((sum, i) => sum + i.count, 0);
+		if (planks + logs * 4 < 6) return;
+
+		this.log("[反射] 丸腰で木がある。剣を作る");
+		this.currentTaskName = craftWeaponSkill.name;
+		this.currentTaskSince = Date.now();
+		this.instantRepeats = 0;
+	}
+
+	private async recoverDeathLootIfAlive(): Promise<void> {
+		const point = this.getDeathPoint();
+		if (!point) return;
+		if (this.driver.getState().health <= 0) return;
+		// 死んだ場所の近くにまだ敵がいるなら戻らない。殺した相手はたいてい
+		// その場に留まっている。丸腰で戻れば同じことが起きる。
+		const dangerNear = this.driver
+			.nearbyEntities(24)
+			.some(
+				(e) =>
+					isHostileMob(e.name) && Math.hypot(e.position.x - point.x, e.position.z - point.z) < 8,
+			);
+		if (dangerNear) return;
+		if (this.currentTaskName === gotoDeathPointSkill.name) return;
+		if (!this.skills.has(gotoDeathPointSkill.name)) return;
+		this.log("[反射] 落とし物を取りに戻る");
+		this.currentTaskName = gotoDeathPointSkill.name;
+		this.currentTaskSince = Date.now();
+		this.instantRepeats = 0;
+	}
+
+	/**
+	 * 地下に埋まっているなら、地上へ戻ることを最優先にする。
+	 *
+	 * 木も動物も地上にある。地下で探索や狩りを繰り返しても永久に何も得られ
+	 * ない。実測で Y=34 に落ちたまま10分間、exploring.explore_land 63回と
+	 * collecting.hunting 23回を空振りし続けた。どちらもその場では成立しない。
+	 *
+	 * これは判断ではなく前提条件なので、LLM に選ばせない。ただし採集中は
+	 * 邪魔しない。地下を掘っているのは正しい行動でありうる。
+	 */
+	private returnToSurfaceIfBuried(): void {
+		if (!this.skills.has(gotoSurfaceSkill.name)) return;
+		if (this.currentTaskName === gotoSurfaceSkill.name) return;
+		// 自分で潜ったのなら、それは「埋まっている」ではない。掘り返さない。
+		// この反射は shelterAtNight より前に回るので、これが無いと
+		// 「潜る→掘り返す」を毎周くり返し、夜の地上に出っぱなしになる。
+		if (this.sheltering) return;
+		// 採集や設置の最中は割り込まない。地下にいるのが目的のことがある。
+		if (this.currentTaskName.startsWith("collecting.")) return;
+		if (this.currentTaskName.startsWith("building.")) return;
+
+		const state = this.driver.getState();
+		const foot = {
+			x: Math.floor(state.position.x),
+			y: Math.floor(state.position.y),
+			z: Math.floor(state.position.z),
+		};
+		// 頭上に固いものが「何枚あるか」で見る。1枚あるだけで埋まっている
+		// ことにすると、木の下や庇の下でも発動する。実測で goto.surface が
+		// 「もう地上にいる」と即答するのに、この判定だけ埋まっていると言い、
+		// 10分に54回そのスキルを掴まされていた。
+		let solidAbove = 0;
+		for (let y = foot.y + 2; y <= foot.y + 2 + BURIED_SCAN_HEIGHT; y++) {
+			const above = this.driver.world.blockAt({ x: foot.x, y, z: foot.z });
+			if (above === null) break;
+			if (above.name !== "air") solidAbove++;
+		}
+		if (solidAbove < BURIED_THICKNESS) return;
+
+		this.log("[反射] 地下に埋まっている。地上へ戻る");
+		this.currentTaskName = gotoSurfaceSkill.name;
+		this.currentTaskSince = Date.now();
+		this.instantRepeats = 0;
+	}
+
+	/**
+	 * 夜、丸腰なら潜ってやり過ごす。
+	 *
+	 * 8分で13回死に、大半が death.attack.mob だった。復帰しては即座に殺され、
+	 * 集めた物も作った道具もその都度消える。武器も防具も無いうちに夜の地上を
+	 * 歩き回るのは、進むどころか積み上げたものを失う行為でしかない。
+	 *
+	 * 逃走と反撃はサイドカーが毎tick行うが、あれは目の前の敵をしのぐだけで、
+	 * 夜通し追われ続ける状況は変えられない。こちらは「そもそも出歩かない」
+	 * 判断で、頻度も低いのでこの層でよい。
+	 *
+	 * 戻り値が true なら、この周の他の反射は行わない。
+	 */
+	private async shelterAtNight(signal: AbortSignal): Promise<boolean> {
+		// 「今わざと潜っている」ことを覚えておく。これが無いと
+		// returnToSurfaceIfBuried が、潜ったばかりの穴を「埋まっている」と
+		// 読んで掘り返す。実測で 05:00:16 に潜り、30秒後に地上へ戻され、
+		// 05:05:47 には同じ秒に両方が発火していた。夜通しこれを往復して
+		// 地上に出続け、mob に86回殺されている。
+		const sheltering = await this.decideShelter(signal);
+		this.sheltering = sheltering;
+		return sheltering;
+	}
+
+	/**
+	 * 誰かがベッドに入っていたら、自分も寝る。
+	 *
+	 * 統合版は全員が寝ないと夜を飛ばせない。起きているのがボット1体でも
+	 * 他の人は朝を迎えられず、これは会話の割り込みより実害が大きい。
+	 * 自分のベッドは持っていないので、近くにある人のベッドを借りる
+	 * （バニラでは他人のベッドでも寝られる。リスポーン地点が移るだけ）。
+	 *
+	 * 戻り値が true なら、この周の他の反射は行わない。
+	 */
+	private async sleepIfOthersSleeping(signal: AbortSignal): Promise<boolean> {
+		if (Date.now() - this.othersSleepingAt > SLEEP_REQUEST_TTL_MS) return false;
+
+		// もう入っている。ベッドをもう一度叩くと自分が起きてしまうので、
+		// 寝ている扱いのまま何もしない。就寝の通知は自分がベッドに入った
+		// ときにも飛んでくるため、この歯止めが無いと寝る・起きるを繰り返す。
+		if (Date.now() - this.lastBedActivatedAt < SLEEP_REQUEST_TTL_MS) return true;
+
+		const state = this.driver.getState();
+		if (!state.isReady || state.health <= 0) return false;
+		// ネザーとエンドでベッドを使うと爆発する。寝る話ではない。
+		if (state.dimension && !state.dimension.includes("overworld")) return false;
+
+		const beds = this.driver.world.findBlocksMatching(
+			(name) => name === "bed" || name.endsWith("_bed"),
+			BED_SEARCH_RADIUS,
+			1,
+		);
+		const bed = beds[0];
+		if (!bed) {
+			// 無いものは探し直しても無い。毎周探して報告し続けないよう、
+			// 知らせを消してこの夜は諦める。
+			this.othersSleepingAt = 0;
+			this.log("[反射] 誰か寝ているが、届く範囲にベッドが無い");
+			return false;
+		}
+
+		this.log("[反射] 誰かが寝ている。ベッドへ向かう");
+		try {
+			await this.driver.goto(signal, { kind: "getToBlock", position: bed.position });
+			await this.driver.activateBlock(bed.position);
+			this.lastBedActivatedAt = Date.now();
+		} catch (e) {
+			if (!signal.aborted) this.log(`ベッドに入れなかった: ${e}`);
+			// 一度失敗したら諦める。夜が明けるまで往復し続ける方が邪魔になる。
+			this.othersSleepingAt = 0;
+			return false;
+		}
+		return true;
+	}
+
+	/** 死んだ時刻を控える。死にすぎていないかを見るために持つ。 */
+	private noteDeath(): void {
+		this.recentDeaths.push(Date.now());
+		if (this.recentDeaths.length > 32) this.recentDeaths.splice(0, this.recentDeaths.length - 32);
+	}
+
+	/**
+	 * 短い間に死に続けているか。
+	 *
+	 * 死ぬたびにサーバーの死亡ログが全員のチャット欄に流れる。実測では
+	 * 1日で141行、他の人の画面はほぼこれで埋まっていた。装備が揃っていても、
+	 * 死に続けているなら夜歩きをやめさせる根拠になる。
+	 */
+	private isDyingRepeatedly(): boolean {
+		const cutoff = Date.now() - DEATH_STORM_WINDOW_MS;
+		this.recentDeaths = this.recentDeaths.filter((t) => t >= cutoff);
+		return this.recentDeaths.length >= DEATH_STORM_LIMIT;
+	}
+
+	/** 潜るべきか判断し、必要なら実際に潜る。戻り値は「今潜っている扱いか」。 */
+	private async decideShelter(signal: AbortSignal): Promise<boolean> {
+		const state = this.driver.getState();
+		// 死んでいる間は何もしない。復帰の要求はサイドカーが出している。
+		if (state.health <= 0) return false;
+
+		const night = state.timeOfDay >= 13000 && state.timeOfDay <= 23000;
+		// 傷ついていて、しかも敵が近いときだけ退く。体力だけで判断すると、
+		// 回復しないまま延々と潜り直して何も進まなくなる。実測で HP1 のまま
+		// 18回潜っていた。潜っても満腹度が足りなければ回復しない。
+		const hurt =
+			state.health <= SHELTER_HEALTH &&
+			this.driver.nearbyEntities(12).some((e) => isHostileMob(e.name));
+		// 装備が揃っていても、死に続けているなら出歩かせない。死亡ログは
+		// 死んだ本人ではなく、周りの全員のチャット欄を潰す。
+		const dying = this.isDyingRepeatedly();
+		if (!night && !hurt && !dying) return false;
+
+		const armed = this.hasWeapon();
+		// 着ている防具は items() に出てこない。持ち物だけを見ると、
+		// 直前の wearBestArmor() が着せたぶんが丸ごと消えて、
+		// フル装備でも「丸腰」と判定され毎晩潜ることになる。
+		const armored =
+			this.driver.inventory.armor().some((i) => i !== null) ||
+			this.driver.inventory.items().some((i) => ARMOR_SUFFIXES.some((suf) => i.name.endsWith(suf)));
+		// 傷ついているとき、死に続けているときは、装備の有無に関わらず退く。
+		if (!hurt && !dying && (armed || armored)) return false;
+
+		// 既に潜れているなら、そのまま待つ。
+		const pos = state.position;
+		const foot = { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) };
+		if (this.isSheltered(foot)) return true;
+
+		// 掘り進み続けないための最後の歯止め。判定を読み違えても、
+		// 最悪この間隔で1マスしか掘れない。
+		if (Date.now() - this.lastBurrowAt < BURROW_COOLDOWN_MS) return true;
+
+		this.log(
+			dying
+				? `[反射] ${DEATH_STORM_WINDOW_MS / 60_000}分で${this.recentDeaths.length}回死んだ。潜って止める`
+				: hurt
+					? `[反射] 体力 ${state.health}。潜って回復を待つ`
+					: "[反射] 夜で丸腰。潜ってやり過ごす",
+		);
+		this.lastBurrowAt = Date.now();
+		await this.burrow(signal);
+		return true;
+	}
+
+	/**
+	 * もう身を隠せているか。
+	 *
+	 * 頭上の蓋だけを見ると足りない。蓋を置けずに1マス掘っただけで終わった場合、
+	 * 落ちたぶん基準がずれて、頭上に見えるのは「さっきまで頭があった空気」に
+	 * なる。それを「まだ地上にいる」と読むので、反射のたびに掘り直して
+	 * 夜通し真下へ掘り進んでしまう。穴に入れているかどうかも併せて見る。
+	 */
+	private isSheltered(foot: Position): boolean {
+		// 蓋がある。これが本来の潜れた形。
+		const above = this.driver.world.blockAt({ ...foot, y: foot.y + 2 });
+		if (above && above.name !== "air") return true;
+
+		// 蓋が無くても、足元の高さが四方とも塞がっていれば穴の中にいる。
+		// 地上に立っているときはここが空くので、掘る前と後を取り違えない。
+		const sides = [
+			{ x: 1, z: 0 },
+			{ x: -1, z: 0 },
+			{ x: 0, z: 1 },
+			{ x: 0, z: -1 },
+		];
+		return sides.every(
+			(d) => this.driver.world.blockAt({ x: foot.x + d.x, y: foot.y, z: foot.z + d.z })?.solid,
+		);
+	}
+
+	/**
+	 * 足元を掘って潜り、頭上を塞ぐ。
+	 *
+	 * 装備が無いうちは走って逃げても追いつかれる。1マス潜って蓋をすれば
+	 * 地上の敵はまず届かない。塞ぐ物が無ければ潜るだけでも当たりにくくなる。
+	 */
+	private async burrow(signal: AbortSignal): Promise<void> {
+		const { driver } = this;
+		const pos = driver.getState().position;
+		const foot = { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) };
+		const below = { x: foot.x, y: foot.y - 1, z: foot.z };
+		const block = driver.world.blockAt(below);
+		if (!block || !block.diggable || block.name === "air") return;
+
+		this.log("[反射] 潜って身を隠す");
+		try {
+			await driver.equipBestTool(below);
+			await driver.dig(signal, below);
+			// 掘った穴へ落ちるのを待つ。
+			await new Promise((r) => setTimeout(r, 600));
+		} catch {
+			return;
+		}
+
+		// 頭上に蓋をする。置ける物が無ければ潜っただけで済ませる。
+		const cover = driver.inventory
+			.items()
+			.find((i) => i.slot >= 0 && i.slot <= 8 && PLACEABLE_COVER.some((n) => i.name.endsWith(n)));
+		if (!cover) return;
+		try {
+			await driver.equip(cover.name, "hand");
+			// 自分がいるマスの上に、その隣を支えにして置く。
+			const here = driver.getState().position;
+			const head = { x: Math.floor(here.x), y: Math.floor(here.y) + 1, z: Math.floor(here.z) };
+			const support = { x: head.x + 1, y: head.y, z: head.z };
+			if (driver.world.blockAt(support)?.solid) {
+				await driver.placeBlock(signal, support, { x: -1, y: 0, z: 0 });
+			}
+		} catch {
+			// 蓋ができなくても、潜っただけで当たりにくくはなっている。
+		}
+	}
+
+	/** 殴れる物を持っているか。素手で敵に向かうのは逃げるより悪い。 */
+	private hasWeapon(): boolean {
+		return this.driver.inventory
+			.items()
+			.some((i) => i.name.endsWith("_sword") || i.name.endsWith("_axe"));
+	}
+
+	/**
+	 * 持っている中で一番良い防具を着る。今着ている物より良いときだけ着替える。
+	 *
+	 * 着替えると外れた方が持ち物へ戻る。そのため「持ち物で一番良い物」だけを
+	 * 見て無条件に着せると、ダイヤを着ている状態で革を拾っただけで
+	 *   革を着る → ダイヤが持ち物に戻る → ダイヤを着る → 革が戻る
+	 * と反射のたびに入れ替わり続け、半分の時間は劣った方を着ることになる。
+	 * 着ている物と比べて、良くなるときだけ手を出す。
+	 */
+	private async wearBestArmor(): Promise<void> {
+		const items = this.driver.inventory.items();
+		const worn = this.driver.inventory.armor();
+
+		for (let i = 0; i < ARMOR_PIECES.length; i++) {
+			const { suffix, destination } = ARMOR_PIECES[i];
+			const best = items
+				.filter((it) => it.name.endsWith(suffix))
+				.sort((a, b) => armorRank(a.name) - armorRank(b.name))[0];
+			if (!best) continue;
+
+			// 着ていなければ着る。着ているなら、等級が上がるときだけ着替える。
+			const current = worn[i];
+			if (current && armorRank(current.name) <= armorRank(best.name)) continue;
+
+			await this.driver.equip(best.name, destination as any);
+		}
+	}
+
+	/**
+	 * 四方を塞がれていたら掘って出る。
+	 *
+	 * 経路探索は掘って抜ける手も持っているが、それは目標がある時の話で、
+	 * 「どこへ行けばいいか分からないが動けない」状態は自力で解けない。
+	 */
+	private async escapeIfBoxedIn(signal: AbortSignal): Promise<void> {
+		const { driver } = this;
+		const pos = driver.getState().position;
+		const foot = { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) };
+		const dirs = [
+			{ x: 1, z: 0 },
+			{ x: -1, z: 0 },
+			{ x: 0, z: 1 },
+			{ x: 0, z: -1 },
+		];
+
+		const open = (dx: number, dz: number) => {
+			const f = driver.world.blockAt({ x: foot.x + dx, y: foot.y, z: foot.z + dz });
+			const h = driver.world.blockAt({ x: foot.x + dx, y: foot.y + 1, z: foot.z + dz });
+			// 未取得(null)は「塞がれている」と決めつけない。掘る理由にしない。
+			if (f === null || h === null) return true;
+			return f.name === "air" && h.name === "air";
+		};
+
+		if (dirs.some((d) => open(d.x, d.z))) return;
+
+		// 全方向が塞がっている。壊せるものを1つ選んで抜ける。
+		for (const d of dirs) {
+			const target = { x: foot.x + d.x, y: foot.y, z: foot.z + d.z };
+			const block = driver.world.blockAt(target);
+			if (!block || !block.diggable) continue;
+			this.log(`[反射] 四方を塞がれているので ${block.name} を掘って出る`);
+			try {
+				await driver.equipBestTool(target);
+				await driver.dig(signal, target);
+				// 頭の高さも空けないと通れない。
+				const head = { ...target, y: target.y + 1 };
+				const above = driver.world.blockAt(head);
+				if (above && above.name !== "air" && above.diggable) {
+					await driver.dig(signal, head);
+				}
+				return;
+			} catch {
+				// この方向は駄目だった。次を試す。
+			}
+		}
+	}
+
 	private async ensureOnLand(signal: AbortSignal): Promise<void> {
+		// ブロック読み取りに依存するため Java 版限定。統合版は world 未実装。
+		if (!this.isJava) return;
 		const { bot } = this;
 		if (!bot.entity) return;
 		const pos = bot.entity.position;

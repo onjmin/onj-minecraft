@@ -1,6 +1,6 @@
-import { goals } from "mineflayer-pathfinder";
-import type { Vec3 } from "vec3";
-import type { SafeBot } from "../../core/types";
+import type { BlockInfo, BotDriver, Position } from "../../core/driver/types";
+import { envNum } from "../../core/utils/env";
+import { describeGain, gainedSince, snapshotInventory, totalGain } from "../inventory-delta";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
 const SINGLE_SAPLING_TREES = ["oak", "birch", "acacia", "cherry"];
@@ -18,6 +18,19 @@ function isQuadTree(saplingName: string): boolean {
 	return QUAD_SAPLING_TREES.includes(base);
 }
 
+/** 木を1本片付けるのにかける上限。超えたら手持ちのぶんで切り上げる。 */
+const FELL_BUDGET_MS = envNum("WOOD_FELL_BUDGET_MS", 40_000);
+/** 何ブロック掘るごとに落下物を拾うか。 */
+const PICKUP_EVERY = 5;
+/** 1回の伐採で壊してよい葉の数。通り道を空けるぶんだけ。 */
+const MAX_LEAVES = envNum("WOOD_MAX_LEAVES", 6);
+/** これより離れていたら、着いたと言われても寄り直す。採掘は6ブロックまで。 */
+const REACH_MARGIN = envNum("WOOD_REACH_MARGIN", 5);
+/** 木が見つからないときに移動して探し直す回数。 */
+const SEARCH_HOPS = envNum("WOOD_SEARCH_HOPS", 6);
+/** 1回の移動距離。読み込み済みの地形の外へ出る程度。 */
+const SEARCH_HOP_DISTANCE = 28;
+
 export const collectWoodSkill = createSkill<void, { felledCount: number; plantedCount: number }>({
 	name: "collecting.wood",
 	description:
@@ -27,34 +40,88 @@ export const collectWoodSkill = createSkill<void, { felledCount: number; planted
 		agent,
 		signal,
 	}): Promise<SkillResponse<{ felledCount: number; plantedCount: number }>> => {
-		const { bot } = agent;
-		if (!bot.entity) return skillResult.fail("Bot entity not loaded");
+		const { driver } = agent;
+		const state = driver.getState();
+		if (!state.isReady) return skillResult.fail("Bot entity not loaded");
 
-		const logs = woodScanner.findNearbyLogs(bot);
+		// 近くに木が無ければ移動して探し直す。その場で諦めると、木の無い
+		// 場所に降りた時点で連鎖が止まり、材料が一生手に入らない。
+		// 見えるのは読み込み済みの地形だけなので、動けば候補も増える。
+		let logs = woodScanner.findNearbyLogs(driver);
+		for (let hop = 0; logs.length === 0 && hop < SEARCH_HOPS; hop++) {
+			const from = driver.getState().position;
+			const angle = Math.random() * Math.PI * 2;
+			agent.log(`[collecting.wood] 近くに木が無い。${SEARCH_HOP_DISTANCE}ブロック移動して探す`);
+			try {
+				await driver.goto(signal, {
+					kind: "xz",
+					x: from.x + Math.cos(angle) * SEARCH_HOP_DISTANCE,
+					z: from.z + Math.sin(angle) * SEARCH_HOP_DISTANCE,
+					distance: 4,
+				});
+			} catch (moveErr) {
+				if (signal.aborted) throw moveErr;
+				// 届かなくても、動いたぶんは地形が読み込まれている。
+			}
+			logs = woodScanner.findNearbyLogs(driver);
+			const now = driver.getState().position;
+			agent.log(
+				`[collecting.wood] ${hop + 1}回目: ${Math.hypot(now.x - from.x, now.z - from.z).toFixed(0)}ブロック動いて 原木 ${logs.length} 件`,
+			);
+		}
 
 		let felledCount = 0;
 		let plantedCount = 0;
+		let gainedBefore: ReturnType<typeof snapshotInventory> | null = null;
+		// 何を壊したかを控える。「壊したのに何も増えない」ときに、
+		// 葉ばかり掘っていたのか原木を掘って拾えていないのかを分ける。
+		const brokeTally = new Map<string, number>();
 
 		let treeTypeToPlant: string | null = null;
 		if (logs.length > 0) {
 			try {
-				const target = logs[0];
-				const toolPlugin = (bot as any).tool;
+				// 幹の根元を狙う。見つけた原木は樹冠の高い位置のことがあり、
+				// その隣に立てる場所は無い。実測で木から10ブロック離れたまま
+				// 近づけず、採掘の届く6ブロックに一度も入れなかった。
+				// 根元なら地面に接しているので、必ず隣に立てる。
+				const target = trunkBase(driver, logs[0].position);
 
-				const logBlock = bot.blockAt(target);
-				if (logBlock) {
-					treeTypeToPlant = getSaplingTypeFromLog(logBlock.name);
+				treeTypeToPlant = getSaplingTypeFromLog(logs[0].name);
+
+				// 木の周りは葉と幹で塞がりやすく、要求した距離まで詰められない
+				// ことがある。届かなかっただけで諦めない。採掘は6ブロックまで
+				// 届くので、少し手前で止まっていても掘れる。掘れなければ
+				// 下の dig が個別に失敗するだけで済む。
+				try {
+					await driver.goto(signal, { kind: "near", position: target, distance: 2 });
+				} catch (moveErr) {
+					if (signal.aborted) throw moveErr;
+					agent.log(`[collecting.wood] 木まで詰め切れず: ${moveErr}。届く範囲で掘る`);
 				}
 
-				const goal = new goals.GoalNear(target.x, target.y, target.z, 2);
-				await agent.abortableGoto(signal, goal);
+				// 「着いた」と返っても届いていないことがある。固いブロックの隣に
+				// 立てる場所を探す仕組みが、木より10ブロック低い所を選ぶような
+				// 場面で起きる。実測で7〜10ブロック手前に立ったまま、候補を
+				// 全部「遠すぎて」で捨てていた。届いていなければ真下を狙い直す。
+				{
+					const me = driver.getState().position;
+					const gap = Math.hypot(me.x - target.x, me.y - target.y, me.z - target.z);
+					if (gap > REACH_MARGIN) {
+						agent.log(`[collecting.wood] まだ ${gap.toFixed(1)} ブロック離れている。詰め直す`);
+						try {
+							await driver.goto(signal, { kind: "xz", x: target.x, z: target.z, distance: 1.5 });
+						} catch (retryErr) {
+							if (signal.aborted) throw retryErr;
+						}
+					}
+				}
 
-				const blocksToRemove: Vec3[] = [];
+				const blocksToRemove: Position[] = [];
 				for (let x = -1; x <= 1; x++) {
 					for (let z = -1; z <= 1; z++) {
 						for (let y = 0; y <= 6; y++) {
-							const pos = target.offset(x, y, z);
-							const b = bot.blockAt(pos);
+							const pos = { x: target.x + x, y: target.y + y, z: target.z + z };
+							const b = driver.world.blockAt(pos);
 							if (b && (isLog(b.name) || isLeaves(b.name))) {
 								blocksToRemove.push(pos);
 							}
@@ -62,24 +129,86 @@ export const collectWoodSkill = createSkill<void, { felledCount: number; planted
 					}
 				}
 
-				const botY = bot.entity.position.y;
-				blocksToRemove.sort((a, b) => {
-					const distA = Math.abs(a.y - (botY + 1.5));
-					const distB = Math.abs(b.y - (botY + 1.5));
-					return distA - distB;
-				});
+				// 原木を先に、葉は後に掘る。目的は原木を手に入れることで、
+				// 葉は通り道を空けるためのおまけ。目線の高さだけで並べると
+				// 手前の葉ばかり掘って時間切れになり、何も持たずに終わる。
+				// 実際に「3ブロック伐採」と報告しながら持ち物が空だった。
+				agent.log(
+					`[collecting.wood] 原木 ${logs.length} 件、掘る候補 ${blocksToRemove.length} 件（目標 ${JSON.stringify(target)}）`,
+				);
+				const botY = driver.getState().position.y;
+				const rank = (p: Position) => {
+					const b = driver.world.blockAt(p);
+					const isLogBlock = b ? isLog(b.name) : false;
+					// 同じ種類の中では目線に近いものから。遠いものは掘れない。
+					return (isLogBlock ? 0 : 1000) + Math.abs(p.y - (botY + 1.5));
+				};
+				blocksToRemove.sort((a, b) => rank(a) - rank(b));
+
+				// 1本あたりの時間を区切る。この木を丸ごと片付けることより、
+				// 原木を何本か手に入れて次の行動に移れることの方が大事。
+				// 上限が無いと、3x3x7の範囲(最大63ブロック)を掘り終わるまで
+				// 戻らず、思考ループから見れば永久に終わらない行動になる。
+				const deadline = Date.now() + FELL_BUDGET_MS;
+				let leavesBroken = 0;
+				let firstDigError = "";
+				// 成果は壊した数ではなく増えた持ち物で測る。葉は掘っても
+				// ほとんど何も落とさないので、壊した数だと嘘になる。
+				gainedBefore = snapshotInventory(driver);
 
 				for (const pos of blocksToRemove) {
-					const block = bot.blockAt(pos);
-					if (block && block.name !== "air" && bot.canDigBlock(block)) {
-						if (toolPlugin) {
-							await toolPlugin.equipForBlock(block);
+					if (Date.now() > deadline) {
+						agent.log(`[collecting.wood] 時間切れ。${felledCount}ブロックで切り上げる`);
+						break;
+					}
+					const block = driver.world.blockAt(pos);
+					if (block && block.name !== "air" && block.diggable) {
+						// 葉は通り道を空けるためだけに壊す。原木と違って
+						// ほとんど何も落とさないのに、1枚ずつ時間を食う。
+						// 実測で原木7本に対して葉38枚を壊し、予算を葉で
+						// 使い切っていた。
+						if (isLeaves(block.name)) {
+							if (leavesBroken >= MAX_LEAVES) continue;
+							leavesBroken++;
 						}
-						await agent.abortableDig(signal, block);
+						await driver.equipBestTool(pos);
+						try {
+							await driver.dig(signal, pos);
+						} catch (digErr) {
+							if (signal.aborted) throw digErr;
+							// 届かないなら近づいてもう一度。飛ばすだけだと、
+							// 木は見つかっているのに1本も伐れないまま終わる。
+							const msg = digErr instanceof Error ? digErr.message : String(digErr);
+							if (!firstDigError) {
+								firstDigError = msg;
+								agent.log(`[collecting.wood] 掘れない理由: ${msg}`);
+							}
+							if (!msg.includes("遠すぎて")) continue;
+							try {
+								await driver.goto(signal, { kind: "near", position: pos, distance: 2 });
+							} catch {
+								continue;
+							}
+							try {
+								await driver.dig(signal, pos);
+							} catch {
+								continue;
+							}
+						}
 						felledCount++;
-						await agent.pickupNearbyItems(signal);
+						brokeTally.set(block.name, (brokeTally.get(block.name) ?? 0) + 1);
+						// 回収は1ブロックごとではなく数ブロックおきにする。
+						// pickupNearbyItems は落下物が出るのを待つため、何も落ちて
+						// いなくても3秒近く使う。葉を1枚掘るたびにこれを挟むと、
+						// 時間のほとんどが待ちに消える。
+						// 落下物は数分残るので、まとめて拾って構わない。
+						if (felledCount % PICKUP_EVERY === 0) {
+							await driver.pickupNearbyItems(signal);
+						}
 					}
 				}
+				// 取りこぼしを最後にまとめて回収する。
+				await driver.pickupNearbyItems(signal);
 			} catch (err) {
 				const errorMsg = err instanceof Error ? err.message : String(err);
 				if (errorMsg.includes("Cancelled") || errorMsg.includes("stop")) {
@@ -90,7 +219,7 @@ export const collectWoodSkill = createSkill<void, { felledCount: number; planted
 		}
 
 		if (!treeTypeToPlant) {
-			const saplings = bot.inventory.items().filter((i) => i.name.endsWith("_sapling"));
+			const saplings = driver.inventory.items().filter((i) => i.name.endsWith("_sapling"));
 			if (saplings.length > 0) {
 				treeTypeToPlant = saplings[0].name;
 			}
@@ -98,50 +227,51 @@ export const collectWoodSkill = createSkill<void, { felledCount: number; planted
 
 		if (treeTypeToPlant) {
 			const isQuad = isQuadTree(treeTypeToPlant);
-			const placeable = findPlaceableForSaplings(bot, isQuad ? 12 : 8, isQuad);
+			const placeable = findPlaceableForSaplings(driver, isQuad ? 12 : 8, isQuad);
 
 			if (placeable.length > 0) {
 				const target = placeable[0];
-				await agent.abortableGoto(signal, new goals.GoalNear(target.x, target.y, target.z, 1));
+				await driver.goto(signal, { kind: "near", position: target, distance: 1 });
 
-				const sapling = bot.inventory.items().find((i) => i.name === treeTypeToPlant);
+				const sapling = driver.inventory.items().find((i) => i.name === treeTypeToPlant);
 				if (sapling) {
-					const block = bot.blockAt(target);
+					const block = driver.world.blockAt(target);
 					if (block && (block.name === "dirt" || block.name === "grass_block")) {
-						const Vec3 = require("vec3");
+						// 上面(0,1,0)に設置する
+						const UP: Position = { x: 0, y: 1, z: 0 };
 
 						if (isQuad) {
-							const positions = [
+							const positions: Position[] = [
 								target,
-								target.offset(1, 0, 0),
-								target.offset(0, 0, 1),
-								target.offset(1, 0, 1),
+								{ ...target, x: target.x + 1 },
+								{ ...target, z: target.z + 1 },
+								{ ...target, x: target.x + 1, z: target.z + 1 },
 							];
 							for (const pos of positions) {
-								const soil = bot.blockAt(pos);
+								const soil = driver.world.blockAt(pos);
 								if (soil && (soil.name === "dirt" || soil.name === "grass_block")) {
-									const above = bot.blockAt(pos.offset(0, 1, 0));
+									const above = driver.world.blockAt({ ...pos, y: pos.y + 1 });
 									if (above && above.name === "air") {
-										await bot.equip(sapling, "hand");
-										await bot.placeBlock(soil, new Vec3(0, 1, 0));
+										await driver.equip(sapling.name, "hand");
+										await driver.placeBlock(signal, pos, UP);
 										plantedCount++;
 										await new Promise((r) => setTimeout(r, 100));
 									}
 								}
 							}
 						} else {
-							await bot.equip(sapling, "hand");
-							await bot.placeBlock(block, new Vec3(0, 1, 0));
+							await driver.equip(sapling.name, "hand");
+							await driver.placeBlock(signal, target, UP);
 							plantedCount++;
 						}
 
-						const boneMeal = bot.inventory.items().find((i) => i.name === "bone_meal");
+						const boneMeal = driver.inventory.items().find((i) => i.name === "bone_meal");
 						if (boneMeal) {
-							await bot.equip(boneMeal, "hand");
-							const saplingBlock = bot.blockAt(target.offset(0, 1, 0));
-							if (saplingBlock) {
+							await driver.equip(boneMeal.name, "hand");
+							const saplingPos: Position = { ...target, y: target.y + 1 };
+							if (driver.world.blockAt(saplingPos)) {
 								try {
-									await bot.activateBlock(saplingBlock);
+									await driver.activateBlock(saplingPos);
 									await new Promise((r) => setTimeout(r, 200));
 								} catch (e) {
 									agent.log(`[collecting.wood] Bone meal failed: ${e}`);
@@ -157,12 +287,48 @@ export const collectWoodSkill = createSkill<void, { felledCount: number; planted
 			return skillResult.fail("No trees to fell and no suitable dirt/grass for planting.");
 		}
 
-		return skillResult.ok(`Felled ${felledCount} blocks, planted ${plantedCount} sapling(s).`, {
-			felledCount,
+		const gained = gainedBefore ? gainedSince(driver, gainedBefore) : new Map<string, number>();
+		if (brokeTally.size > 0) {
+			agent.log(
+				`[collecting.wood] 壊した内訳: ${[...brokeTally].map(([n, c]) => `${n}x${c}`).join(", ")}`,
+			);
+			const items = driver.nearbyEntities(24).filter((e) => e.kind === "item");
+			agent.log(
+				`[collecting.wood] 周囲の落下物 ${items.length} 個: ${items.map((e) => e.name).join(", ") || "なし"}`,
+			);
+		}
+		if (felledCount > 0 && totalGain(gained) === 0) {
+			// 壊せたのに何も増えていない。葉ばかり掘ったか、落下物を拾えて
+			// いない。成功として返すと、持っていない原木を前提に次の行動が
+			// 組まれる。
+			return skillResult.fail(
+				`Broke ${felledCount} blocks but obtained no wood. The logs may be out of reach; move closer to the trunk.`,
+			);
+		}
+
+		const what = describeGain(gained) || `${felledCount} blocks`;
+		return skillResult.ok(`Collected ${what}, planted ${plantedCount} sapling(s).`, {
+			felledCount: totalGain(gained) || felledCount,
 			plantedCount,
 		});
 	},
 });
+
+/**
+ * その原木と同じ列を下へ辿って、幹の根元を返す。
+ *
+ * 木を切りに行くなら根元へ向かうのが自然で、経路探索も解ける。
+ * 樹冠の1本を目標にすると、その隣に立てる場所が無くて詰む。
+ */
+function trunkBase(driver: BotDriver, from: Position): Position {
+	let y = from.y;
+	for (let i = 0; i < 24; i++) {
+		const below = driver.world.blockAt({ x: from.x, y: y - 1, z: from.z });
+		if (!below || !isLog(below.name)) break;
+		y -= 1;
+	}
+	return { x: from.x, y, z: from.z };
+}
 
 function isLog(name: string): boolean {
 	return (
@@ -182,10 +348,16 @@ function isLeaves(name: string): boolean {
 	);
 }
 
-function findPlaceableForSaplings(bot: SafeBot, radius: number, isQuad: boolean): Vec3[] {
-	if (!bot.entity) return [];
-	const candidates: { pos: Vec3; dist: number; gridScore: number }[] = [];
-	const agentPos = bot.entity.position;
+function findPlaceableForSaplings(driver: BotDriver, radius: number, isQuad: boolean): Position[] {
+	const state = driver.getState();
+	if (!state.isReady) return [];
+	const candidates: { pos: Position; dist: number; gridScore: number }[] = [];
+	const agentPos = state.position;
+	const at = (dx: number, dy: number, dz: number): Position => ({
+		x: Math.floor(agentPos.x) + dx,
+		y: Math.floor(agentPos.y) + dy,
+		z: Math.floor(agentPos.z) + dz,
+	});
 
 	const gridInterval = 3;
 	const gridX = Math.floor(agentPos.x / gridInterval) * gridInterval;
@@ -195,11 +367,11 @@ function findPlaceableForSaplings(bot: SafeBot, radius: number, isQuad: boolean)
 		for (let dz = -radius; dz <= radius; dz++) {
 			if (isQuad) {
 				if (dx < 0 || dz < 0) continue;
-				const checkPos = agentPos.offset(dx, 0, dz);
-				const soil1 = bot.blockAt(checkPos);
-				const soil2 = bot.blockAt(checkPos.offset(1, 0, 0));
-				const soil3 = bot.blockAt(checkPos.offset(0, 0, 1));
-				const soil4 = bot.blockAt(checkPos.offset(1, 0, 1));
+				const checkPos = at(dx, 0, dz);
+				const soil1 = driver.world.blockAt(checkPos);
+				const soil2 = driver.world.blockAt({ ...checkPos, x: checkPos.x + 1 });
+				const soil3 = driver.world.blockAt({ ...checkPos, z: checkPos.z + 1 });
+				const soil4 = driver.world.blockAt({ ...checkPos, x: checkPos.x + 1, z: checkPos.z + 1 });
 				if (!soil1 || !soil2 || !soil3 || !soil4) continue;
 				if (
 					!isPlantable(soil1) ||
@@ -209,10 +381,11 @@ function findPlaceableForSaplings(bot: SafeBot, radius: number, isQuad: boolean)
 				)
 					continue;
 
-				const above1 = bot.blockAt(checkPos.offset(0, 1, 0));
-				const above2 = bot.blockAt(checkPos.offset(1, 1, 0));
-				const above3 = bot.blockAt(checkPos.offset(0, 1, 1));
-				const above4 = bot.blockAt(checkPos.offset(1, 1, 1));
+				const y = checkPos.y + 1;
+				const above1 = driver.world.blockAt({ ...checkPos, y });
+				const above2 = driver.world.blockAt({ x: checkPos.x + 1, y, z: checkPos.z });
+				const above3 = driver.world.blockAt({ x: checkPos.x, y, z: checkPos.z + 1 });
+				const above4 = driver.world.blockAt({ x: checkPos.x + 1, y, z: checkPos.z + 1 });
 				if (
 					(above1 && above1.name !== "air") ||
 					(above2 && above2.name !== "air") ||
@@ -229,11 +402,11 @@ function findPlaceableForSaplings(bot: SafeBot, radius: number, isQuad: boolean)
 					candidates.push({ pos: checkPos, dist, gridScore });
 				}
 			} else {
-				const checkPos = agentPos.offset(dx, 0, dz);
-				const block = bot.blockAt(checkPos);
+				const checkPos = at(dx, 0, dz);
+				const block = driver.world.blockAt(checkPos);
 				if (!isPlantable(block)) continue;
 
-				const above = bot.blockAt(checkPos.offset(0, 1, 0));
+				const above = driver.world.blockAt({ ...checkPos, y: checkPos.y + 1 });
 				if (above && above.name !== "air") continue;
 
 				const dist = Math.abs(dx) + Math.abs(dz);
@@ -254,22 +427,18 @@ function findPlaceableForSaplings(bot: SafeBot, radius: number, isQuad: boolean)
 	return candidates.map((c) => c.pos);
 }
 
-function isPlantable(block: any): boolean {
-	return block && (block.name === "dirt" || block.name === "grass_block");
+function isPlantable(block: BlockInfo | null): boolean {
+	return block !== null && (block.name === "dirt" || block.name === "grass_block");
 }
 
 export const woodScanner = {
-	findNearbyLogs: (bot: SafeBot, radius = 24): Vec3[] => {
-		if (!bot.entity) return [];
-		const entityPos = bot.entity.position;
-		return bot
-			.findBlocks({
-				matching: (block: any) => isLog(block.name),
-				maxDistance: radius,
-				count: 10,
-			})
-			.sort((a, b) => {
-				return entityPos.distanceTo(a) - entityPos.distanceTo(b);
-			});
+	findNearbyLogs: (driver: BotDriver, radius = 24): BlockInfo[] => {
+		const state = driver.getState();
+		if (!state.isReady) return [];
+		const origin = state.position;
+		const distanceTo = (p: Position) => Math.hypot(p.x - origin.x, p.y - origin.y, p.z - origin.z);
+		return driver.world
+			.findBlocksMatching((name) => isLog(name), radius, 10)
+			.sort((a, b) => distanceTo(a.position) - distanceTo(b.position));
 	},
 };

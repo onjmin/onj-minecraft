@@ -1,5 +1,4 @@
-import type { Vec3 } from "vec3";
-import type { SafeBot } from "./types";
+import type { BotDriver, Position } from "./driver/types";
 
 export interface EnvironmentSnapshot {
 	biome: string;
@@ -24,7 +23,7 @@ export interface DamageInfo {
 }
 
 export interface PerceptionSnapshot {
-	position: Vec3;
+	position: Position;
 	health: number;
 	food: number;
 	environment: EnvironmentSnapshot;
@@ -32,15 +31,19 @@ export interface PerceptionSnapshot {
 	lastDamageCause?: DamageInfo;
 }
 
+const ORIGIN: Position = { x: 0, y: 0, z: 0 };
+
 export function createPerceptionSnapshot(
-	bot: SafeBot,
+	driver: BotDriver,
 	lastDamageCause?: DamageInfo,
 ): PerceptionSnapshot {
-	if (!bot.entity) {
+	const state = driver.getState();
+
+	if (!state.isReady) {
 		return {
-			position: new (require("vec3"))(0, 0, 0),
-			health: bot.health,
-			food: bot.food,
+			position: ORIGIN,
+			health: state.health,
+			food: state.food,
 			environment: {
 				biome: "unknown",
 				timeOfDay: "day",
@@ -56,62 +59,46 @@ export function createPerceptionSnapshot(
 			lastDamageCause,
 		};
 	}
-	const position = bot.entity.position.clone();
-	const health = bot.health;
-	const food = bot.food;
 
-	// biome取得
-	const blockAtPos = bot.blockAt(bot.entity.position);
+	const position = state.position;
 
-	// 1. 位置を確定（自分自身の足元の座標 Vec3 を取得）
-	const pos = blockAtPos?.position || bot.entity.position;
-
-	let biomeName = "unknown";
-
-	if (pos) {
-		try {
-			// 2. 標準API: world.getBiome を使用して ID を取得
-			const biomeId = bot.world.getBiome(pos);
-
-			// 3. レジストリからバイオーム情報を取得
-			const biomeInfo = bot.registry.biomes[biomeId];
-
-			// 4. 名前を取得（例: "plains"）
-			biomeName = biomeInfo?.name || bot.game.dimension || "unknown";
-		} catch {
-			// まだチャンクが読み込まれていない場合はここに来る
-			biomeName = bot.game.dimension || "unknown";
-		}
-	} else {
-		biomeName = bot.game.dimension || "unknown";
+	// バイオームはチャンク未ロードなどで引けないことがあるため、失敗しても知覚全体は止めない
+	let biome = "unknown";
+	try {
+		biome = driver.world.getBiome(position) || state.dimension || "unknown";
+	} catch {
+		biome = state.dimension || "unknown";
 	}
 
-	const timeOfDay = detectTimeOfDay(bot.time.timeOfDay);
-	const weather = bot.isRaining ? "rain" : "clear";
-	const lightLevel = getPerceivedLight(bot);
+	const nearby = driver.nearbyEntities(16);
+	const distanceTo = (p: Position) =>
+		Math.hypot(p.x - position.x, p.y - position.y, p.z - position.z);
 
-	const nearbyPlayers = getNearbyPlayers(bot, 16);
-	const nearbyMobs = getNearbyMobs(bot, 16);
+	const nearbyPlayers = nearby
+		.filter((e) => e.kind === "player" && e.username && e.username !== state.username)
+		.map((e) => e.username as string);
 
-	const inventoryItems = bot.inventory.items().map((i) => `${i.name} x${i.count}`) ?? [];
+	const nearbyMobs = nearby
+		.filter((e) => e.kind === "mob")
+		.map((e) => ({ name: e.name, distance: Math.round(distanceTo(e.position)) }));
 
-	const heldItem = bot.heldItem?.name ?? "bare_hands";
+	const items = driver.inventory.items();
 
 	return {
 		position,
-		health,
-		food,
+		health: state.health,
+		food: state.food,
 		environment: {
-			biome: biomeName,
-			timeOfDay,
-			weather,
-			lightLevel,
+			biome,
+			timeOfDay: detectTimeOfDay(state.timeOfDay),
+			weather: state.isRaining ? "rain" : "clear",
+			lightLevel: getPerceivedLight(driver, position),
 			nearbyPlayers,
 			nearbyMobs,
 		},
 		inventory: {
-			items: inventoryItems,
-			heldItem,
+			items: items.map((i) => `${i.name} x${i.count}`),
+			heldItem: driver.inventory.heldItem()?.name ?? "bare_hands",
 		},
 		lastDamageCause,
 	};
@@ -126,46 +113,25 @@ function detectTimeOfDay(tick: number): "sunrise" | "day" | "sunset" | "night" {
 	return "night";
 }
 
-function getNearbyPlayers(bot: SafeBot, radius: number): string[] {
-	if (!bot.entity?.position) return [];
-	const entityPos = bot.entity.position;
-
-	return Object.values(bot.players)
-		.filter((p) => p.entity && p.entity.position.distanceTo(entityPos) < radius)
-		.map((p) => p.username);
-}
-
-function getNearbyMobs(bot: SafeBot, radius: number): { name: string; distance: number }[] {
-	if (!bot.entity?.position) return [];
-	const entityPos = bot.entity.position;
-
-	return Object.values(bot.entities)
-		.filter((e) => e.type === "mob" && e.position.distanceTo(entityPos) < radius)
-		.map((e) => ({
-			name: e.name ?? e.displayName ?? e.type,
-			distance: Math.round(e.position.distanceTo(entityPos)),
-		}));
-}
-
-function getPerceivedLight(bot: SafeBot): number {
-	if (!bot.entity) return 0;
-	const pos = bot.entity.position.floored();
+/**
+ * 足元まわり 3x3 の明るさを平均する。
+ * 注意: 統合版はライトレベルをクライアントへ送らないため近似値になる。
+ *       厳密な値を前提にした判定をここより上流に書かないこと。
+ */
+function getPerceivedLight(driver: BotDriver, position: Position): number {
+	const base = { x: Math.floor(position.x), y: Math.floor(position.y), z: Math.floor(position.z) };
 	const samples: number[] = [];
 
 	for (let dx = -1; dx <= 1; dx++) {
 		for (let dz = -1; dz <= 1; dz++) {
-			const block = bot.blockAt(pos.offset(dx, 0, dz));
-			if (!block) continue;
-
-			const raw = Math.max(block.light ?? 0, (block as any).skyLight ?? 0);
-
-			samples.push(raw);
+			try {
+				samples.push(driver.world.getLightLevel({ x: base.x + dx, y: base.y, z: base.z + dz }));
+			} catch {
+				// 未対応エディションやチャンク未ロードでは単に取れない
+			}
 		}
 	}
 
 	if (samples.length === 0) return 0;
-
-	const avg = samples.reduce((a, b) => a + b, 0) / samples.length;
-
-	return Math.round(avg);
+	return Math.round(samples.reduce((a, b) => a + b, 0) / samples.length);
 }

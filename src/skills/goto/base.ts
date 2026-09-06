@@ -1,4 +1,3 @@
-import { goals } from "mineflayer-pathfinder";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
 export const gotoBaseSkill = createSkill<void, { baseId: string; reason: string }>({
@@ -10,32 +9,30 @@ export const gotoBaseSkill = createSkill<void, { baseId: string; reason: string 
 		agent,
 		signal,
 	}): Promise<SkillResponse<{ baseId: string; reason: string }>> => {
-		const { bot } = agent;
-		if (!bot.entity) return skillResult.fail("Bot entity not loaded");
+		const { driver } = agent;
+		const state = driver.getState();
+		if (!state.isReady) return skillResult.fail("Bot entity not loaded");
 		const bases = agent.getBases();
 
 		if (bases.length === 0) {
 			return skillResult.fail("No registered bases found.");
 		}
 
-		const timeOfDay = bot.time.timeOfDay;
+		const timeOfDay = state.timeOfDay;
 		const isNight = timeOfDay >= 13000 && timeOfDay < 23000;
-		const isFullInventory = bot.inventory.slots.filter((s) => s !== null).length >= 36;
+		const isFullInventory = driver.inventory.emptySlotCount() === 0;
 
-		const hasFuel = bot.inventory
-			.items()
-			.some(
-				(i) => i.name === "coal" || i.name === "charcoal" || i.name === "wood" || i.name === "log",
-			);
-		const hasOre = bot.inventory
-			.items()
-			.some(
-				(i) =>
-					i.name.includes("ore") ||
-					i.name.includes("raw_iron") ||
-					i.name.includes("raw_gold") ||
-					i.name.includes("copper_ore"),
-			);
+		const items = driver.inventory.items();
+		const hasFuel = items.some(
+			(i) => i.name === "coal" || i.name === "charcoal" || i.name === "wood" || i.name === "log",
+		);
+		const hasOre = items.some(
+			(i) =>
+				i.name.includes("ore") ||
+				i.name.includes("raw_iron") ||
+				i.name.includes("raw_gold") ||
+				i.name.includes("copper_ore"),
+		);
 		const canSmelt = hasFuel && hasOre;
 
 		let targetBase = null;
@@ -52,7 +49,7 @@ export const gotoBaseSkill = createSkill<void, { baseId: string; reason: string 
 		if (!targetBase && isFullInventory) {
 			const storageBases = bases.filter((b) => b.hasStorage);
 			if (storageBases.length > 0) {
-				const pos = bot.entity.position;
+				const pos = state.position;
 				storageBases.sort(
 					(a, b) =>
 						Math.abs(a.position.x - pos.x) +
@@ -67,7 +64,7 @@ export const gotoBaseSkill = createSkill<void, { baseId: string; reason: string 
 		if (!targetBase && isNight) {
 			const safeBases = bases.filter((b) => b.safe);
 			if (safeBases.length > 0) {
-				const pos = bot.entity.position;
+				const pos = state.position;
 				safeBases.sort(
 					(a, b) =>
 						Math.abs(a.position.x - pos.x) +
@@ -80,7 +77,7 @@ export const gotoBaseSkill = createSkill<void, { baseId: string; reason: string 
 		}
 
 		if (!targetBase) {
-			const pos = bot.entity.position;
+			const pos = state.position;
 			const sorted = [...bases].sort(
 				(a, b) =>
 					Math.abs(a.position.x - pos.x) +
@@ -96,13 +93,11 @@ export const gotoBaseSkill = createSkill<void, { baseId: string; reason: string 
 		);
 
 		try {
-			const goal = new goals.GoalNear(
-				targetBase.position.x,
-				targetBase.position.y,
-				targetBase.position.z,
-				2,
-			);
-			await agent.abortableGoto(signal, goal);
+			await agent.driver.goto(signal, {
+				kind: "near",
+				position: targetBase.position,
+				distance: 2,
+			});
 			return skillResult.ok(`Returned to base ${targetBase.id}. Reason: ${reason}`, {
 				baseId: targetBase.id,
 				reason,

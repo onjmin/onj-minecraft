@@ -1,32 +1,47 @@
-import { Vec3 } from "vec3";
 import type { MinecraftAgent } from "../../core/agent";
-import type { SafeBot } from "../../core/types";
+import type { BlockInfo, Position } from "../../core/driver/types";
 
-type Block = NonNullable<ReturnType<SafeBot["blockAt"]>>;
-
-interface PlaceableBlock extends Block {
-	_needsDig?: boolean;
-	_digTarget?: Block;
+/**
+ * 設置候補。元実装は Block オブジェクトに _needsDig / _digTarget を生やしていたが、
+ * エディション固有の Block に依存しないよう独立した型にした。
+ */
+interface PlaceCandidate {
+	block: BlockInfo;
+	dist: number;
+	needsDig: boolean;
+	digTarget?: BlockInfo;
 }
+
+/**
+ * 中断しない AbortSignal。
+ * 元実装の設置・整地処理は AbortSignal を見ていなかったため、挙動を変えないために使う。
+ * TODO: 呼び出し側から signal を引き回せるようになったら差し替える。
+ */
+const neverAbort = (): AbortSignal => new AbortController().signal;
+
+/** 上面(0,1,0)に設置することを示すオフセット。 */
+const UP: Position = { x: 0, y: 1, z: 0 };
 
 /**
  * 設置を試みる（複数の位置でリトライ）
  * 候補が埋まっている場合は、掘ってでも設置を試みる
  */
 export async function tryPlaceBlock(
-	bot: SafeBot,
-	itemName: string,
-	blockId: number,
 	agent: MinecraftAgent,
-	targetPos?: Vec3,
-): Promise<Block | null> {
-	let positions: PlaceableBlock[];
+	itemName: string,
+	blockName: string,
+	targetPos?: Position,
+): Promise<BlockInfo | null> {
+	const { driver } = agent;
+
+	let positions: PlaceCandidate[];
 	if (targetPos) {
-		const block = bot.blockAt(targetPos.offset(0, -1, 0)); // 下のブロックを土台にする
+		// 下のブロックを土台にする
+		const block = driver.world.blockAt({ ...targetPos, y: targetPos.y - 1 });
 		if (!block) return null;
-		positions = [block as PlaceableBlock];
+		positions = [{ block, dist: 0, needsDig: false }];
 	} else {
-		positions = findAllPlaceablePositions(bot) as PlaceableBlock[];
+		positions = findAllPlaceablePositions(agent);
 	}
 	agent.log(`[tryPlaceBlock] Found ${positions.length} positions`);
 
@@ -35,36 +50,34 @@ export async function tryPlaceBlock(
 		return null;
 	}
 
-	const item = bot.inventory.items().find((i) => i.name === itemName);
+	const item = driver.inventory.items().find((i) => i.name === itemName);
 	if (!item) {
 		agent.log(`[tryPlaceBlock] Item not found in inventory: ${itemName}`);
 		return null;
 	}
 	agent.log(`[tryPlaceBlock] Item found: ${item.name}, count=${item.count}`);
 
-	for (const refBlock of positions) {
+	for (const candidate of positions) {
+		const refBlock = candidate.block;
 		agent.log(
-			`[tryPlaceBlock] Trying at ${refBlock.position}, ref=${refBlock.name}, needsDig=${refBlock._needsDig}`,
+			`[tryPlaceBlock] Trying at ${JSON.stringify(refBlock.position)}, ref=${refBlock.name}, needsDig=${candidate.needsDig}`,
 		);
 
 		try {
-			await bot.equip(item, "hand");
+			await driver.equip(item.name, "hand");
 			agent.log(`[tryPlaceBlock] Equipped ${item.name}`);
 
 			await new Promise((r) => setTimeout(r, 500));
 
-			if (refBlock._needsDig && refBlock._digTarget) {
-				agent.log(`[tryPlaceBlock] Digging blocking block: ${refBlock._digTarget.name}`);
-				const toolPlugin = (bot as any).tool;
-				if (toolPlugin) {
-					await toolPlugin.equipForBlock(refBlock._digTarget);
-				}
-				await bot.dig(refBlock._digTarget);
+			if (candidate.needsDig && candidate.digTarget) {
+				agent.log(`[tryPlaceBlock] Digging blocking block: ${candidate.digTarget.name}`);
+				await driver.equipBestTool(candidate.digTarget.position);
+				await driver.dig(neverAbort(), candidate.digTarget.position);
 				await new Promise((r) => setTimeout(r, 500));
 			}
 
 			try {
-				await bot.placeBlock(refBlock, new Vec3(0, 1, 0));
+				await driver.placeBlock(neverAbort(), refBlock.position, UP);
 				agent.log(`[tryPlaceBlock] placeBlock returned`);
 			} catch (placeErr) {
 				agent.log(`[tryPlaceBlock] placeBlock error: ${placeErr}`);
@@ -72,19 +85,16 @@ export async function tryPlaceBlock(
 			}
 
 			await new Promise((r) => setTimeout(r, 500));
-			const placed = bot.findBlock({
-				matching: blockId,
-				maxDistance: 4,
-			});
+			const placed = driver.world.findBlock([blockName], 4);
 
 			if (placed) {
-				agent.log(`[tryPlaceBlock] SUCCESS at ${refBlock.position}`);
+				agent.log(`[tryPlaceBlock] SUCCESS at ${JSON.stringify(refBlock.position)}`);
 				return placed;
 			} else {
 				agent.log(`[tryPlaceBlock] Block not found after placement`);
 			}
 		} catch (e) {
-			agent.log(`[tryPlaceBlock] Error at ${refBlock.position}: ${e}`);
+			agent.log(`[tryPlaceBlock] Error at ${JSON.stringify(refBlock.position)}: ${e}`);
 		}
 	}
 
@@ -123,16 +133,28 @@ function isDiggable(name: string): boolean {
  * 設置可能な位置をすべて取得（拡張版）
  * 設置可能な場所がない場合は、掘ってでも場所を作る候補を含める
  */
-export function findAllPlaceablePositions(bot: SafeBot): Block[] {
-	const candidates: { block: Block; dist: number; needsDig: boolean; digTarget?: Block }[] = [];
-	if (!bot.entity) return [];
-	const agentY = Math.floor(bot.entity.position.y);
+export function findAllPlaceablePositions(agent: MinecraftAgent): PlaceCandidate[] {
+	const { driver } = agent;
+	const candidates: PlaceCandidate[] = [];
+
+	const state = driver.getState();
+	if (!state.isReady) return [];
+	const agentY = Math.floor(state.position.y);
+	const base = {
+		x: Math.floor(state.position.x),
+		y: Math.floor(state.position.y),
+		z: Math.floor(state.position.z),
+	};
 
 	for (let dx = -3; dx <= 3; dx++) {
 		for (let dz = -3; dz <= 3; dz++) {
 			if (dx === 0 && dz === 0) continue;
 
-			const refBlock = bot.blockAt(bot.entity.position.offset(dx, -1, dz));
+			const refBlock = driver.world.blockAt({
+				x: base.x + dx,
+				y: base.y - 1,
+				z: base.z + dz,
+			});
 			if (!refBlock || refBlock.name === "air") continue;
 
 			// エージェントより下の座標は除外
@@ -141,12 +163,15 @@ export function findAllPlaceablePositions(bot: SafeBot): Block[] {
 			const invalidBlocks = ["water", "lava", "fire", "grass", "tall_grass", "fern", "snow"];
 			if (invalidBlocks.includes(refBlock.name)) continue;
 
-			const blockAbove = bot.blockAt(refBlock.position.offset(0, 1, 0));
+			const blockAbove = driver.world.blockAt({
+				...refBlock.position,
+				y: refBlock.position.y + 1,
+			});
 
 			if (blockAbove && blockAbove.name === "air") {
 				const dist = Math.abs(dx) + Math.abs(dz);
 				candidates.push({ block: refBlock, dist, needsDig: false });
-			} else if (blockAbove && isDiggable(blockAbove.name) && bot.canDigBlock(blockAbove)) {
+			} else if (blockAbove && isDiggable(blockAbove.name) && blockAbove.diggable) {
 				const dist = Math.abs(dx) + Math.abs(dz);
 				candidates.push({ block: refBlock, dist, needsDig: true, digTarget: blockAbove });
 			}
@@ -154,46 +179,122 @@ export function findAllPlaceablePositions(bot: SafeBot): Block[] {
 	}
 
 	candidates.sort((a, b) => a.dist - b.dist);
-	return candidates.map((c) => ({
-		...c.block,
-		_needsDig: c.needsDig,
-		_digTarget: c.digTarget,
-	})) as unknown as Block[];
+	return candidates;
+}
+
+/**
+ * 原木名から板材名を導く (birch_log -> birch_planks)。
+ *
+ * 接尾辞は末尾でのみ落とす。以前は `/_log|_stem|_wood$/` と書いていて、
+ * `$` が最後の選択肢にしか掛からず `_log` はどこにあっても消えていた。
+ *
+ * 皮を剥いだ原木も同じ板材になる。stripped_ を付けたままだと
+ * stripped_oak_planks という存在しない名前を作り、レシピが引けずに
+ * 「木は持っているのに板材が作れない」で連鎖が止まる。
+ */
+function plankNameFromLog(logName: string): string {
+	const base = logName.replace(/^stripped_/, "").replace(/(_log|_stem|_wood|_hyphae)$/, "");
+	return `${base}_planks`;
+}
+
+/** インベントリから最初に見つかった原木を返す。 */
+function findLog(agent: MinecraftAgent) {
+	return agent.driver.inventory
+		.items()
+		.find((i) => i.name.endsWith("_log") || i.name.endsWith("_stem") || i.name.endsWith("_wood"));
+}
+
+/** インベントリから最初に見つかった板材を返す。 */
+function findPlanks(agent: MinecraftAgent) {
+	return agent.driver.inventory.items().find((i) => i.name.endsWith("_planks"));
+}
+
+/**
+ * 板材の合計枚数。種類も山も問わずに数える。
+ *
+ * findPlanks() は最初の1山しか返さない。樫と白樺を両方持っていると
+ * oak_planks:2 と birch_planks:3 が別の山になり、合計5枚あるのに
+ * 「2枚しかない」と判定される。作業台は板材4枚だが、板材のレシピは
+ * タグ指定なので種類が混ざっていても作れる。数えるときも混ぜて数える。
+ *
+ * これを1山で見ていたため、材料が足りているのに作業台が用意できず、
+ * 木の剣が最後まで作れないことがあった。
+ */
+export function countPlanks(agent: MinecraftAgent): number {
+	return agent.driver.inventory
+		.items()
+		.filter((i) => i.name.endsWith("_planks"))
+		.reduce((sum, i) => sum + i.count, 0);
+}
+
+/** 原木の合計本数。1本で板材4枚になる。 */
+export function countLogs(agent: MinecraftAgent): number {
+	return agent.driver.inventory
+		.items()
+		.filter((i) => i.name.endsWith("_log") || i.name.endsWith("_stem") || i.name.endsWith("_wood"))
+		.reduce((sum, i) => sum + i.count, 0);
+}
+
+/** 品目の合計。同じ物が複数スロットに散っていても数え落とさない。 */
+export function countItem(agent: MinecraftAgent, name: string): number {
+	return agent.driver.inventory
+		.items()
+		.reduce((sum, i) => (i.name === name ? sum + i.count : sum), 0);
+}
+
+/**
+ * driver.craft() を安全に呼ぶ。
+ *
+ * 統合版はサーバーに拒否されると例外を投げる(BedrockDriver.craft は
+ * sidecar.send を経由し、送信側が ok:false を reject にしている)。
+ * ここの ensureXxx 系はどれもその前提を忘れて素通しにしていたため、
+ * 拒否が丸ごと ensureSticks/ensurePlanks の外まで抜け、呼び出し元の
+ * crafting.tool / crafting.weapon の try ブロックにも入らずに
+ * MinecraftAgent の反射ループまで届いていた。そこでは「aborted」と
+ * 誤表記された上で例外を再送出し、指数バックオフ(最大30秒)だけがかかって
+ * 同じ拒否を延々と繰り返す。skillStats にも一切残らないので、LLM から見て
+ * 「crafting.weapon が失敗し続けている」ことにすら気づけなかった。
+ * 失敗は例外ではなく戻り値の false で返し、ここで一度だけログする。
+ */
+async function tryCraft(
+	agent: MinecraftAgent,
+	label: string,
+	itemName: string,
+	count: number,
+	craftingTable?: Position,
+): Promise<boolean> {
+	try {
+		await agent.driver.craft(itemName, count, craftingTable);
+		return true;
+	} catch (err) {
+		agent.log(`[${label}] クラフトが拒否された: ${itemName} x${count}: ${err}`);
+		return false;
+	}
 }
 
 /**
  * 共通ロジック：作業台を確保する（周辺スキャン -> 作成 -> 設置）
- * @returns 確保された作業台のBlockオブジェクト、確保失敗時は null
+ * @returns 確保された作業台のブロック、確保失敗時は null
  */
-export async function ensureCraftingTable(agent: MinecraftAgent): Promise<Block | null> {
-	const { bot } = agent;
+export async function ensureCraftingTable(agent: MinecraftAgent): Promise<BlockInfo | null> {
+	const { driver } = agent;
 
 	// 1. 周辺スキャン
-	const tableBlock = bot.findBlock({
-		matching: bot.registry.blocksByName.crafting_table.id,
-		maxDistance: 4,
-	});
+	const tableBlock = driver.world.findBlock(["crafting_table"], 4);
 
 	agent.log(`[ensureCraftingTable] Scanning nearby: found=${!!tableBlock}`);
 	if (tableBlock) return tableBlock;
 
 	// 2. インベントリ確認
-	let tableItem = bot.inventory.items().find((i) => i.name === "crafting_table");
+	let tableItem = driver.inventory.items().find((i) => i.name === "crafting_table");
 	agent.log(`[ensureCraftingTable] In inventory: found=${!!tableItem}`);
 
 	// 3. なければ作る（原木 -> 板材 -> 作業台）
 	if (!tableItem) {
-		let planks = bot.inventory.items().find((i) => i.name.endsWith("_planks"));
-		agent.log(
-			`[ensureCraftingTable] Planks in inventory: found=${!!planks}, count=${planks?.count || 0}`,
-		);
+		agent.log(`[ensureCraftingTable] Planks in inventory: total=${countPlanks(agent)}`);
 
-		if (!planks || planks.count < 4) {
-			const logItem = bot.inventory
-				.items()
-				.find(
-					(i) => i.name.endsWith("_log") || i.name.endsWith("_stem") || i.name.endsWith("_wood"),
-				);
+		if (countPlanks(agent) < 4) {
+			const logItem = findLog(agent);
 
 			agent.log(
 				`[ensureCraftingTable] Logs in inventory: found=${!!logItem}, name=${logItem?.name}`,
@@ -203,44 +304,32 @@ export async function ensureCraftingTable(agent: MinecraftAgent): Promise<Block 
 				return null;
 			}
 
-			const logBaseName = logItem.name.replace(/_log|_stem|_wood$/, "");
-			const plankItemName = `${logBaseName}_planks`;
-			const plankItem = bot.registry.itemsByName[plankItemName];
-			const recipes = bot.recipesFor(plankItem?.id, null, 1, null);
-			agent.log(`[ensureCraftingTable] Plank recipes: count=${recipes.length}`);
+			const plankItemName = plankNameFromLog(logItem.name);
+			const canCraftPlanks = driver.canCraft(plankItemName);
+			agent.log(`[ensureCraftingTable] Plank recipe: found=${canCraftPlanks}`);
 
-			const plankRecipe = recipes[0];
-			if (!plankRecipe) {
+			if (!canCraftPlanks) {
 				agent.log(`[ensureCraftingTable] FAIL: No plank recipe`);
 				return null;
 			}
-			await bot.craft(plankRecipe, 1);
-			planks = bot.inventory.items().find((i) => i.name.endsWith("_planks"));
-			agent.log(`[ensureCraftingTable] After crafting planks: count=${planks?.count || 0}`);
+			await tryCraft(agent, "ensureCraftingTable", plankItemName, 1);
+			agent.log(`[ensureCraftingTable] After crafting planks: total=${countPlanks(agent)}`);
 		}
 
-		if (planks && planks.count >= 4) {
-			const tableRecipe = bot.recipesFor(
-				bot.registry.itemsByName.crafting_table.id,
-				null,
-				1,
-				null,
-			)[0];
-			agent.log(`[ensureCraftingTable] Table recipe: found=${!!tableRecipe}`);
-			await bot.craft(tableRecipe, 1);
-			tableItem = bot.inventory.items().find((i) => i.name === "crafting_table");
+		if (countPlanks(agent) >= 4) {
+			const canCraftTable = driver.canCraft("crafting_table");
+			agent.log(`[ensureCraftingTable] Table recipe: found=${canCraftTable}`);
+			if (canCraftTable) {
+				await tryCraft(agent, "ensureCraftingTable", "crafting_table", 1);
+			}
+			tableItem = driver.inventory.items().find((i) => i.name === "crafting_table");
 			agent.log(`[ensureCraftingTable] Crafted table item: found=${!!tableItem}`);
 		}
 	}
 
 	// 4. 設置する
 	if (tableItem) {
-		const placed = await tryPlaceBlock(
-			bot,
-			tableItem.name,
-			bot.registry.blocksByName.crafting_table.id,
-			agent,
-		);
+		const placed = await tryPlaceBlock(agent, tableItem.name, "crafting_table");
 		agent.log(`[ensureCraftingTable] Placed: found=${!!placed}`);
 		return placed;
 	}
@@ -251,33 +340,30 @@ export async function ensureCraftingTable(agent: MinecraftAgent): Promise<Block 
 
 /**
  * 共通ロジック：かまどを確保する（周辺スキャン -> 作成 -> 設置）
- * @returns 確保されたかまどのBlockオブジェクト、確保失敗時は null
+ * @returns 確保されたかまどのブロック、確保失敗時は null
  */
-export async function ensureFurnace(agent: MinecraftAgent): Promise<Block | null> {
-	const { bot } = agent;
+export async function ensureFurnace(agent: MinecraftAgent): Promise<BlockInfo | null> {
+	const { driver } = agent;
 
 	// 1. 周辺スキャン
-	const furnaceBlock = bot.findBlock({
-		matching: bot.registry.blocksByName.furnace.id,
-		maxDistance: 4,
-	});
+	const furnaceBlock = driver.world.findBlock(["furnace"], 4);
 
 	agent.log(`[ensureFurnace] Scanning nearby: found=${!!furnaceBlock}`);
 	if (furnaceBlock) return furnaceBlock;
 
 	// 2. インベントリ確認
-	let furnaceItem = bot.inventory.items().find((i) => i.name === "furnace");
+	let furnaceItem = driver.inventory.items().find((i) => i.name === "furnace");
 	agent.log(`[ensureFurnace] In inventory: found=${!!furnaceItem}`);
 
 	// 3. なければ作る（丸石 x 8 -> かまど）
 	if (!furnaceItem) {
-		const cobble = bot.inventory.items().find((i) => i.name === "cobblestone");
-		agent.log(
-			`[ensureFurnace] Cobble in inventory: found=${!!cobble}, count=${cobble?.count || 0}`,
-		);
+		// 山ごとではなく合計で数える。丸石が 4+4 の2山に分かれているとき、
+		// 最初の山だけを見て「8個に足りない」と判定していた。
+		const cobble = countItem(agent, "cobblestone");
+		agent.log(`[ensureFurnace] Cobble in inventory: total=${cobble}`);
 
 		// 丸石が8個以上必要
-		if (!cobble || cobble.count < 8) {
+		if (cobble < 8) {
 			agent.log(`[ensureFurnace] FAIL: Not enough cobble (need 8)`);
 			return null;
 		}
@@ -289,24 +375,19 @@ export async function ensureFurnace(agent: MinecraftAgent): Promise<Block | null
 			return null;
 		}
 
-		const furnaceRecipe = bot.recipesFor(bot.registry.itemsByName.furnace.id, null, 1, table)[0];
-		agent.log(`[ensureFurnace] Furnace recipe: found=${!!furnaceRecipe}`);
+		const canCraftFurnace = driver.canCraft("furnace", table.position);
+		agent.log(`[ensureFurnace] Furnace recipe: found=${canCraftFurnace}`);
 
-		if (!furnaceRecipe) return null;
+		if (!canCraftFurnace) return null;
 
-		await bot.craft(furnaceRecipe, 1, table);
-		furnaceItem = bot.inventory.items().find((i) => i.name === "furnace");
+		await tryCraft(agent, "ensureFurnace", "furnace", 1, table.position);
+		furnaceItem = driver.inventory.items().find((i) => i.name === "furnace");
 		agent.log(`[ensureFurnace] Crafted furnace: found=${!!furnaceItem}`);
 	}
 
 	// 4. 設置する
 	if (furnaceItem) {
-		const placed = await tryPlaceBlock(
-			bot,
-			furnaceItem.name,
-			bot.registry.blocksByName.furnace.id,
-			agent,
-		);
+		const placed = await tryPlaceBlock(agent, furnaceItem.name, "furnace");
 		agent.log(`[ensureFurnace] Placed: found=${!!placed}`);
 		return placed;
 	}
@@ -321,24 +402,19 @@ export async function ensureFurnace(agent: MinecraftAgent): Promise<Block | null
  * @returns 確保成功時は true
  */
 export async function ensureSticks(agent: MinecraftAgent, count = 4): Promise<boolean> {
-	const { bot } = agent;
+	const { driver } = agent;
 
-	// 1. インベントリ確認
-	const sticks = bot.inventory.items().find((i) => i.name === "stick");
-	agent.log(
-		`[ensureSticks] sticks found=${!!sticks}, count=${sticks?.count || 0}, required=${count}`,
-	);
-	if (sticks && sticks.count >= count) return true;
+	// 1. インベントリ確認。棒も複数の山に分かれうるので合計で見る。
+	agent.log(`[ensureSticks] sticks total=${countItem(agent, "stick")}, required=${count}`);
+	if (countItem(agent, "stick") >= count) return true;
 
 	// 2. なければ作る（板材 -> 棒）
-	let planks = bot.inventory.items().find((i) => i.name.endsWith("_planks"));
-	agent.log(`[ensureSticks] planks: found=${!!planks}, count=${planks?.count || 0}`);
+	let planks = findPlanks(agent);
+	agent.log(`[ensureSticks] planks: total=${countPlanks(agent)}`);
 
 	// 板材がない場合は原木から作る（再帰的に板材を確保するようなロジック）
-	if (!planks || planks.count < 2) {
-		const logItem = bot.inventory
-			.items()
-			.find((i) => i.name.endsWith("_log") || i.name.endsWith("_stem") || i.name.endsWith("_wood"));
+	if (countPlanks(agent) < 2) {
+		const logItem = findLog(agent);
 
 		agent.log(
 			`[ensureSticks] logs: found=${!!logItem}, name=${logItem?.name}, count=${logItem?.count || 0}`,
@@ -350,43 +426,35 @@ export async function ensureSticks(agent: MinecraftAgent, count = 4): Promise<bo
 		}
 
 		// 原木の種類に合わせて板材名を作る (birch_log -> birch_planks)
-		const logBaseName = logItem.name.replace(/_log|_stem|_wood$/, "");
-		const plankItemName = `${logBaseName}_planks`;
+		const plankItemName = plankNameFromLog(logItem.name);
 		agent.log(`[ensureSticks] Looking for plank: ${plankItemName}`);
-		const plankItem = bot.registry.itemsByName[plankItemName];
-		agent.log(`[ensureSticks] plankItem: ${plankItem?.name}, id=${plankItem?.id}`);
-		const recipes = bot.recipesFor(plankItem?.id, null, 1, null);
-		agent.log(`[ensureSticks] Found ${recipes.length} plank recipes, idUsed=${plankItem?.id}`);
+		const canCraftPlanks = driver.canCraft(plankItemName);
+		agent.log(`[ensureSticks] plankRecipe: found=${canCraftPlanks}`);
 
-		const plankRecipe = recipes[0];
+		if (!canCraftPlanks) return false;
 
-		agent.log(`[ensureSticks] plankRecipe: found=${!!plankRecipe}`);
-		if (!plankRecipe) return false;
-
-		await bot.craft(plankRecipe, 1);
-		planks = bot.inventory.items().find((i) => i.name.endsWith("_planks"));
+		if (!(await tryCraft(agent, "ensureSticks", plankItemName, 1))) return false;
+		planks = findPlanks(agent);
 		agent.log(
 			`[ensureSticks] After crafting planks: found=${!!planks}, count=${planks?.count || 0}`,
 		);
 	}
 
 	// 3. 棒をクラフト（2枚の板材から4本の棒）
-	if (planks && planks.count >= 2) {
-		const stickRecipe = bot.recipesFor(
-			bot.registry.itemsByName.stick.id,
-			null,
-			1,
-			null, // 棒は作業台不要
-		)[0];
+	if (countPlanks(agent) >= 2) {
+		// 棒は作業台不要
+		const canCraftSticks = driver.canCraft("stick");
 
-		agent.log(`[ensureSticks] stickRecipe: found=${!!stickRecipe}`);
+		agent.log(`[ensureSticks] stickRecipe: found=${canCraftSticks}`);
 
-		if (stickRecipe) {
-			await bot.craft(stickRecipe, Math.ceil(count / 4));
-			const sticksAfter = bot.inventory.items().find((i) => i.name === "stick");
-			agent.log(`[ensureSticks] After crafting sticks: count=${sticksAfter?.count || 0}`);
-			agent.log(`[ensureSticks] SUCCESS: Crafted sticks`);
-			return true;
+		if (canCraftSticks) {
+			await tryCraft(agent, "ensureSticks", "stick", Math.ceil(count / 4));
+			// 作ったつもりで数を確かめずに true を返していた。クラフトが
+			// 弾かれても成功として返るので、呼び出し側は棒があるものとして
+			// 剣の作成へ進み、そこで初めて失敗する。実際に増えたかで答える。
+			const after = countItem(agent, "stick");
+			agent.log(`[ensureSticks] After crafting sticks: total=${after}`);
+			return after >= count;
 		}
 	}
 
@@ -401,120 +469,107 @@ export async function ensureSticks(agent: MinecraftAgent, count = 4): Promise<bo
  * @returns 確保成功時は true
  */
 export async function ensurePlanks(agent: MinecraftAgent, minCount = 4): Promise<boolean> {
-	const { bot } = agent;
+	const { driver } = agent;
 
-	const planks = bot.inventory.items().find((i) => i.name.endsWith("_planks"));
-	if (planks && planks.count >= minCount) {
-		agent.log(`[ensurePlanks] Already have enough planks: ${planks.count}`);
+	const have = countPlanks(agent);
+	if (have >= minCount) {
+		agent.log(`[ensurePlanks] Already have enough planks: ${have}`);
 		return true;
 	}
-
-	if (planks) {
-		agent.log(`[ensurePlanks] Already have some planks: ${planks.count}, need ${minCount}`);
-	}
+	agent.log(`[ensurePlanks] Have ${have} planks, need ${minCount}`);
 
 	agent.log(
-		`[ensurePlanks] Current inventory: ${bot.inventory
+		`[ensurePlanks] Current inventory: ${driver.inventory
 			.items()
 			.map((i) => `${i.name}:${i.count}`)
 			.join(", ")}`,
 	);
 
-	const logItem = bot.inventory
-		.items()
-		.find((i) => i.name.endsWith("_log") || i.name.endsWith("_stem") || i.name.endsWith("_wood"));
+	const logItem = findLog(agent);
 
 	if (!logItem) {
 		agent.log(
-			`[ensurePlanks] FAIL: No logs in inventory, and not enough planks (have ${planks?.count || 0}, need ${minCount})`,
+			`[ensurePlanks] FAIL: No logs in inventory, and not enough planks (have ${have}, need ${minCount})`,
 		);
 		return false;
 	}
 
 	// 原木の種類に合わせて板材名を作る
-	const logBaseName = logItem.name.replace(/_log|_stem|_wood$/, "");
-	const plankItemName = `${logBaseName}_planks`;
-	const plankItem = bot.registry.itemsByName[plankItemName];
+	const plankItemName = plankNameFromLog(logItem.name);
 
 	agent.log(`[ensurePlanks] Converting ${logItem.name} to ${plankItemName}`);
 
-	const recipes = bot.recipesFor(plankItem?.id, null, 1, null);
-	if (recipes.length === 0) {
+	if (!driver.canCraft(plankItemName)) {
 		agent.log(`[ensurePlanks] FAIL: No recipe for ${plankItemName}`);
 		return false;
 	}
 
-	// 必要な板材の数に合わせて原木の数を変える（1原木 = 4板材）
-	const logsNeeded = Math.ceil(minCount / 4);
-	await bot.craft(recipes[0], logsNeeded);
+	// 足りないぶんだけ作る。1原木 = 板材4枚。
+	// 既に持っているぶんを引かずに minCount 全部を作ろうとしていたので、
+	// 原木を余計に潰していた。
+	const logsNeeded = Math.ceil((minCount - have) / 4);
+	await tryCraft(agent, "ensurePlanks", plankItemName, Math.max(1, logsNeeded));
 
-	const planksAfter = bot.inventory.items().find((i) => i.name.endsWith("_planks"));
-	agent.log(`[ensurePlanks] After crafting: count=${planksAfter?.count || 0}`);
+	const after = countPlanks(agent);
+	agent.log(`[ensurePlanks] After crafting: total=${after}`);
 
-	return Boolean(planksAfter && planksAfter.count >= minCount);
+	return after >= minCount;
 }
 
 /**
  * 共通ロジック：チェストを確保する（周辺スキャン -> 作成 -> 設置）
- * @returns 確保されたチェストのBlockオブジェクト、確保失敗時は null
+ * @returns 確保されたチェストのブロック、確保失敗時は null
  */
-export async function ensureChest(agent: MinecraftAgent): Promise<Block | null> {
-	const { bot } = agent;
+export async function ensureChest(agent: MinecraftAgent): Promise<BlockInfo | null> {
+	const { driver } = agent;
 
 	// 1. 周辺スキャン
-	const chestBlock = bot.findBlock({
-		matching: bot.registry.blocksByName.chest.id,
-		maxDistance: 4,
-	});
+	const chestBlock = driver.world.findBlock(["chest"], 4);
 
 	agent.log(`[ensureChest] Scanning nearby: found=${!!chestBlock}`);
 	if (chestBlock) return chestBlock;
 
 	// 2. インベントリ確認
-	let chestItem = bot.inventory.items().find((i) => i.name === "chest");
+	let chestItem = driver.inventory.items().find((i) => i.name === "chest");
 	agent.log(`[ensureChest] In inventory: found=${!!chestItem}`);
 
 	// 3. なければ作る（板材 x 8 -> チェスト）
 	if (!chestItem) {
-		let planks = bot.inventory.items().find((i) => i.name.endsWith("_planks"));
-		agent.log(`[ensureChest] Planks in inventory: found=${!!planks}, count=${planks?.count || 0}`);
+		// 板材はタグ指定なので種類が混ざっていても作れる。数えるときも
+		// 山ごとではなく合計で見る。樫4枚と白樺4枚を持っているとき、
+		// 山で見ると8枚あるのに「足りない」と判定していた。
+		agent.log(`[ensureChest] Planks in inventory: total=${countPlanks(agent)}`);
 
-		if (!planks || planks.count < 8) {
+		if (countPlanks(agent) < 8) {
 			agent.log(`[ensureChest] Not enough planks (need 8)`);
 			const ensured = await ensurePlanks(agent, 8);
 			if (!ensured) {
 				agent.log(`[ensureChest] FAIL: Could not ensure planks`);
 				return null;
 			}
-			planks = bot.inventory.items().find((i) => i.name.endsWith("_planks"));
 		}
 
-		if (planks && planks.count >= 8) {
+		if (countPlanks(agent) >= 8) {
 			const table = await ensureCraftingTable(agent);
 			if (!table) {
 				agent.log(`[ensureChest] FAIL: No crafting table`);
 				return null;
 			}
 
-			const chestRecipe = bot.recipesFor(bot.registry.itemsByName.chest.id, null, 1, table)[0];
-			agent.log(`[ensureChest] Chest recipe: found=${!!chestRecipe}`);
+			const canCraftChest = driver.canCraft("chest", table.position);
+			agent.log(`[ensureChest] Chest recipe: found=${canCraftChest}`);
 
-			if (!chestRecipe) return null;
+			if (!canCraftChest) return null;
 
-			await bot.craft(chestRecipe, 1, table);
-			chestItem = bot.inventory.items().find((i) => i.name === "chest");
+			await tryCraft(agent, "ensureChest", "chest", 1, table.position);
+			chestItem = driver.inventory.items().find((i) => i.name === "chest");
 			agent.log(`[ensureChest] Crafted chest: found=${!!chestItem}`);
 		}
 	}
 
 	// 4. 設置する
 	if (chestItem) {
-		const placed = await tryPlaceBlock(
-			bot,
-			chestItem.name,
-			bot.registry.blocksByName.chest.id,
-			agent,
-		);
+		const placed = await tryPlaceBlock(agent, chestItem.name, "chest");
 		agent.log(`[ensureChest] Placed: found=${!!placed}`);
 		return placed;
 	}
