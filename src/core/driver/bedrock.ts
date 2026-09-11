@@ -156,6 +156,18 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
  * これ以上広げても縦方向は埋まらない。
  */
 const SNAPSHOT_RADIUS = 16;
+/**
+ * findBlocksFar で許す最大の半径。
+ *
+ * サイドカーは要求済みのチャンク(水平±128・垂直±80)を持っている。
+ * 探索は立方体の全走査ではなく、サブチャンクのパレットで先に絞ってから
+ * 中身を引く方式(world.findWide)なので、半径を上げても走査量は
+ * 「人工物のあるサブチャンクの数」でしか増えない。取得している範囲まで
+ * 見せてよい。
+ */
+const FAR_SEARCH_RADIUS = 128;
+/** findBlocksFar の応答待ち。全走査に振れても落ちない程度に取る。 */
+const FAR_SEARCH_TIMEOUT_MS = 8_000;
 
 /** "minecraft:stone" のような名前空間付きでも引けるようにする。 */
 function stripNamespace(name: string): string {
@@ -260,6 +272,7 @@ export class BedrockDriver implements BotDriver {
 			},
 			findBlocksMatching: (predicate, maxDistance, count) =>
 				this.blocks.findMatching(this.state.position, predicate, maxDistance, count),
+			findBlocksFar: (names, maxDistance, count) => this.findBlocksFar(names, maxDistance, count),
 			// 統合版はバイオームもライトレベルもクライアントへ素直に送ってこない。
 			// 近似を返すと skills/ がそれを前提に判断してしまうため、
 			// 判断材料にならない値であることが分かる形で返す。
@@ -281,6 +294,40 @@ export class BedrockDriver implements BotDriver {
 			hasBlock: (name) => this.items.some((i) => i.name === name),
 			hasItem: (name) => this.items.some((i) => i.name === name),
 		};
+	}
+
+	/**
+	 * サイドカーが持っているチャンクを直に引いて、名前の合うブロックを探す。
+	 *
+	 * 同期の find* 系が見ている BlockView は半径16の立方体しかない。16より
+	 * 遠くを指定しても黙って切り詰められるため、「半径48でベッドを探す」と
+	 * 書いたつもりの探索が実際には16しか見ていなかった。遠くを見たいものは
+	 * こちらを使う。
+	 *
+	 * 名前は完全一致。述語は線を越えられないので、接尾辞で探したいものは
+	 * 呼び出し側が候補を並べること。
+	 */
+	private async findBlocksFar(
+		names: string[],
+		maxDistance: number,
+		count: number,
+	): Promise<BlockInfo[]> {
+		if (names.length === 0 || count <= 0) return [];
+		const range = Math.max(1, Math.min(FAR_SEARCH_RADIUS, Math.floor(maxDistance)));
+		try {
+			const res = await this.sidecar.send(
+				"findBlock",
+				{ names: names.map(stripNamespace), range, count },
+				FAR_SEARCH_TIMEOUT_MS,
+			);
+			const found = (res.blocks ?? []) as { name: string; position: number[] }[];
+			return found.map((b) =>
+				BlockView.describe(b.name, { x: b.position[0], y: b.position[1], z: b.position[2] }),
+			);
+		} catch {
+			// 探索の失敗で呼び出し側を止めない。見つからなかったのと同じに扱う。
+			return [];
+		}
 	}
 
 	/** 切断時の追跡用。workflow 側が参照する。 */

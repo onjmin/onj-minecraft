@@ -78,6 +78,12 @@ export class JavaDriver implements BotDriver {
 					.map((v: Vec3) => toBlockInfo(self.bot, self.bot.blockAt(v)))
 					.filter((b: BlockInfo | null): b is BlockInfo => b !== null);
 			},
+			// Java版はワールド全体を持っているので、遠距離も同じ実装で足りる。
+			// 非同期なのは統合版がサイドカーへ問い合わせるためで、こちらは
+			// 待つものが無い。形だけ揃える。
+			async findBlocksFar(names, maxDistance, count) {
+				return this.findBlocks(names, maxDistance, count);
+			},
 			getBiome(position) {
 				try {
 					const id = self.bot.world.getBiome(toVec3(position));

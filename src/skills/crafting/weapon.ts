@@ -18,45 +18,48 @@ export const craftWeaponSkill = createSkill<void, { item: string; material: stri
 	}): Promise<SkillResponse<{ item: string; material: string }>> => {
 		const { driver } = agent;
 
-		// 棒を確保（武器作成には最低2本必要）
-		const sticksReady = await ensureSticks(agent, 2);
-		if (!sticksReady) {
-			// 棒が作れなかった（板材も原木もない）場合は、エラーではなく
-			// 「素材不足」として失敗させることで、LLMに伐採などを促す
-			return skillResult.fail(
-				"Insufficient materials: Need sticks (or wood to make them) to craft skills.",
-			);
-		}
-
-		// 板材を事前に確保（木武器の場合は2枚以上必要）
-		// 剣に2枚、作業台に4枚。まとめて確保する。剣のぶんだけ用意すると、
-		// この直後の ensureCraftingTable が板不足で止まる。実測で
-		// crafting.weapon が28回選ばれて、剣の要求が0回だった。
-		//
-		// 戻り値を捨てていた。板材を用意できなくてもそのまま先へ進み、
-		// 作業台も剣も作れずに「材料不足」以外の分かりにくい失敗になる。
-		// ここで止めれば、伐採へ回るべきだと上位に伝わる。
-		if (!(await ensurePlanks(agent, 6))) {
-			return skillResult.fail(
-				"Insufficient materials: need at least 6 planks (or logs to make them) for a weapon and a crafting table.",
-			);
-		}
-
 		// 1. 次に作るべき装備を判定
+		if (signal?.aborted) return skillResult.fail("Aborted");
 		const target = craftingManager.determineNextWeapon(agent);
 		if (!target) {
 			return skillResult.fail("All combat equipment is already at the highest possible quality.");
 		}
 
+		// 2. 作成対象に応じて必要な材料の下準備
+		if (target.skillType === "sword") {
+			// 剣の作成には棒が1本必要（なければ板材・原木から作る）
+			const sticksReady = await ensureSticks(agent, 1);
+			if (!sticksReady) {
+				return skillResult.fail(
+					"Insufficient materials: Need sticks (or wood to make them) to craft a sword.",
+				);
+			}
+			if (target.material === "wooden") {
+				// 木の剣なら板材2枚が必要
+				if (!(await ensurePlanks(agent, 2))) {
+					return skillResult.fail(
+						"Insufficient materials: Need at least 2 planks to craft a wooden sword.",
+					);
+				}
+			}
+		} else if (target.skillType === "shield") {
+			// 盾なら板材6枚が必要
+			if (!(await ensurePlanks(agent, 6))) {
+				return skillResult.fail(
+					"Insufficient materials: Need at least 6 planks to craft a shield.",
+				);
+			}
+		}
+		// 防具（helmet, chestplate, leggings, boots）は革・鉄・ダイヤ等で作るため追加の木材は不要
+
 		try {
-			// 2. 作業台の確保
+			// 3. 作業台の確保
 			const craftingTable = await ensureCraftingTable(agent);
 
-			// (作業台の設置・作成ロジックは craftSkillSkill と同様なので、実際には共通関数化を推奨)
 			if (!craftingTable)
 				return skillResult.fail("Crafting table is required for weapon maintenance.");
 
-			// 3. 装備のクラフト
+			// 4. 装備のクラフト
 			const itemName =
 				target.skillType === "shield" ? "shield" : `${target.material}_${target.skillType}`;
 			if (!driver.canCraft(itemName, craftingTable.position)) {

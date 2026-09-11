@@ -83,6 +83,7 @@ const REQUIRED_WORLD = [
 	"findBlock",
 	"findBlocks",
 	"findBlocksMatching",
+	"findBlocksFar",
 	"getBiome",
 	"getLightLevel",
 ];

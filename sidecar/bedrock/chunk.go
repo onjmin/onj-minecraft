@@ -11,6 +11,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"math"
+	"sort"
 
 	"github.com/sandertv/gophertunnel/minecraft/nbt"
 )
@@ -247,6 +249,161 @@ func (w *world) blockAt(x, y, z int32) (string, bool) {
 
 // loadedColumns は取得済みの列の数。どれだけ見えているかの目安。
 func (w *world) loadedColumns() int { return len(w.columns) }
+
+// paletteNamesOf はそのサブチャンクに「出てくる可能性のある」ブロック名を返す。
+//
+// パレットはサブチャンク(16x16x16=4096マス)あたり数個〜数十個しかない。
+// 「このサブチャンクに作業台はあるか」を知るのに4096マスを引く必要はなく、
+// パレットを見れば足りる。遠くまで見渡すための肝がこれで、走査量が
+// 3桁変わる。
+func paletteNamesOf(sc *subChunk) []string {
+	if len(sc.Storages) == 0 {
+		return nil
+	}
+	st := &sc.Storages[0]
+	if len(st.PaletteNames) > 0 {
+		out := make([]string, 0, len(st.PaletteNames))
+		for _, n := range st.PaletteNames {
+			out = append(out, trimNamespace(n))
+		}
+		return out
+	}
+	out := make([]string, 0, len(st.Palette))
+	for _, id := range st.Palette {
+		if n, ok := blockNameFor(id); ok {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// findWide は取得済みのチャンクすべてから、名前の合うブロックを近い順に探す。
+//
+// 立方体を総当たりしない。半径128の立方体は1600万マスあり、引けば tick が
+// 止まる。代わりに
+//  1. 取得済みの列を、自分からの水平距離で並べる
+//  2. 各サブチャンクのパレットに目的の名前が入っているかだけ見る
+//  3. 入っていたサブチャンクだけ、中の4096マスを引く
+//
+// の順で絞る。人工物は世界のごく一部にしか無いので、2 でほとんど落ちる。
+//
+// 半径はチャンク単位ではなくブロック単位。取得していない領域は当然見えない
+// ので、実効範囲は requestRadius が決める。
+func (w *world) findWide(
+	ox, oy, oz int32,
+	want map[string]bool,
+	radius float64,
+	count int,
+) []foundBlock {
+	type colRef struct {
+		key  [2]int32
+		dist float64
+	}
+	// まず列を距離順に。列の中心と自分の水平距離で測る。
+	cols := make([]colRef, 0, len(w.columns))
+	for key := range w.columns {
+		cx := float64(key[0]*16 + 8)
+		cz := float64(key[1]*16 + 8)
+		dx := cx - float64(ox)
+		dz := cz - float64(oz)
+		d := math.Sqrt(dx*dx + dz*dz)
+		// 列の中心が範囲外でも、手前の角は届いていることがある。
+		// 半分の対角(約11.3)ぶん甘く見る。
+		if d-11.4 > radius {
+			continue
+		}
+		cols = append(cols, colRef{key, d})
+	}
+	sort.Slice(cols, func(i, j int) bool { return cols[i].dist < cols[j].dist })
+
+	out := make([]foundBlock, 0, count)
+	for _, c := range cols {
+		col := w.columns[c.key]
+		for idx, sc := range col {
+			// パレットで落とす。ここが効くので総当たりにならない。
+			hit := false
+			for _, n := range paletteNamesOf(sc) {
+				if want[n] {
+					hit = true
+					break
+				}
+			}
+			if !hit {
+				continue
+			}
+			baseX := c.key[0] * 16
+			baseY := int32(idx) * 16
+			baseZ := c.key[1] * 16
+			for lx := int32(0); lx < 16; lx++ {
+				for lz := int32(0); lz < 16; lz++ {
+					for ly := int32(0); ly < 16; ly++ {
+						x, y, z := baseX+lx, baseY+ly, baseZ+lz
+						name, ok := w.blockAt(x, y, z)
+						if !ok || !want[name] {
+							continue
+						}
+						dx := float64(x - ox)
+						dy := float64(y - oy)
+						dz := float64(z - oz)
+						d := math.Sqrt(dx*dx + dy*dy + dz*dz)
+						if d > radius {
+							continue
+						}
+						out = append(out, foundBlock{Name: name, X: x, Y: y, Z: z, Dist: d})
+					}
+				}
+			}
+		}
+		// 近い列から見ているので、必要数が揃ったらそこで切り上げてよい。
+		// ただし同じ列の中では距離順になっていないため、最後に並べ直す。
+		if len(out) >= count {
+			break
+		}
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].Dist < out[j].Dist })
+	if len(out) > count {
+		out = out[:count]
+	}
+	return out
+}
+
+// foundBlock は findWide の結果。距離を持たせるのは並べ替えのため。
+type foundBlock struct {
+	Name string
+	X    int32
+	Y    int32
+	Z    int32
+	Dist float64
+}
+
+// forget は中心から remove チャンクより遠い列を捨てる。
+//
+// 取得した列は今まで一度も捨てていなかった。歩き回るほど積み上がるので、
+// 要求範囲を広げるならここが要る。捨てた列は s.requested からも消して、
+// 戻ってきたときに取り直せるようにする(呼び出し側の責務)。
+//
+// 捨てた列のキーを返す。
+func (w *world) forget(px, pz int32, keep int32) [][2]int32 {
+	var dropped [][2]int32
+	for key := range w.columns {
+		dx := key[0] - px
+		dz := key[1] - pz
+		if dx < 0 {
+			dx = -dx
+		}
+		if dz < 0 {
+			dz = -dz
+		}
+		if dx > keep || dz > keep {
+			dropped = append(dropped, key)
+		}
+	}
+	for _, key := range dropped {
+		delete(w.columns, key)
+	}
+	return dropped
+}
 
 // setBlock は1マスだけ差し替える。掘った/置いた結果を反映するのに使う。
 // パレットに無い名前なら末尾に足す。

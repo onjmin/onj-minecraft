@@ -25,6 +25,8 @@ export const EDIBLE_PRIORITY = [
 	"apple",
 	"melon_slice",
 	"sweet_berries",
+	// 光るベリーは洞窟に生えていて、掘っている最中に勝手に集まる。
+	"glow_berries",
 	"beetroot",
 	// 生肉。焼く手段が無いときの最後の手段。生鶏肉だけは食中毒があるので外す。
 	"beef",
@@ -34,6 +36,11 @@ export const EDIBLE_PRIORITY = [
 	"salmon",
 	"cod",
 	"potato",
+	// 最後の手段。満腹度は1〜2しか戻らないが、毒も食中毒も無い。
+	// 水辺でいくらでも手に入るので、他に何も無いときの繋ぎにはなる。
+	// これが抜けていたせいで、熱帯魚を13匹持ったまま満腹度2で餓えていた。
+	"dried_kelp",
+	"tropical_fish",
 ] as const;
 
 /**

@@ -118,6 +118,22 @@ export class BlockView {
 		return name === "" ? null : name;
 	}
 
+	/**
+	 * 名前と座標から BlockInfo を組む。
+	 *
+	 * サイドカーへ直に問い合わせた結果(名前と座標しか返らない)を、同期版の
+	 * find* と同じ形に揃えるために外へ出している。硬さと当たり判定の表は
+	 * ここにしか無いので、呼び出し側で作り直さない。
+	 */
+	static describe(name: string, position: Position): BlockInfo {
+		return {
+			name,
+			position,
+			diggable: !UNBREAKABLE.has(name),
+			solid: !PASSABLE.has(name),
+		};
+	}
+
 	blockAt(position: Position): BlockInfo | null {
 		const x = Math.floor(position.x);
 		const y = Math.floor(position.y);

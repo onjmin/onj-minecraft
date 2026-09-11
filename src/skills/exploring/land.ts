@@ -4,7 +4,7 @@ import { createSkill, type SkillResponse, skillResult } from "../types";
 export const exploreLandSkill = createSkill<void, { x: number; z: number }>({
 	name: "exploring.explore_land",
 	description:
-		"Explores the nearby surface by sampling safe ground, prioritizing the forward direction.",
+		"Explores the nearby surface by sampling safe ground. Heads toward the nearest man-made structure you have seen, otherwise prioritizes the forward direction.",
 	inputSchema: {} as any,
 	handler: async ({ agent, signal }): Promise<SkillResponse<{ x: number; z: number }>> => {
 		const { driver } = agent;
@@ -13,6 +13,30 @@ export const exploreLandSkill = createSkill<void, { x: number; z: number }>({
 		const currentPos = state.position;
 		const currentY = Math.floor(currentPos.y);
 		const yaw = state.yaw; // 現在の向き
+
+		// 行き先を知っているなら、そちらへ寄せる。
+		//
+		// 前方優先とはいえ向き自体はランダムに変わるので、結局その場を
+		// うろつくだけになる。実測で7日間、地上に出ても拠点に一度も
+		// 到達せず Known Bases は空のままだった。見かけた建物を覚えて
+		// いるなら、探索もそちらを向いて行う。
+		//
+		// 角度の取り方は下の dx/dz と揃えること。
+		// dx = -sin(a)*d, dz = -cos(a)*d なので、方向ベクトル(vx,vz)に
+		// 対応する角度は atan2(-vx, -vz)。
+		const landmark = agent.getKnownLandmarks()[0];
+		let baseAngle = yaw;
+		let spread = Math.PI; // ±90度
+		if (landmark) {
+			const vx = landmark.position.x - currentPos.x;
+			const vz = landmark.position.z - currentPos.z;
+			// 目の前にあるなら向きを固定する意味が無い。素直に見回す。
+			if (Math.hypot(vx, vz) > 6) {
+				baseAngle = Math.atan2(-vx, -vz);
+				// 寄せる以上は幅を狭める。±90度のままだと横へ逸れて進まない。
+				spread = Math.PI / 2; // ±45度
+			}
+		}
 
 		// --- 1. 段階的・方向優先サンプリング ---
 		// 遠く(16)から近く(4)へ、あるいはその逆でも良いですが、
@@ -25,8 +49,8 @@ export const exploreLandSkill = createSkill<void, { x: number; z: number }>({
 			for (let i = 0; i < attempts; i++) {
 				// 前方優先ロジック:
 				// 完全にランダムではなく、現在の視線方向に ±90度のバイアスをかける
-				const angleOffset = (Math.random() - 0.5) * Math.PI; // ±90度
-				const finalAngle = yaw + angleOffset;
+				const angleOffset = (Math.random() - 0.5) * spread;
+				const finalAngle = baseAngle + angleOffset;
 
 				const dist = radius * (0.5 + Math.random() * 0.5); // 半径の50%〜100%の距離
 				const dx = Math.floor(-Math.sin(finalAngle) * dist);

@@ -85,6 +85,20 @@ export interface WorldReader {
 		maxDistance: number,
 		count: number,
 	): BlockInfo[];
+	/**
+	 * 名前指定で、同期版より遠くまで探す。
+	 *
+	 * 同期の find* 系は「自分中心の立方体を丸ごと受け取って展開したもの」を
+	 * 見ている。統合版ではその立方体が半径16しかなく、それより遠くを指定しても
+	 * 黙って16に切り詰められる（BlockView.findMatching のクランプ）。
+	 * BED_SEARCH_RADIUS=48 のような指定が効いていないのはこれが理由で、
+	 * 半径48のつもりで書いた探索が実際には16しか見ていなかった。
+	 *
+	 * こちらはサイドカーが保持しているチャンクを直接引くので、要求済みの
+	 * 範囲(水平±128・垂直±80)まで届く。往復が要るので非同期。
+	 * 毎tick呼ぶものではない。間隔を空けて使うこと。
+	 */
+	findBlocksFar(names: string[], maxDistance: number, count: number): Promise<BlockInfo[]>;
 	getBiome(position: Position): string;
 	/**
 	 * 体感的な明るさ 0–15。

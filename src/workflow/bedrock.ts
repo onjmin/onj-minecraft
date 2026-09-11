@@ -28,10 +28,11 @@ import { exploreLandSkill } from "../skills/exploring/land";
 import { gotoBaseSkill } from "../skills/goto/base";
 import { gotoCoordsSkill } from "../skills/goto/coords";
 import { gotoDeathPointSkill } from "../skills/goto/death";
+import { gotoLandmarkSkill } from "../skills/goto/landmark";
 import { gotoPlayerSkill } from "../skills/goto/player";
 import { gotoSurfaceSkill } from "../skills/goto/surface";
 import { giveItemSkill } from "../skills/social/give";
-import { isLeaveRequest, shouldYieldForSleep, shouldYieldSeat } from "./bedrock-session";
+import { isLeaveRequest, shouldYieldSeat } from "./bedrock-session";
 
 // 統合版でもスキルは一通り動く。Driver 層が Java 版との差を吸収しているので
 // skills/ 側は共通のものをそのまま使う。
@@ -47,6 +48,9 @@ const bedrockSkills = [
 	gotoCoordsSkill,
 	gotoPlayerSkill,
 	gotoBaseSkill,
+	// 地上に出ても行き先が無いと、その場をランダムに歩くだけで拠点へ着かない。
+	// 見かけた人工物へ向かう手を持たせる。
+	gotoLandmarkSkill,
 	collectWoodSkill,
 	collectStoneSkill,
 	collectDirtSkill,
@@ -80,7 +84,12 @@ async function main() {
 
 	console.log(`[bedrock] ${profile.displayName} を Realm に接続します...`);
 	await driver.connect();
-	console.log("[bedrock] スポーン完了。ループを開始します。");
+	// どのアカウントで入ったかを必ず残す。トークンファイルの存在は根拠に
+	// ならない(AGENTS.md)。管理者アカウントで本番の世界に入っていないかを、
+	// ログを見るだけで確かめられるようにしておく。
+	console.log(
+		`[bedrock] スポーン完了。接続アカウント: ${driver.getState().username}。ループを開始します。`,
+	);
 
 	// 統合版は接続完了のタイミングを呼び出し側が握っているので明示的に起動する
 	agent.startLoops();
@@ -117,14 +126,13 @@ async function main() {
 		}
 	});
 
-	// 自分以外の全員がベッドに入ったら、寝られない自分が夜明けの邪魔をして
-	// いることになる。謝るだけで居座らず、席を譲って夜を明けさせる。
-	driver.on("sleeping", (count: number) => {
-		const self = driver.getState().username;
-		if (shouldYieldForSleep(driver, self, count)) {
-			void yieldSeat("他の全員が就寝した");
-		}
-	});
+	// 誰かが寝ているのに近くにベッドが無くて自分は寝られなかったら、
+	// 居座らず席を譲って抜ける。agent 側は近くのベッドを探して自分も
+	// 寝ようとするが、届く範囲に無ければそこで諦める(agent.ts の
+	// sleepIfOthersSleeping)。その通知をここで受けて実際に抜ける。
+	agent.onNoBedForSleep = () => {
+		void yieldSeat("寝られる場所が無い");
+	};
 
 	// 切断に気づかず空回りし続けるのを防ぐ。
 	// BedrockX は接続断を必ずしもイベントで教えてくれないため、

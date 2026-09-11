@@ -44,20 +44,30 @@ export const huntAnimalsSkill = createSkill<void, { hunted: string; success: boo
 				items.find((item) => item.name.endsWith("_axe"));
 			if (weapon) await driver.equip(weapon.name, "hand");
 
-			// 3. Approach and attack
-			// 動物に近づいて攻撃
-			const pos = target.position;
-			await driver.goto(signal, { kind: "follow", entityId: target.id, distance: 1 });
-
-			// Attack the entity
-			// 攻撃実行
-			await driver.attack(signal, target.id);
+			// 3. Approach and attack until dead
+			// 動物を倒すまで追撃して攻撃を繰り返す
+			let lastPos = target.position;
+			for (let i = 0; i < 6; i++) {
+				if (signal.aborted) break;
+				const current = driver.nearbyEntities(32).find((e) => e.id === target.id);
+				if (!current) break;
+				lastPos = current.position;
+				try {
+					await driver.goto(signal, { kind: "follow", entityId: target.id, distance: 1.5 });
+					await driver.attack(signal, target.id);
+					await new Promise((r) => setTimeout(r, 350));
+				} catch {
+					break;
+				}
+			}
 
 			// 4. Wait a moment and collect drops (Reflex)
-			// ドロップアイテムを拾うために少し待機して移動（脊髄反射）
-			await new Promise((r) => setTimeout(r, 800));
-			await driver.goto(signal, { kind: "near", position: pos, distance: 1 });
-			await driver.pickupNearbyItems(signal);
+			// ドロップアイテムを拾うために移動（脊髄反射）
+			await new Promise((r) => setTimeout(r, 500));
+			try {
+				await driver.goto(signal, { kind: "near", position: lastPos, distance: 1 });
+				await driver.pickupNearbyItems(signal);
+			} catch {}
 
 			return skillResult.ok(`Successfully hunted a ${target.name}.`, {
 				hunted: target.name || "unknown",

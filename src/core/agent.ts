@@ -73,7 +73,7 @@ const MAX_UNINTERRUPTED_MS = envNum("SKILL_MAX_RUN_MS", 300_000);
 const MIN_UNINTERRUPTED_MS = envNum("SKILL_MIN_RUN_MS", 60_000);
 
 /** これを下回ったら戦わずに逃げる。 */
-const FLEE_HEALTH = envNum("FLEE_HEALTH", 10);
+const _FLEE_HEALTH = envNum("FLEE_HEALTH", 10);
 /** 死亡地点の落とし物を追いかける制限時間。落下物は5分ほどで消える。 */
 const DEATH_LOOT_WINDOW_MS = envNum("DEATH_LOOT_WINDOW_MS", 240_000);
 /** 回収に戻って返り討ちに遭ったあと、次に試すまで置く間隔。 */
@@ -81,7 +81,7 @@ const RECOVER_COOLDOWN_MS = envNum("RECOVER_COOLDOWN_MS", 45_000);
 /** プレイヤーに殴られてから、人に近づかないでおく時間。 */
 const PLAYER_HOSTILITY_MS = envNum("PLAYER_HOSTILITY_MS", 120_000);
 /** 一度の反射で振る回数。振り続けて本来の行動を止めない程度に。 */
-const ATTACK_SWINGS = 4;
+const _ATTACK_SWINGS = 4;
 /** 頭上の蓋に使える物。何でもよいが、貴重な物を使わないよう絞る。 */
 const PLACEABLE_COVER = ["dirt", "cobblestone", "stone", "_planks", "gravel", "sand", "netherrack"];
 /** 防具かどうかの判定に使う。 */
@@ -205,8 +205,139 @@ const DEATH_STORM_WINDOW_MS = envNum("DEATH_STORM_WINDOW_MS", 10 * 60_000);
 const DEATH_STORM_LIMIT = envNum("DEATH_STORM_LIMIT", 3);
 /** 誰かがベッドに入ったという知らせを、この間だけ有効とみなす。 */
 const SLEEP_REQUEST_TTL_MS = envNum("SLEEP_REQUEST_TTL_MS", 90_000);
-/** 寝るために探すベッドの範囲。 */
-const BED_SEARCH_RADIUS = envNum("BED_SEARCH_RADIUS", 48);
+/**
+ * 寝るために探すベッドの範囲。
+ *
+ * 人工物(LANDMARK_SEARCH_RADIUS)より狭くしてある。ベッドは「歩いて行って
+ * 叩いて戻る」前提なので、片道が長すぎると夜になるか途中で殺される。
+ * 遠くの拠点はまず goto.landmark で近づき、着いてからこの範囲に入る。
+ */
+const BED_SEARCH_RADIUS = envNum("BED_SEARCH_RADIUS", 64);
+/**
+ * 統合版のベッドのブロック名。
+ *
+ * 統合版は色を NBT で持つので、ブロック名は "bed" ひとつ。Java版は色ごとに
+ * 別の名前になるため、両方を並べる。findBlocksFar は完全一致でしか探せない
+ * ので、接尾辞ではなく名前を列挙する必要がある。
+ */
+const BED_NAMES = [
+	"bed",
+	"white_bed",
+	"orange_bed",
+	"magenta_bed",
+	"light_blue_bed",
+	"yellow_bed",
+	"lime_bed",
+	"pink_bed",
+	"gray_bed",
+	"light_gray_bed",
+	"cyan_bed",
+	"purple_bed",
+	"blue_bed",
+	"brown_bed",
+	"green_bed",
+	"red_bed",
+	"black_bed",
+];
+/**
+ * リスポーン地点を登録し直すまでの間隔。
+ *
+ * 統合版はベッドを叩いた時点で、昼でもリスポーン地点が移る(「リスポーン
+ * 地点を設定しました」と出る)。寝られなくてもよい。これをやっていなかった
+ * ので、死ぬたびにワールドスポーンへ戻されていた。実測で死亡地点は7日間
+ * ずっと X:-22〜15 / Z:52〜84 の約40ブロック四方に収まっている。
+ */
+const SPAWN_BED_COOLDOWN_MS = envNum("SPAWN_BED_COOLDOWN_MS", 20 * 60_000);
+/**
+ * 人の手が入ったことが分かるブロック。
+ *
+ * 自然には湧かないもの、あるいは湧いても行く価値がある場所(難破船・村)の
+ * ものに絞る。丸石や原木のように洞窟や森で普通に見つかるものは入れない。
+ * 入れると「拠点を見つけた」と言って地面へ歩いて行くだけになる。
+ */
+const MANMADE_BLOCKS = [
+	"crafting_table",
+	"furnace",
+	"blast_furnace",
+	"smoker",
+	"chest",
+	"trapped_chest",
+	"barrel",
+	"bed",
+	"torch",
+	"wall_torch",
+	"lantern",
+	"campfire",
+	"bookshelf",
+	"anvil",
+	"ladder",
+	"glass",
+	"glass_pane",
+	"white_bed",
+	"red_bed",
+	"blue_bed",
+	"oak_planks",
+	"spruce_planks",
+	"birch_planks",
+	"jungle_planks",
+	"acacia_planks",
+	"dark_oak_planks",
+	"oak_door",
+	"spruce_door",
+	"iron_door",
+	"oak_stairs",
+	"cobblestone_stairs",
+	"stone_bricks",
+	"bricks",
+];
+/**
+ * 人工物を探す範囲。サイドカーが取得している範囲いっぱいまで使う。
+ *
+ * ここが行き先の供給源になる。狭いと「地上に出たが向かう先が無い」に
+ * 逆戻りするので、届く限り遠くを見る。遠すぎて着けなくても、
+ * goto.landmark は近づいたぶんを成果として返すので損にはならない。
+ */
+const LANDMARK_SEARCH_RADIUS = envNum("LANDMARK_SEARCH_RADIUS", 128);
+/** 人工物を探し直す間隔。全走査に振れうるので、毎tickは回さない。 */
+const LANDMARK_SCAN_INTERVAL_MS = envNum("LANDMARK_SCAN_INTERVAL_MS", 30_000);
+/** 覚えておく人工物の数。近い順に残す。 */
+const LANDMARK_MEMORY_LIMIT = envNum("LANDMARK_MEMORY_LIMIT", 12);
+/** 同じ建物を何度も覚えないための、まとめる粗さ(ブロック)。 */
+const LANDMARK_GRID = 8;
+/**
+ * 思考が何回続けて落ちたら、脳無しで動く判断に切り替えるか。
+ *
+ * LLM が落ちている間、currentTaskName を更新する者が誰もいなくなる。反射
+ * ループは最後に選ばれたスキルを回し続けるので、一瞬で終わるスキルを掴んで
+ * いると永久に空回りする。実測 2026-09-11 の 02:48〜09:40、goto.surface を
+ * 2184回呼んで「もう地上にいる」と答え続けた。
+ */
+const THINK_FAILURE_TOLERANCE = envNum("THINK_FAILURE_TOLERANCE", 2);
+/** 思考が落ちている間、次に考え直すまでの上限。復帰の取りこぼしを避けて短めに。 */
+const THINK_RETRY_MAX_MS = envNum("THINK_RETRY_MAX_MS", 2 * 60_000);
+/**
+ * 潜るとき、掘った先がこれ以上空いていたら掘らない。
+ *
+ * 「1マス潜って蓋をする」つもりの穴が、洞窟の天井に空けた落とし穴に
+ * なっていた。掘る先の下に何があるかを見ていなかったため。9/5〜9/11 の
+ * 死因606件のうち death.fell が146件(24%)で、mob に次ぐ2位。落ちた先は
+ * 暗い洞窟なので、そこでさらに mob に殺され、持ち物ごと失う。
+ */
+const BURROW_MAX_DROP = envNum("BURROW_MAX_DROP", 2);
+/** 掘る前に下を見る深さ。これより深い空洞は「底なし」と同じに扱う。 */
+const BURROW_FALL_SCAN = 8;
+/**
+ * 丸腰のとき、今いる高さからこれ以上深い落とし物は取りに行かない。
+ *
+ * 落とし物は洞窟の底にあることが多い。そこは暗くて mob が湧くので、素手で
+ * 降りれば同じ死に方をして、拾った物ごとまた落とす。回収の往復そのものが
+ * 「初期座標のまわりで死に続ける」主な運動になっていた。
+ */
+const UNARMED_RECOVERY_MAX_DEPTH = envNum("UNARMED_RECOVERY_MAX_DEPTH", 12);
+/** 同じ死亡地点へ取りに行く回数の上限。超えたら諦める。 */
+const RECOVERY_ATTEMPT_LIMIT = envNum("RECOVERY_ATTEMPT_LIMIT", 2);
+/** 抱えておく方針の数。プロンプトの "CURRENT STRATEGY (Max 3)" と揃える。 */
+const MAX_STRATEGIES = 3;
 
 /**
  * 一回成功したら依頼が消化される類のスキル。
@@ -252,7 +383,7 @@ function isHostileMob(name: string): boolean {
 	return hostile.some((h) => name.includes(h));
 }
 
-function distanceTo(
+function _distanceTo(
 	a: { x: number; y: number; z: number },
 	b: { x: number; y: number; z: number },
 ) {
@@ -357,6 +488,34 @@ export class MinecraftAgent {
 	private othersSleepingAt = 0;
 	/** 最後にベッドを使った時刻。入り直して自分を起こさないために見る。 */
 	private lastBedActivatedAt = 0;
+	/**
+	 * リスポーン地点として登録したベッドの位置。
+	 *
+	 * 統合版はベッドを叩けば昼でもリスポーン地点が移る。登録しておかないと、
+	 * 死ぬたびにワールドスポーンへ戻され、何度死んでも同じ初期座標の周りを
+	 * うろつくことになる。実測で死亡地点は7日間ずっと約40ブロック四方に
+	 * 収まっていた。
+	 */
+	private spawnBed: Position | null = null;
+	/** 最後にリスポーン地点の登録を試みた時刻。往復を繰り返さないために見る。 */
+	private lastSpawnBedAt = 0;
+	/**
+	 * 見かけた人工物の位置。
+	 *
+	 * 地上に出ても行き先が無いと、その場でランダムに歩き回るだけで拠点へ
+	 * 一向に着かない。視界から外れた建物を覚えておき、向かう先として使う。
+	 */
+	private knownLandmarks: { position: Position; name: string; at: number }[] = [];
+	/** 最後に人工物を探した時刻。全走査に振れうるので間隔を空ける。 */
+	private lastLandmarkScanAt = 0;
+	/** 思考が続けて落ちた回数。脳無しで動く判断に切り替えるために数える。 */
+	private thinkFailures = 0;
+	/**
+	 * 誰かが寝ているのに、近くにベッドが無くて自分は寝られなかったときの
+	 * 呼び出し先。統合版は全員が寝ないと朝が来ないので、寝られないなら
+	 * 席を譲って抜けるしかない。呼び出し側(bedrock.ts)が設定する。
+	 */
+	public onNoBedForSleep?: () => void;
 	/** 連続失敗回数。待機時間を伸ばして暴走を防ぐのに使う。 */
 	private consecutiveFailures = 0;
 	/** 直前に失敗したスキル名。別のスキルに切り替わったらカウンタを戻す。 */
@@ -382,7 +541,13 @@ export class MinecraftAgent {
 	 * 死んだ場所と時刻。持ち物はそこに落ちているので、取りに戻る手掛かり。
 	 * 落下物は5分ほどで消えるため、古くなったら捨てる。
 	 */
-	private deathPoint: { position: Position; at: number; retryAfter?: number } | null = null;
+	private deathPoint: {
+		position: Position;
+		at: number;
+		retryAfter?: number;
+		/** 取りに行った回数。往復を繰り返して損を広げないための歯止め。 */
+		attempts?: number;
+	} | null = null;
 	/** 最後にプレイヤーから殴られた時刻。人に近づいてよいかの判断に使う。 */
 	private attackedByPlayerAt = 0;
 	/** 最後に潜った時刻。掘り進み続けるのを止めるために見る。 */
@@ -516,8 +681,10 @@ export class MinecraftAgent {
 			// 実測で 01:13〜01:17 の4分間に15回、ほぼ同じ場所で死に続けている。
 			this.driver.on("respawn", () => {
 				if (!this.getDeathPoint()) return;
-				this.currentTaskName = gotoDeathPointSkill.name;
-				this.currentTaskSince = Date.now();
+				// 取りに行くかどうかの判断は反射側に揃える。ここで直に
+				// currentTaskName を書くと、丸腰・深さ・試行回数の歯止めを
+				// すべて素通りして、さっき殺された穴へまっすぐ戻ることになる。
+				void this.recoverDeathLootIfAlive();
 				this.requestImmediateThink();
 			});
 			// mineflayer 固有の初期化（プラグイン・経路探索設定・イベント配線）は行わない。
@@ -1611,6 +1778,9 @@ export class MinecraftAgent {
 					(i) => i.name === "furnace" || i.name === "cobblestone" || i.name === "blackstone",
 				);
 			}
+			case "goto.landmark":
+				// 一度も人工物を見ていないなら行き先が無い。
+				return this.getKnownLandmarks().length > 0;
 			case "goto.player": {
 				// 殴られた直後は近づかない。誰もいないなら行き先が無い。
 				if (this.wasAttackedByPlayerRecently()) return false;
@@ -1864,22 +2034,66 @@ export class MinecraftAgent {
 
 				const parsed = parseLlmOutput(rawOutput);
 				await this.applyThoughtResult(parsed);
+				this.thinkFailures = 0;
 			} catch (err) {
+				this.thinkFailures++;
 				this.log(`Thinking error: ${err}`);
+				// 脳が落ちている間、行動を選び直す者が誰もいなくなる。
+				// 反射ループは currentTaskName をひたすら回すだけなので、
+				// goto.surface のような「もう条件を満たしている」と即答する
+				// スキルを掴んでいると、何時間でも空回りする。
+				// 選べないなら、せめて選び直す。
+				if (this.thinkFailures >= THINK_FAILURE_TOLERANCE) this.pickSkillWithoutBrain();
 			}
 
 			// 途中で起こされたら待たずに次を考える。
+			//
+			// 落ちている間は間隔を広げる。10秒で接続に失敗するので、30秒ごとに
+			// 叩き続けるとログがそればかりになる。復帰を取りこぼさない程度に
+			// 抑える(上限 THINK_RETRY_MAX_MS)。
+			const wait =
+				this.thinkFailures > 0
+					? Math.min(THINK_RETRY_MAX_MS, 30000 * 2 ** Math.min(this.thinkFailures - 1, 3))
+					: 30000;
 			await new Promise<void>((resolve) => {
 				const timer = setTimeout(() => {
 					this.wakeThinking = null;
 					resolve();
-				}, 30000);
+				}, wait);
 				this.wakeThinking = () => {
 					clearTimeout(timer);
 					resolve();
 				};
 			});
 		}
+	}
+
+	/**
+	 * 脳が落ちている間の行動選び。
+	 *
+	 * LLM が答えないとき、currentTaskName は最後に選ばれたまま固定される。
+	 * 反射ループはそれを回し続けるので、一瞬で終わるスキルを掴んでいると
+	 * 空回りが止まらない。実測 2026-09-11 は 6時間52分で goto.surface を
+	 * 2184回、他は explore_land が230回だけだった。
+	 *
+	 * 賢く選ぶ必要はない。「同じものを回し続けない」ことと「前提が明らかに
+	 * 満たせないものを選ばない」ことだけ守れば、脳が戻るまで持ちこたえる。
+	 */
+	private pickSkillWithoutBrain(): void {
+		const candidates = Array.from(this.skills.keys()).filter((name) => {
+			if (name === this.currentTaskName) return false;
+			if (!this.skillIsWorthOffering(name)) return false;
+			// 何度試しても駄目だったものを、判断できない状態で選び直しても同じ。
+			const rel = this.skillReliability(name);
+			return !(rel && rel.tried >= 3 && rel.rate < 0.2);
+		});
+		if (candidates.length === 0) return;
+
+		const next = candidates[Math.floor(Math.random() * candidates.length)];
+		this.log(`[思考停止] LLM に繋がらないので ${next} に切り替える`);
+		this.currentTaskName = next;
+		this.currentTaskSince = Date.now();
+		this.instantRepeats = 0;
 	}
 
 	private getAgentStateForThinking() {
@@ -2014,6 +2228,24 @@ export class MinecraftAgent {
 				(b) =>
 					`${b.id} (${b.type}) at (${b.position.x}, ${b.position.y}, ${b.position.z}) | safe: ${b.safe}, functional: ${b.functional}, storage: ${b.hasStorage}`,
 			),
+			// 見かけた建物を渡す。行き先の候補がこれしか無いことも多い。
+			//
+			// 高さの差も必ず添える。水平距離だけ書くと、地下 Y=1 から
+			// 「作業台まで10ブロック」と読めてしまい、実際は真上に65ブロック
+			// ある、という誤解になる。地下にいる間は「まず地上へ出る」が
+			// 正しい判断なので、そこが伝わらないと選択を誤る。
+			landmarks: this.getKnownLandmarks()
+				.slice(0, 5)
+				.map((l) => {
+					const d = Math.hypot(l.position.x - origin.x, l.position.z - origin.z);
+					const dy = Math.round(l.position.y - origin.y);
+					const vertical =
+						dy > 1 ? `, ${dy} blocks above you` : dy < -1 ? `, ${-dy} blocks below you` : "";
+					return `${l.name} at (${l.position.x}, ${l.position.y}, ${l.position.z}) — ${Math.round(d)} blocks away horizontally${vertical}`;
+				}),
+			spawnBed: this.spawnBed
+				? `(${this.spawnBed.x}, ${this.spawnBed.y}, ${this.spawnBed.z})`
+				: undefined,
 			skills: skillsContext,
 			chatHistory: [chatLogContext],
 			pendingRequest,
@@ -2023,16 +2255,27 @@ export class MinecraftAgent {
 	}
 
 	private async applyThoughtResult(result: any) {
-		// Extract strategy and achievement from memory
-		const memoryText = result.memory || "";
-		const strategyMatch = memoryText.match(/Strategy:\s*(.+?)(?:\||$)/);
-		const achievementMatch = memoryText.match(/Achievement:\s*(.+?)(?:\||$)/);
-
-		if (strategyMatch) {
-			this.updateFIFO(this.strategicState.strategies, strategyMatch[1].trim());
+		// 方針は「積み上げる」ものではなく「今の方針」なので、書き換える。
+		//
+		// 以前は FIFO に追加していた。プロンプトは毎周「update or keep current」と
+		// 尋ねるので、モデルは毎回ほぼ同じことを言い直す。少しずつ違う文面が
+		// 3枠を埋め、本当に別の方針が出てきても押し出す枠が無い、という状態に
+		// なっていた。実測では
+		//   - 安全な場所へ移動する
+		//   - 安全な場所へ移動し、木材を集めて木の剣を作る。
+		//   - 安全な場所へ移動し、木材を集める
+		// の3本が固定され、長時間まったく更新されていない。
+		// 言い直しかどうかを測るより、毎回入れ替える方が素直で、
+		// プロンプトの文面とも一致する。
+		const strategy: string[] = Array.isArray(result.strategy) ? result.strategy : [];
+		if (strategy.length > 0) {
+			this.strategicState.strategies = strategy.slice(0, MAX_STRATEGIES);
 		}
-		if (achievementMatch) {
-			this.updateFIFO(this.strategicState.achievements, achievementMatch[1].trim());
+
+		// 実績は履歴なので、こちらは積む。同じ文面は updateFIFO が弾く。
+		const achievement: string[] = Array.isArray(result.achievement) ? result.achievement : [];
+		for (const line of achievement) {
+			this.updateFIFO(this.strategicState.achievements, line);
 		}
 
 		// この判断で使い切る。次の周からは通常の猶予に戻す。
@@ -2609,12 +2852,18 @@ export class MinecraftAgent {
 			await this.recoverDeathLootIfAlive();
 			this.returnToSurfaceIfBuried();
 			await this.wearBestArmor();
+			await this.equipBestWeapon();
 			// 食事は籠るより先。籠っても満腹度が足りなければ体力は戻らないので、
 			// 先に食べておかないと「隠れたのに回復しない」まま夜を越すことになる。
 			await this.eatIfHungry(signal);
 			// 丸腰で木があるなら、まず剣。籠るより前に置くのは、
 			// 剣さえあれば籠らずに済む場面が多いため。
 			this.craftSwordIfUnarmed();
+			// 見かけた建物を控える。地上に出たとき、向かう先として使う。
+			await this.noteLandmarksNearby();
+			// 昼のうちにベッドを叩いてリスポーン地点を移しておく。
+			// 死んでからでは間に合わない。
+			await this.registerSpawnAtBed(signal);
 			// 待たせず自分から動く。await しない: LLM 呼び出しを含むので、
 			// ここで待つと反射ループそのものが詰まる。結果は後続の反射に
 			// 依存しないので、投げっぱなしで構わない。
@@ -2793,19 +3042,44 @@ export class MinecraftAgent {
 	private async recoverDeathLootIfAlive(): Promise<void> {
 		const point = this.getDeathPoint();
 		if (!point) return;
-		if (this.driver.getState().health <= 0) return;
-		// 死んだ場所の近くにまだ敵がいるなら戻らない。殺した相手はたいてい
-		// その場に留まっている。丸腰で戻れば同じことが起きる。
-		const dangerNear = this.driver
-			.nearbyEntities(24)
-			.some(
-				(e) =>
-					isHostileMob(e.name) && Math.hypot(e.position.x - point.x, e.position.z - point.z) < 8,
-			);
-		if (dangerNear) return;
+		const state = this.driver.getState();
+		if (state.health <= 0) return;
 		if (this.currentTaskName === gotoDeathPointSkill.name) return;
 		if (!this.skills.has(gotoDeathPointSkill.name)) return;
-		this.log("[反射] 落とし物を取りに戻る");
+
+		// 危険判定は「自分の周り」で見る。
+		//
+		// 元は nearbyEntities(24) の中から「死亡地点の8m以内にいるもの」を
+		// 探していた。復帰地点は死亡地点から離れているので、自分の24m以内に
+		// 死亡地点の近くの敵が入ることはまず無く、この歯止めは事実上一度も
+		// 発火していなかった。丸腰のまま、さっき殺された穴へまっすぐ戻る。
+		if (this.driver.nearbyEntities(16).some((e) => isHostileMob(e.name))) return;
+
+		// 丸腰で深いところへは取りに行かない。
+		//
+		// 落とし物は洞窟の底にあることが多い。暗くて mob が湧くので、素手で
+		// 降りれば同じ死に方をして、拾った物ごとまた落とす。往復するほど損を
+		// 広げる。装備があるなら行ってよい。
+		const depth = state.position.y - point.y;
+		if (!this.hasWeapon() && depth > UNARMED_RECOVERY_MAX_DEPTH) {
+			this.log(`[反射] 落とし物は ${Math.round(depth)} マス下。丸腰では取りに行かない`);
+			this.clearDeathPoint();
+			return;
+		}
+
+		// 同じ場所へ何度も通わない。
+		//
+		// 1回で拾えなかったものは、たいてい経路が無いか、殺された相手がまだ
+		// そこにいる。落とし物は5分で消えるので、通い続けても取り返せない。
+		const attempts = (this.deathPoint?.attempts ?? 0) + 1;
+		if (attempts > RECOVERY_ATTEMPT_LIMIT) {
+			this.log(`[反射] 落とし物の回収を ${attempts - 1} 回試した。諦める`);
+			this.clearDeathPoint();
+			return;
+		}
+		if (this.deathPoint) this.deathPoint.attempts = attempts;
+
+		this.log(`[反射] 落とし物を取りに戻る（${attempts}回目）`);
 		this.currentTaskName = gotoDeathPointSkill.name;
 		this.currentTaskSince = Date.now();
 		this.instantRepeats = 0;
@@ -2903,17 +3177,19 @@ export class MinecraftAgent {
 		// ネザーとエンドでベッドを使うと爆発する。寝る話ではない。
 		if (state.dimension && !state.dimension.includes("overworld")) return false;
 
-		const beds = this.driver.world.findBlocksMatching(
-			(name) => name === "bed" || name.endsWith("_bed"),
-			BED_SEARCH_RADIUS,
-			1,
-		);
+		// BlockView(半径16)ではなくサイドカーのチャンクを引く。同期版は
+		// maxDistance を黙って16に切り詰めるので、BED_SEARCH_RADIUS=48 と
+		// 書いてあっても16しか見ていなかった。
+		const beds = await this.driver.world.findBlocksFar(BED_NAMES, BED_SEARCH_RADIUS, 1);
 		const bed = beds[0];
 		if (!bed) {
 			// 無いものは探し直しても無い。毎周探して報告し続けないよう、
 			// 知らせを消してこの夜は諦める。
 			this.othersSleepingAt = 0;
-			this.log("[反射] 誰か寝ているが、届く範囲にベッドが無い");
+			this.log("[反射] 誰か寝ているが、届く範囲にベッドが無い。席を譲って抜ける");
+			// 寝られないまま居座ると、他の全員が寝ているのに夜が明けない
+			// ままになる。抜ける判断は呼び出し側(接続の管理者)に委ねる。
+			this.onNoBedForSleep?.();
 			return false;
 		}
 
@@ -2922,6 +3198,10 @@ export class MinecraftAgent {
 			await this.driver.goto(signal, { kind: "getToBlock", position: bed.position });
 			await this.driver.activateBlock(bed.position);
 			this.lastBedActivatedAt = Date.now();
+			// 寝た時点でリスポーン地点もそこへ移る。登録し直す反射
+			// (registerSpawnAtBed)が同じベッドへもう一度歩かないよう控える。
+			this.spawnBed = { ...bed.position };
+			this.lastSpawnBedAt = Date.now();
 		} catch (e) {
 			if (!signal.aborted) this.log(`ベッドに入れなかった: ${e}`);
 			// 一度失敗したら諦める。夜が明けるまで往復し続ける方が邪魔になる。
@@ -2929,6 +3209,133 @@ export class MinecraftAgent {
 			return false;
 		}
 		return true;
+	}
+
+	/**
+	 * 昼のうちにベッドを叩いて、リスポーン地点を自分の近くへ移す。
+	 *
+	 * 統合版はベッドを叩いた時点でリスポーン地点が移る。夜である必要は
+	 * ないし、寝られなくてもよい(「今は寝られません」と出ても地点は移る)。
+	 *
+	 * これをやっていなかったので、死ぬたびにワールドスポーンへ戻されていた。
+	 * 死亡地点の座標は7日間ずっと X:-22〜15 / Z:52〜84 の約40ブロック四方に
+	 * 収まっている。集めた物は死んだ場所に落ちたままなので、戻されるたびに
+	 * 拠点でも死亡地点でもないところから歩き直すことになる。
+	 *
+	 * 自分のベッドは持っていないので、人のベッドを借りる。バニラでは他人の
+	 * ベッドでもリスポーン地点は移る。壊したり動かしたりはしない。
+	 */
+	private async registerSpawnAtBed(signal: AbortSignal): Promise<void> {
+		if (Date.now() - this.lastSpawnBedAt < SPAWN_BED_COOLDOWN_MS) return;
+
+		const state = this.driver.getState();
+		if (!state.isReady || state.health <= 0) return;
+		// ネザーとエンドでベッドに触ると爆発する。
+		if (state.dimension && !state.dimension.includes("overworld")) return;
+		// 夜のベッド探しは、暗い中を32ブロック歩くのと同じ。昼にやる。
+		// 夜に寝る話は sleepIfOthersSleeping が別に持っている。
+		const night = state.timeOfDay >= 13000 && state.timeOfDay <= 23000;
+		if (night) return;
+		// 追われている最中に寄り道しない。
+		if (this.driver.nearbyEntities(16).some((e) => isHostileMob(e.name))) return;
+		if (state.health <= SHELTER_HEALTH) return;
+
+		// 探す前に間隔を消費する。見つからなかったときにここを通さないと、
+		// ベッドの無い場所では反射のたびに半径32の全走査を投げることになる。
+		// 見つかった場合も、届かなかった場合も、同じだけ間を置けばよい。
+		this.lastSpawnBedAt = Date.now();
+
+		const beds = await this.driver.world.findBlocksFar(BED_NAMES, BED_SEARCH_RADIUS, 1);
+		const bed = beds[0];
+		if (!bed) return;
+
+		// 直前に登録したのと同じベッドなら、行くだけ無駄。
+		if (
+			this.spawnBed &&
+			Math.hypot(
+				this.spawnBed.x - bed.position.x,
+				this.spawnBed.y - bed.position.y,
+				this.spawnBed.z - bed.position.z,
+			) < 2
+		) {
+			return;
+		}
+
+		this.log(
+			`[反射] リスポーン地点を登録しに行く (${bed.position.x}, ${bed.position.y}, ${bed.position.z})`,
+		);
+		try {
+			await this.driver.goto(signal, { kind: "getToBlock", position: bed.position });
+			await this.driver.activateBlock(bed.position);
+			this.spawnBed = { ...bed.position };
+			this.log("[反射] リスポーン地点を登録した");
+		} catch (e) {
+			if (!signal.aborted) this.log(`リスポーン地点を登録できなかった: ${e}`);
+		}
+	}
+
+	/**
+	 * 見かけた人工物を控える。
+	 *
+	 * 地上に出ても行き先が無いと、その場でランダムに歩き回るだけになる。
+	 * 実測では7日間、拠点に一度も到達せず Known Bases は空のままだった。
+	 * 視界から外れた建物を覚えておけば、そちらを目指せる。
+	 *
+	 * BlockView(半径16)では建物に触れるまで気付けないので、サイドカーが
+	 * 持っているチャンク(半径32)を引く。全走査に振れうるので間隔を空ける。
+	 */
+	private async noteLandmarksNearby(): Promise<void> {
+		if (Date.now() - this.lastLandmarkScanAt < LANDMARK_SCAN_INTERVAL_MS) return;
+		const state = this.driver.getState();
+		if (!state.isReady || state.health <= 0) return;
+		this.lastLandmarkScanAt = Date.now();
+
+		const found = await this.driver.world.findBlocksFar(MANMADE_BLOCKS, LANDMARK_SEARCH_RADIUS, 8);
+		if (found.length === 0) return;
+
+		const now = Date.now();
+		for (const b of found) {
+			// 同じ建物の中の別のブロックを何個も覚えない。粗い格子でまとめる。
+			const key = (p: Position) =>
+				`${Math.floor(p.x / LANDMARK_GRID)},${Math.floor(p.y / LANDMARK_GRID)},${Math.floor(p.z / LANDMARK_GRID)}`;
+			const k = key(b.position);
+			const existing = this.knownLandmarks.find((l) => key(l.position) === k);
+			if (existing) {
+				existing.at = now;
+				continue;
+			}
+			this.knownLandmarks.push({ position: { ...b.position }, name: b.name, at: now });
+			this.log(
+				`[記憶] 人工物を見つけた: ${b.name} (${b.position.x}, ${b.position.y}, ${b.position.z})`,
+			);
+		}
+
+		// 近い順に残す。遠いものを抱え続けても、そこまで歩けない。
+		const here = state.position;
+		this.knownLandmarks.sort(
+			(a, b) =>
+				Math.hypot(a.position.x - here.x, a.position.z - here.z) -
+				Math.hypot(b.position.x - here.x, b.position.z - here.z),
+		);
+		this.knownLandmarks = this.knownLandmarks.slice(0, LANDMARK_MEMORY_LIMIT);
+	}
+
+	/**
+	 * 覚えている人工物を近い順に返す。
+	 *
+	 * スキル(goto.landmark)と思考プロンプトの両方から読む。探索の向きを
+	 * 決めるのにも使うので、公開しておく。
+	 */
+	public getKnownLandmarks(): { position: Position; name: string }[] {
+		const here = this.driver.getState().position;
+		return this.knownLandmarks
+			.slice()
+			.sort(
+				(a, b) =>
+					Math.hypot(a.position.x - here.x, a.position.z - here.z) -
+					Math.hypot(b.position.x - here.x, b.position.z - here.z),
+			)
+			.map((l) => ({ position: l.position, name: l.name }));
 	}
 
 	/** 死んだ時刻を控える。死にすぎていないかを見るために持つ。 */
@@ -3038,6 +3445,20 @@ export class MinecraftAgent {
 		const below = { x: foot.x, y: foot.y - 1, z: foot.z };
 		const block = driver.world.blockAt(below);
 		if (!block || !block.diggable || block.name === "air") return;
+		// 水や溶岩は掘っても穴にならない。流れ込むか、落ちて死ぬ。
+		if (block.name === "water" || block.name === "lava") return;
+
+		// 掘った先が空洞なら潜らない。
+		//
+		// 「1マス潜って蓋をする」つもりの穴が、洞窟の天井に空けた落とし穴に
+		// なっていた。掘る先の下を見ていなかったため。9/5〜9/11 の死因606件の
+		// うち death.fell が146件(24%)、落ちた先は暗い洞窟なので、そこで
+		// さらに mob に殺されて持ち物ごと失う。潜れないなら潜らない方がよい。
+		const unsafe = this.burrowHazardBelow(below);
+		if (unsafe) {
+			this.log(`[反射] 潜るのをやめる（${unsafe}）`);
+			return;
+		}
 
 		this.log("[反射] 潜って身を隠す");
 		try {
@@ -3066,6 +3487,26 @@ export class MinecraftAgent {
 		} catch {
 			// 蓋ができなくても、潜っただけで当たりにくくはなっている。
 		}
+	}
+
+	/**
+	 * その位置を掘ったとき、落ちて困ることになるか。
+	 *
+	 * 困る理由を返す。問題なければ null。未取得(null)のマスは「空いている」
+	 * ことの根拠にならないので、そこで打ち切って安全側に倒す。読めていない
+	 * ものを空気扱いにすると、見えない穴の上で掘ってよいことになる。
+	 */
+	private burrowHazardBelow(dug: Position): string | null {
+		let fall = 0;
+		for (let y = dug.y - 1; y >= dug.y - 1 - BURROW_FALL_SCAN; y--) {
+			const b = this.driver.world.blockAt({ x: dug.x, y, z: dug.z });
+			if (b === null) break;
+			if (b.name === "water" || b.name === "lava") return `下が ${b.name}`;
+			if (b.solid) break;
+			fall++;
+			if (fall > BURROW_MAX_DROP) return `下が ${fall} マス以上空いている`;
+		}
+		return null;
 	}
 
 	/** 殴れる物を持っているか。素手で敵に向かうのは逃げるより悪い。 */
@@ -3100,6 +3541,36 @@ export class MinecraftAgent {
 			if (current && armorRank(current.name) <= armorRank(best.name)) continue;
 
 			await this.driver.equip(best.name, destination as any);
+		}
+	}
+
+	/**
+	 * 最強の武器（剣、なければ斧）をホットバー／手元に装備する。
+	 *
+	 * 持ち物の奥にあってもホットバーへ移されないと、サイドカーの
+	 * 迎撃反射(defendLocked)が武器を使えず、丸腰扱いで逃げ回ることになる。
+	 */
+	private async equipBestWeapon(): Promise<void> {
+		const items = this.driver.inventory.items();
+		const rank = [
+			"diamond_sword",
+			"iron_sword",
+			"stone_sword",
+			"wooden_sword",
+			"diamond_axe",
+			"iron_axe",
+			"stone_axe",
+			"wooden_axe",
+		];
+		const best = items
+			.filter((it) => rank.includes(it.name))
+			.sort((a, b) => rank.indexOf(a.name) - rank.indexOf(b.name))[0];
+		if (!best) return;
+
+		// 既にホットバー(0-8)にあればサイドカーが自動で持ち替えるので、
+		// 奥(9-35)にあるときだけホットバーへ移す。
+		if (best.slot > 8 && best.slot <= 35) {
+			await this.driver.equip(best.name, "hand");
 		}
 	}
 

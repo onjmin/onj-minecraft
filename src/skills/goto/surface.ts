@@ -1,3 +1,4 @@
+import type { MinecraftAgent } from "../../core/agent";
 import type { BotDriver, Position } from "../../core/driver/types";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
@@ -80,6 +81,88 @@ function skyAbove(driver: BotDriver, x: number, fromY: number, z: number): SkySt
 		air++;
 	}
 	return air > 0 ? "open" : "unknown";
+}
+
+/**
+ * 横へ1歩ぶんずらして1段上がる足場を掘り、そこへ登る。
+ *
+ * 真上へ掘るだけでは縦穴が伸びるだけで、登るには足元に何か置くしかない。
+ * 手ぶらのときはそれができないので、代わりに階段を刻む。掘るだけで登れる
+ * ので、持ち物が空でも地上へ戻れる。
+ *
+ * 1段ぶんの形:
+ *   - (x+dx, y,   z+dz) … 踏み台。ここは残す（空なら別の向きを試す）
+ *   - (x+dx, y+1, z+dz) … 足を置く場所。塞がっていれば掘る
+ *   - (x+dx, y+2, z+dz) … 頭の場所。塞がっていれば掘る
+ *   - (x,    y+2, z)    … 跳ぶための頭上の空き。塞がっていれば掘る
+ *
+ * 登れたら true。どの向きも成立しなければ false。
+ */
+async function digStepUp(agent: MinecraftAgent, signal: AbortSignal): Promise<boolean> {
+	const { driver } = agent;
+	const here = driver.getState().position;
+	const fx = Math.floor(here.x);
+	const fy = Math.floor(here.y);
+	const fz = Math.floor(here.z);
+
+	const dirs = [
+		{ dx: 1, dz: 0 },
+		{ dx: -1, dz: 0 },
+		{ dx: 0, dz: 1 },
+		{ dx: 0, dz: -1 },
+	];
+
+	for (const { dx, dz } of dirs) {
+		if (signal.aborted) return false;
+
+		const stand = driver.world.blockAt({ x: fx + dx, y: fy, z: fz + dz });
+		// 踏み台が無い向きへ登ろうとすると、ただ穴へ落ちる。
+		// 未取得(null)も「有る」ことの根拠にならないので避ける。
+		if (!stand || !stand.solid) continue;
+		// 水や溶岩の上には立てない。
+		if (stand.name === "water" || stand.name === "lava") continue;
+
+		const toClear: Position[] = [
+			{ x: fx + dx, y: fy + 1, z: fz + dz },
+			{ x: fx + dx, y: fy + 2, z: fz + dz },
+			{ x: fx, y: fy + 2, z: fz },
+		];
+
+		let blocked = false;
+		for (const p of toClear) {
+			const b = driver.world.blockAt(p);
+			if (!b || b.name === "air") continue;
+			if (!b.diggable) {
+				blocked = true;
+				break;
+			}
+			try {
+				await driver.equipBestTool(p);
+				await driver.dig(signal, p);
+			} catch {
+				blocked = true;
+				break;
+			}
+		}
+		if (blocked) continue;
+
+		try {
+			await driver.goto(signal, { kind: "block", position: { x: fx + dx, y: fy + 1, z: fz + dz } });
+		} catch {
+			continue;
+		}
+
+		// 実際に上がれたかで判断する。経路探索が「着いた」と言っても、
+		// Y が変わっていなければ登れていない。
+		if (Math.floor(driver.getState().position.y) > fy) {
+			agent.log(
+				`[goto.surface] Cut a step and climbed to Y=${Math.floor(driver.getState().position.y)}.`,
+			);
+			return true;
+		}
+	}
+
+	return false;
 }
 
 export const gotoSurfaceSkill = createSkill<void, { y: number; method: string }>({
@@ -176,15 +259,16 @@ export const gotoSurfaceSkill = createSkill<void, { y: number; method: string }>
 
 		agent.log(`[goto.surface] No surface path found, attempting dig-up...`);
 
-		const digUpTargetY = Math.min(320, startY + 30);
-		let currentDigY = startY;
+		const MAX_CLIMB = 30;
+		/** 同じ高さで足踏みしてよい回数。超えたらこの列では上がれない。 */
+		const STUCK_LIMIT = 3;
 
 		// 掘り上がりは1ブロックに数秒かかる。30ブロック掘り切るまで成功と
 		// 認めないと、地下深くからは何度やっても失敗になる。実測で64回試して
 		// 成功率0%。上がったぶんを成果として返す。
-		const climbed = () => Math.floor(driver.getState().position.y) - startY;
+		const climbedBlocks = () => Math.floor(driver.getState().position.y) - startY;
 		const partial = (): SkillResponse<{ y: number; method: string }> | null => {
-			const gained = climbed();
+			const gained = climbedBlocks();
 			if (gained < PARTIAL_CLIMB) return null;
 			return skillResult.ok(`Climbed ${gained} blocks toward the surface.`, {
 				y: startY + gained,
@@ -192,61 +276,104 @@ export const gotoSurfaceSkill = createSkill<void, { y: number; method: string }>
 			});
 		};
 
-		while (currentDigY < digUpTargetY) {
+		// 掘るのは「頭のすぐ上」だけにする。
+		//
+		// 以前は、頭上が空いていると掘る目標だけを上へ進めていた。ボットは
+		// 動かないので、Y=0 に立ったまま Y=5 の天井を掘る、ということが起きる。
+		// 掘れても間に4マスの空きが残り、そこを越える手段は無いので一歩も
+		// 上がらない。実測 2026-09-12 は Y=0〜2 を往復し続け、毎周
+		// 「Digging up at Y=5」だけを出していた。
+		//
+		// 目標を手の届く1マスに固定し、上がるのは経路探索と階段に任せる。
+		let lastY = startY;
+		let stuck = 0;
+
+		while (climbedBlocks() < MAX_CLIMB) {
 			if (signal.aborted) {
 				return partial() ?? skillResult.fail("Aborted");
 			}
 
-			const checkPos: Position = {
-				x: Math.floor(currentPos.x),
-				y: currentDigY + 1,
-				z: Math.floor(currentPos.z),
-			};
-			const block = driver.world.blockAt(checkPos);
-			const above = driver.world.blockAt({ ...checkPos, y: checkPos.y + 1 });
+			const here = driver.getState().position;
+			const fx = Math.floor(here.x);
+			const fy = Math.floor(here.y);
+			const fz = Math.floor(here.z);
 
-			if (!block || block.name === "air") {
-				currentDigY++;
-				continue;
+			// 空が見えたら終わり。掘り切る前でも、出られていれば用は足りている。
+			if (skyAbove(driver, fx, fy + 2, fz) === "open") {
+				return skillResult.ok(`Reached surface at Y=${fy}.`, { y: fy, method: "dig-up" });
 			}
 
-			if (!above || above.name === "air") {
+			const headAbove: Position = { x: fx, y: fy + 2, z: fz };
+			const block = driver.world.blockAt(headAbove);
+			// 水は掘らない。掘っても穴にならず、そのまま浮いて上がれる。
+			// 溶岩も掘らない（掘れば降ってくる）。
+			if (block && block.name !== "air" && block.name !== "water") {
+				if (block.name === "lava") {
+					return partial() ?? skillResult.fail("Lava directly overhead; cannot dig up here.");
+				}
+				if (!block.diggable) {
+					return partial() ?? skillResult.fail("The block overhead cannot be broken.");
+				}
+				agent.log(`[goto.surface] Digging up at Y=${headAbove.y}...`);
+				await driver.equipBestTool(headAbove);
 				try {
-					await driver.goto(signal, { kind: "near", position: checkPos, distance: 1 });
-					return skillResult.ok(`Reached surface at Y=${checkPos.y}.`, {
-						y: checkPos.y,
-						method: "dig-up",
-					});
+					await driver.dig(signal, headAbove);
+					await new Promise((r) => setTimeout(r, 100));
 				} catch {
-					currentDigY++;
+					return partial() ?? skillResult.fail("Dig-up aborted or failed");
+				}
+			}
+
+			// 水の中なら、まず浮いて上がる。
+			//
+			// 水没した洞窟では足場が無いので階段は掘れず、柱積みも置く物が
+			// 要る。実測 2026-09-12、Y=1 の水没洞窟で四方が水だったため
+			// digStepUp が全方向を弾き、3周で「上がれない」と返して4秒で
+			// 終わっていた。人は水中でジャンプを押しっぱなしにして浮上する。
+			// 同じことをする。
+			const feetBlock = driver.world.blockAt({ x: fx, y: fy, z: fz });
+			const headBlock = driver.world.blockAt({ x: fx, y: fy + 1, z: fz });
+			if (feetBlock?.name === "water" || headBlock?.name === "water") {
+				try {
+					await driver.setControlState(signal, "jump", true);
+					await new Promise((r) => setTimeout(r, 1200));
+				} finally {
+					await driver.setControlState(signal, "jump", false);
+				}
+				if (Math.floor(driver.getState().position.y) > fy) {
+					// 浮けた。掘る必要も歩く必要もない。
+					stuck = 0;
+					lastY = Math.floor(driver.getState().position.y);
 					continue;
 				}
 			}
 
-			agent.log(`[goto.surface] Digging up at Y=${currentDigY + 1}...`);
-			await driver.equipBestTool(checkPos);
-
-			try {
-				await driver.dig(signal, checkPos);
-				await new Promise((r) => setTimeout(r, 100));
-			} catch {
-				return partial() ?? skillResult.fail("Dig-up aborted or failed");
-			}
-
-			// 掘っただけでは登れない。縦穴が伸びるだけでボットは底に残る。
-			// 経路探索が柱積み(stepTower)を持つので、そちらに登らせる。
-			// スキル側で登り方を持つと、経路探索の持つ手と二重になる。
+			// 1マス上がる。まず経路探索(柱積み)に任せ、駄目なら階段を掘る。
+			// 柱積みは手元に置けるブロックが要るので、死んで手ぶらの状態では
+			// 階段だけが頼りになる。
 			try {
 				await driver.goto(signal, {
 					kind: "near",
-					position: { x: checkPos.x, y: checkPos.y, z: checkPos.z },
+					position: { x: fx + 0.5, y: fy + 1, z: fz + 0.5 },
 					distance: 1,
 				});
 			} catch {
-				return partial() ?? skillResult.fail("Could not climb: nothing to stand on.");
+				// 次の手へ。
+			}
+			if (Math.floor(driver.getState().position.y) <= fy) {
+				await digStepUp(agent, signal);
 			}
 
-			currentDigY = Math.floor(driver.getState().position.y);
+			const nowY = Math.floor(driver.getState().position.y);
+			if (nowY <= lastY) {
+				stuck++;
+				if (stuck >= STUCK_LIMIT) {
+					return partial() ?? skillResult.fail("Could not climb: nothing to stand on.");
+				}
+			} else {
+				stuck = 0;
+				lastY = nowY;
+			}
 		}
 
 		return partial() ?? skillResult.fail("Could not reach surface.");

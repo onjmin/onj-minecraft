@@ -31,6 +31,16 @@ export interface ThinkingState {
 
 	bases?: string[];
 
+	/**
+	 * 見かけた人工物(誰かの拠点)の位置。
+	 *
+	 * 地上に出たときの行き先として渡す。これが無いと、ランダムに歩き回る
+	 * ことしか選べず、拠点へ一向に着かない。
+	 */
+	landmarks?: string[];
+	/** リスポーン地点として登録したベッドの位置。無ければ未登録。 */
+	spawnBed?: string;
+
 	skills?: {
 		name: string;
 		description: string;
@@ -147,6 +157,11 @@ ${achievementText}
 
 Known Bases:
 ${formatList(state.bases)}
+
+Man-made structures you have seen (someone's base — go here instead of wandering):
+${formatList(state.landmarks)}
+
+Respawn point registered at: ${state.spawnBed ?? "None (you will respawn at world spawn if you die)"}
 `.trim();
 }
 

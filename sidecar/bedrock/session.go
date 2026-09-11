@@ -63,12 +63,13 @@ const attackReach = float32(3.5)
 // これより早く「食べ終わった」を送るとサーバーに捨てられ、満腹度が戻らない。
 const eatDuration = 1900 * time.Millisecond
 
-// 敵に反応し始める距離。
-//
-// 広すぎると、敵が視界にいる限り逃げ続けて何もできない。実測で 10 にしたとき、
-// 8分の試運転で死亡が 3回から 28回に増えた。逃げっぱなしで別の敵に突っ込み、
-// 潜って隠れることもできなくなる。実際に届く間合いの少し外にとどめる。
-const defendRange = float32(5)
+// 敵に先制攻撃・反応し始める距離。
+// 射線が通っている敵には自らダッシュで間合いを詰めて先制攻撃を仕掛ける。
+const (
+	defendRangeNearby  = float32(9)  // 近接モブ(ゾンビ・クモ等)への先制急襲距離
+	defendRangeRanged  = float32(14) // 遠距離モブ(スケルトン等)への急襲距離(射撃前に接近)
+	defendRangeCreeper = float32(8)  // クリーパーへの警戒・回避距離
+)
 
 // 殴られてから、遠くの敵にも反応し続ける時間。
 const hurtMemory = 4 * time.Second
@@ -78,10 +79,19 @@ const hurtDefendRange = float32(16)
 
 // 一度に逃げ続ける上限(tick)。これを過ぎたら本来の行動へ戻す。
 // 戻ってまだ危なければまた逃げる。走りっぱなしにしないための区切り。
+//
+// ただし敵が fleeGiveUpRange より近いままなら、この上限・下のクールダウンは
+// 無視してでも逃げ続ける。タイマーで機械的に切り上げると、敵がまだ隣にいる
+// のに数秒間まるごと無防備な通常行動へ戻ってしまい、その間に殴られ続けて
+// 死ぬ（死因の実測で mob 起因の死亡が多いのはこれが主因だった）。
 const fleeMaxTicks = uint64(60)
 
-// 逃げたあと、次に逃げるまで置く間隔(tick)。
+// 逃げたあと、次に逃げるまで置く間隔(tick)。敵が離れて安全になった場合のみ効く。
 const fleeCooldownTicks = uint64(60)
+
+// この距離より敵が近い間は、fleeMaxTicks/fleeCooldownTicks を無視して
+// 逃げ続ける。攻撃が届く間合いのすぐ外まで見ておく。
+const fleeGiveUpRange = float32(6)
 
 // これを下回ったら戦わずに逃げる。
 const defendFleeHealth = float32(10)
@@ -95,8 +105,9 @@ const playerThreatDuration = 20 * time.Second
 // 殴ってきたプレイヤーがこの距離まで近いなら逃げる。
 const playerFleeRange = float32(16)
 
-// 攻撃の間隔(tick)。バニラの剣は概ね0.6秒。
-const attackIntervalTicks = uint64(12)
+// 攻撃の間隔(tick)。統合版(Bedrock)は武器クールダウンがないため、6tick(約0.3秒)で
+// 連打してノックバックを与え、敵を寄せ付けずに倒す。
+const attackIntervalTicks = uint64(6)
 
 // 採掘が届く距離。サバイバルは概ね5ブロック。少し余裕を持たせる。
 const digReach = float32(6)
@@ -193,6 +204,9 @@ type session struct {
 	// 逃げ始めた tick と、逃げ終えた tick。走りっぱなしを防ぐ。
 	fleeSince uint64
 	fleeUntil uint64
+	// 防衛・逃走時の移動スタック検知用。段差で詰まったら跳ぶ。
+	defendLastPos      mgl32.Vec3
+	defendStalledTicks int
 	// 今サーバーにいる人。UUID -> 表示名。人数制限の判断に使う。
 	online map[string]string
 	// 最後に damage を受けた時刻。撃たれているときは遠くの敵にも反応する。
@@ -237,8 +251,15 @@ type session struct {
 	chunkReported bool
 	// サーバーから存在を知らされた列と、その次元。
 	known map[[2]int32]int32
-	// 要求済みの (列, 高さ区画) の組。移動で高さが変われば取り直す。
-	requested map[[3]int32]bool
+	// 列ごとに、最後に要求したときの高さ区画。
+	//
+	// 元は (列, 高さ区画) の組を集合で持ち、高さ区画が1つ変わるだけで
+	// 全部の列を取り直していた。要求範囲が3チャンク(49列)なら実害は
+	// 小さかったが、8チャンク(289列)に広げると、掘り上がりで Y が16変わる
+	// たびに289列×11区画=3000件を要求し直すことになる。
+	// 上下に requestVertical ぶん取ってあるので、中心が少し動いたくらいでは
+	// 取り直す必要がない。どこまで動いたら取り直すかは requestRestep で見る。
+	requested map[[2]int32]int32
 	// 受け取ったブロック。ワールド読み取りの土台。
 	world *world
 	// 進行中の採掘。tick ループが毎回 BlockActions を積む。
@@ -283,7 +304,7 @@ func newSession(conn *minecraft.Conn, game minecraft.GameData) *session {
 		controls:    map[string]bool{},
 		entities:    map[uint64]*entityInfo{},
 		known:       map[[2]int32]int32{},
-		requested:   map[[3]int32]bool{},
+		requested:   map[[2]int32]int32{},
 		rawSlots:    map[int]protocol.ItemInstance{},
 		world:       newWorld(),
 		unique:      map[int64]uint64{},
@@ -929,6 +950,12 @@ func (s *session) buildInput(n uint64) *packet.PlayerAuthInput {
 		flags.Set(packet.InputFlagStartJumping)
 	}
 	if swimming {
+		// 水に入った瞬間、直前の落下速度(airborne/vy)が残っていると、
+		// 下の跳躍計算(s.airborne)がそのマイナス vy を毎tick足し続け、
+		// ここで足す浮上分を数tickぶん打ち消して沈み続ける。着水は
+		// 着地と同じ扱いにして、まず落下状態を断ち切る。
+		s.airborne = false
+		s.vy = 0
 		// 水中は地面を蹴らないので上の跳躍計算に乗らない。浮き上がるぶんを
 		// ここで足す。バニラの水中上昇はおよそ 0.04/tick。
 		s.pos[1] += 0.04
@@ -1150,29 +1177,56 @@ func (s *session) defendLocked(n uint64) bool {
 				s.yaw = float32(math.Atan2(float64(dx), float64(-dz)) * 180 / math.Pi)
 				s.controls["forward"] = true
 				s.controls["sprint"] = true
-				s.controls["jump"] = false
+				if n%4 == 0 {
+					moved := s.pos.Sub(s.defendLastPos).Len()
+					if moved < 0.05 {
+						s.defendStalledTicks++
+					} else {
+						s.defendStalledTicks = 0
+					}
+					s.defendLastPos = s.pos
+				}
+				s.controls["jump"] = s.defendStalledTicks >= 2
 				s.fighting = 0
 				return true
 			}
 		}
 	}
 
-	// 殴られた直後は遠くの敵にも反応する。骨は間合いの外から撃ってくるので、
-	// 5ブロックで見ていると一方的に削られる。実測で10分に12回、mob に
-	// 殺されていた。
-	reach := float32(defendRange)
-	if time.Since(s.lastHurt) < hurtMemory {
-		reach = hurtDefendRange
-	}
+	// 敵への先制攻撃・反応。
+	// 武器を持っている場合は、遠距離モブは14ブロックから先制ダッシュで詰め、
+	// ゾンビなどは9ブロックから能動的に急襲して先手を取る。
+	// 丸腰(素手)の場合は、ダメージ効率が悪いため遠くの敵には突っ込まず、
+	// 接近してきた敵(6ブロック、スケルトンは12ブロック)から確実に逃げる。
+	isHurtRecently := time.Since(s.lastHurt) < hurtMemory
+	isArmed := s.hasWeaponLocked()
 
 	var target *entityInfo
-	best := reach
+	var best float32 = 999.0
 	for _, e := range s.entities {
 		if !hostileName(e.Name) {
 			continue
 		}
 		d := e.Pos.Sub(feet).Len()
-		if d >= best {
+
+		maxDist := defendRangeNearby
+		if !isArmed {
+			maxDist = float32(6)
+		}
+		if strings.Contains(e.Name, "skeleton") || strings.Contains(e.Name, "stray") || strings.Contains(e.Name, "pillager") {
+			if isArmed {
+				maxDist = defendRangeRanged
+			} else {
+				maxDist = float32(12)
+			}
+		} else if strings.Contains(e.Name, "creeper") {
+			maxDist = defendRangeCreeper
+		}
+		if isHurtRecently {
+			maxDist = hurtDefendRange
+		}
+
+		if d > maxDist || d >= best {
 			continue
 		}
 		// 壁の向こうの敵には反応しない。見えていない相手から逃げ続けると、
@@ -1187,13 +1241,17 @@ func (s *session) defendLocked(n uint64) bool {
 	if target == nil {
 		s.fighting = 0
 		s.fleeSince = 0
+		s.defendStalledTicks = 0
 		return false
 	}
 
-	// 逃げる条件。体力が減っている、武器が無い、相手がクリーパー。
-	// クリーパーを殴る間合いは自爆の間合いなので近づかない。
-	flee := s.health <= defendFleeHealth ||
-		!s.hasWeaponLocked() ||
+	// 逃げる条件：
+	// 1. 武器が無い(!s.hasWeaponLocked())。素手は1打点(ハート0.5個)とダメージ効率が極めて悪く、
+	//    敵を倒す前に削り殺されるため、武器を持つまでは戦わずに確実に逃げる。
+	// 2. 体力が減っている(s.health <= defendFleeHealth)。
+	// 3. 相手がクリーパー(自爆の危険)。
+	flee := !s.hasWeaponLocked() ||
+		s.health <= defendFleeHealth ||
 		strings.Contains(target.Name, "creeper")
 
 	dx := target.Pos[0] - s.pos[0]
@@ -1210,13 +1268,18 @@ func (s *session) defendLocked(n uint64) bool {
 		}
 		// 逃げるのは一定時間まで。過ぎたら本来の行動へ戻し、まだ危なければ
 		// 間隔を置いてまた逃げる。走りっぱなしだと何も進まない。
+		//
+		// ただし敵がすぐ近く(fleeGiveUpRange未満)にいる間は、このタイマーを
+		// 無視して逃げ続ける。ここで機械的に切り上げると、敵が隣にいるのに
+		// 無防備な通常行動へ戻り、殴られ続けて死ぬ。
+		nearby := best < fleeGiveUpRange
 		if s.fleeSince == 0 {
-			if n < s.fleeUntil+fleeCooldownTicks {
+			if n < s.fleeUntil+fleeCooldownTicks && !nearby {
 				return false
 			}
 			s.fleeSince = n
 		}
-		if n-s.fleeSince > fleeMaxTicks {
+		if n-s.fleeSince > fleeMaxTicks && !nearby {
 			s.fleeSince = 0
 			s.fleeUntil = n
 			s.controls["sprint"] = false
@@ -1226,7 +1289,18 @@ func (s *session) defendLocked(n uint64) bool {
 		s.yaw = float32(math.Atan2(float64(dx), float64(-dz)) * 180 / math.Pi)
 		s.controls["forward"] = true
 		s.controls["sprint"] = true
-		s.controls["jump"] = false
+
+		// 移動が詰まっていれば段差とみなして跳ぶ。平地の1マス段差で引っかかって追いつかれるのを防ぐ。
+		if n%4 == 0 {
+			moved := s.pos.Sub(s.defendLastPos).Len()
+			if moved < 0.05 {
+				s.defendStalledTicks++
+			} else {
+				s.defendStalledTicks = 0
+			}
+			s.defendLastPos = s.pos
+		}
+		s.controls["jump"] = s.defendStalledTicks >= 2
 		s.fighting = 0
 		return true
 	}
@@ -1235,16 +1309,46 @@ func (s *session) defendLocked(n uint64) bool {
 	// 殴る前に一番強い武器へ持ち替える。手に持っている物のまま殴ると、
 	// 剣を持っていてもツルハシで殴ることになる。
 	s.holdBestWeaponLocked()
-	// 殴る。間合いの外なら詰める。
-	s.lookAtLocked(target.Pos[0], target.Pos[1], target.Pos[2])
+	// 殴る。相手の胸〜頭部(足元 + 1.2)を狙う。足元を向いていると視線が地面を指して空振りする。
+	s.lookAtLocked(target.Pos[0], target.Pos[1]+1.2, target.Pos[2])
+
+	// スタック検知
+	if n%4 == 0 {
+		moved := s.pos.Sub(s.defendLastPos).Len()
+		if moved < 0.05 {
+			s.defendStalledTicks++
+		} else {
+			s.defendStalledTicks = 0
+		}
+		s.defendLastPos = s.pos
+	}
+
+	// 間合い管理 (Preemptive Sprint Attack & Kiting)
+	// 1. 間合いの外(> attackReach)なら常にスプリントダッシュで一気に詰めて急襲する。
+	//    走って殴る(スプリントアタック)ことで強ノックバックが発生し、敵を大きく弾き飛ばす。
+	// 2. 至近距離(< 2.0)に密着されたら後退して間合いを保つ(Kiting)。
+	// 3. 適正間合い(2.0 〜 3.5)なら前進スプリントを効かせて強打を維持する。
 	if best > attackReach {
 		s.controls["forward"] = true
-		s.controls["sprint"] = false
+		s.controls["back"] = false
+		s.controls["sprint"] = true
+		s.controls["jump"] = s.defendStalledTicks >= 2
 		return true
+	} else if best < 2.0 && !strings.Contains(target.Name, "skeleton") {
+		// 近接モブに密着されたら後退して間合いを取り被弾を避ける
+		s.controls["forward"] = false
+		s.controls["back"] = true
+		s.controls["sprint"] = false
+		s.controls["jump"] = s.defendStalledTicks >= 2
+	} else {
+		// 適正間合いでもスプリント前進を入れてノックバックを最大化
+		s.controls["forward"] = true
+		s.controls["back"] = false
+		s.controls["sprint"] = true
+		s.controls["jump"] = false
 	}
-	s.controls["forward"] = false
-	s.controls["sprint"] = false
-	// 振る間隔。連打してもサーバーに弾かれるだけ。
+
+	// 振る間隔。統合版に適したレート(約0.3秒)で叩き、ノックバックで敵を近づかせない。
 	if n-s.fighting >= attackIntervalTicks || s.fighting == 0 {
 		s.fighting = n
 		_ = s.conn.WritePacket(&packet.InventoryTransaction{
@@ -1254,6 +1358,7 @@ func (s *session) defendLocked(n uint64) bool {
 				HotBarSlot:            s.heldSlot,
 				HeldItem:              s.rawSlots[int(s.heldSlot)],
 				Position:              s.pos,
+				ClickedPosition:       mgl32.Vec3{0, 1, 0},
 			},
 		})
 	}
@@ -1331,10 +1436,9 @@ func (s *session) holdBestWeaponLocked() {
 	})
 }
 
-// hasWeaponLocked はホットバーに殴れる物があるか。
-// 素手で向かうのは逃げるより悪い。
+// hasWeaponLocked は所持品（ホットバーまたはメインインベントリ）に殴れる物があるか。
 func (s *session) hasWeaponLocked() bool {
-	for slot := 0; slot <= 8; slot++ {
+	for slot := 0; slot <= 35; slot++ {
 		it, ok := s.rawSlots[slot]
 		if !ok || it.Stack.Count == 0 {
 			continue
@@ -2588,8 +2692,38 @@ func (s *session) requestLoop() {
 }
 
 // requestRadius は要求する水平方向の広さ(チャンク単位)。
-// 広げるほど探索範囲は伸びるが、要求と保持のコストも増える。
-const requestRadius = 3
+//
+// 3 だった。サーバーは view distance ぶんのチャンクを LevelChunk で通知して
+// くるので「そこにチャンクがある」ことは s.known に入っているのだが、中身を
+// 取りに行くのが自分の周り3チャンク(±48ブロック)だけで、遠くは一度も開いて
+// いなかった。人が地平線の建物を見つけられるのにボットが見つけられないのは
+// これが理由で、地上に出ても向かう先が無く、その場をうろつくことしかできない。
+//
+// 広げてよいのは、探索側をパレット先読み(world.findWide)に替えて走査量が
+// 桁で下がったのと、遠い列を捨てる(world.forget)ようにして保持が青天井に
+// ならなくなったため。この2つが無い状態で半径だけ上げると tick が止まる。
+const requestRadius = 8
+
+// keepRadius は保持しておく列の広さ(チャンク単位)。
+// 要求範囲より少し広く取り、行ったり来たりで取り直しが続くのを避ける。
+const keepRadius = requestRadius + 4
+
+// requestVertical は要求する上下のサブチャンク数。
+//
+// 2(±32ブロック)だった。地下にいるとき地上の建物が丸ごと範囲外になる。
+// 拠点は地表にあるので、地下から地上を見上げられる程度には要る。
+const requestVertical = 5
+
+// requestRestep は、同じ列を取り直すまでに動いてよい高さ区画の数。
+// requestVertical より小さくしておくと、取り直す前に隙間ができない。
+const requestRestep = 3
+
+func absInt32(v int32) int32 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
 
 func (s *session) requestNearby() {
 	s.mu.Lock()
@@ -2603,6 +2737,13 @@ func (s *session) requestNearby() {
 	pz := floorDiv16(int32(math.Floor(float64(feet[2]))))
 	center := floorDiv16(int32(math.Floor(float64(feet[1]))))
 
+	// 遠ざかった列を捨てる。取得した列を一度も捨てていなかったので、歩き
+	// 回るほど際限なく積み上がっていた。要求範囲を広げるなら必須。
+	// 捨てた列は requested からも消し、戻ってきたときに取り直せるようにする。
+	for _, key := range s.world.forget(px, pz, keepRadius) {
+		delete(s.requested, key)
+	}
+
 	type req struct {
 		cx, cz, dim int32
 	}
@@ -2613,19 +2754,22 @@ func (s *session) requestNearby() {
 			if !ok {
 				continue
 			}
-			key := [3]int32{cx, cz, center}
-			if s.requested[key] {
+			key := [2]int32{cx, cz}
+			// 一度取った列は、高さが requestRestep ぶん動くまで取り直さない。
+			// 上下に requestVertical ぶん持っているので、その内側の移動なら
+			// 既に手元にある。
+			if last, ok := s.requested[key]; ok && absInt32(center-last) < requestRestep {
 				continue
 			}
-			s.requested[key] = true
+			s.requested[key] = center
 			todo = append(todo, req{cx, cz, dim})
 		}
 	}
 	s.mu.Unlock()
 
-	// 足元と頭上が分かれば移動には足りる。上下2区画ぶん。
-	offsets := make([]protocol.SubChunkOffset, 0, 5)
-	for dy := int8(-2); dy <= 2; dy++ {
+	// 足元と頭上だけでは、地下から地上の建物が見えない。上下に広く取る。
+	offsets := make([]protocol.SubChunkOffset, 0, requestVertical*2+1)
+	for dy := int8(-requestVertical); dy <= requestVertical; dy++ {
 		offsets = append(offsets, protocol.SubChunkOffset{0, dy, 0})
 	}
 	for _, r := range todo {
@@ -2708,45 +2852,24 @@ func (s *session) findBlocksLocked(names []string, radius float32, count int) []
 	ox := int32(math.Floor(float64(feet[0])))
 	oy := int32(math.Floor(float64(feet[1])))
 	oz := int32(math.Floor(float64(feet[2])))
-	r := int32(radius)
 
-	out := make([]map[string]any, 0, count)
-	for d := int32(0); d <= r; d++ {
-		for dx := -d; dx <= d; dx++ {
-			for dy := -d; dy <= d; dy++ {
-				for dz := -d; dz <= d; dz++ {
-					// シェルの表面だけを見る。内側は前の d で見終わっている。
-					if maxAbs(dx, dy, dz) != d {
-						continue
-					}
-					x, y, z := ox+dx, oy+dy, oz+dz
-					name, ok := s.world.blockAt(x, y, z)
-					if !ok || !want[name] {
-						continue
-					}
-					out = append(out, map[string]any{
-						"name":     name,
-						"position": []int32{x, y, z},
-					})
-					if len(out) >= count {
-						return out
-					}
-				}
-			}
-		}
+	// パレット先読みで絞ってから中身を引く(world.findWide)。
+	//
+	// 元は距離順の立方体シェルを1マスずつ引いていた。見つかれば早いが、
+	// 見つからないときは全走査になる。半径32で26万マス、半径128なら
+	// 1600万マスで、その間 mu を握ったままになり tick が止まる。
+	// サブチャンクのパレットは数個〜数十個しかないので、そこで落とせば
+	// 「人工物のある一部のサブチャンク」しか中を見なくて済む。
+	found := s.world.findWide(ox, oy, oz, want, float64(radius), count)
+
+	out := make([]map[string]any, 0, len(found))
+	for _, f := range found {
+		out = append(out, map[string]any{
+			"name":     f.Name,
+			"position": []int32{f.X, f.Y, f.Z},
+		})
 	}
 	return out
-}
-
-func maxAbs(a, b, c int32) int32 {
-	return max(abs32(a), max(abs32(b), abs32(c)))
-}
-
-func abs32(v int32) int32 {
-	if v < 0 {
-		return -v
-	}
-	return v
 }
 
 // snapshotLocked は自分を中心とした立方体のブロックをパレット形式で書き出す。
@@ -2890,7 +3013,7 @@ func (s *session) inLiquidLocked() bool {
 		if !ok {
 			continue
 		}
-		if name == "water" || name == "flowing_water" {
+		if name == "water" || name == "flowing_water" || name == "lava" || name == "flowing_lava" {
 			return true
 		}
 	}

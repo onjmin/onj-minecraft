@@ -4,9 +4,16 @@ export function parseSections(rawContent: string) {
 
 	const headerPattern = headers.join("|");
 
-	// ^...: で行頭からキャプチャ、次の見出し行または文末までを非貪欲に取得
+	// ^...: で行頭からキャプチャ、次の見出し行または文末までを非貪欲に取得。
+	//
+	// 終端に `$` をそのまま置かないこと。`m` を付けているので `$` は行末に
+	// 当たる。非貪欲の `[\s\S]*?` と組み合わさると最初の改行で先読みが成立して
+	// 打ち切られ、どのセクションも1行目しか取れない。ローカルモデルは
+	// Strategy を複数行の箇条書きで返すので、2行目以降が丸ごと落ちていた
+	// (Rationale や Chat も同じく1行目だけになる)。
+	// 文末は「$ に当たり、かつ後ろに何も無い」で表す。
 	const pattern = new RegExp(
-		`^(${headerPattern}):\\s*([\\s\\S]*?)(?=^(?:${headerPattern}):|$)`,
+		`^(${headerPattern}):[ \\t]*([\\s\\S]*?)(?=^(?:${headerPattern}):|$(?![\\s\\S]))`,
 		"gim",
 	);
 
@@ -180,7 +187,40 @@ export interface ParsedThought {
 		 */
 		positional?: unknown[];
 	};
+	/**
+	 * Strategy セクションの中身を行ごとに分けたもの。箇条書きの記号は外してある。
+	 *
+	 * memory に混ぜた文字列から取り出し直さないこと。ローカルモデルは
+	 * Strategy を複数行の箇条書きで返すので、`Strategy: <本文> | Achievement: ...`
+	 * のように1本の文字列へ畳むと、読む側は改行をまたげる正規表現を書くしかなく
+	 * なる。実際そうなっていて、`/Strategy:\s*(.+?)(?:\||$)/` が1行目だけを
+	 * 拾い、しかも先頭の "- " ごと保存していた。表示側も "- " を足すので
+	 * 「- - 安全な場所へ移動する」になり、似た言い換えが3枠を埋めて二度と
+	 * 更新されない状態が続いていた。
+	 */
+	strategy?: string[];
+	/** Achievement セクションの中身。扱いは strategy と同じ。 */
+	achievement?: string[];
 	memory?: string;
+}
+
+/**
+ * 箇条書きを行の配列にする。
+ *
+ * "- ", "* ", "・", "1. " のような記号を落とす。落とさないと、表示側が
+ * 付け直す記号と二重になる。空行と記号だけの行は捨てる。
+ */
+export function splitListLines(section: string): string[] {
+	if (!section) return [];
+	return section
+		.split(/\r?\n/)
+		.map((line) =>
+			line
+				.trim()
+				.replace(/^(?:[-*+・‣▪]|\d+[.)])\s*/, "")
+				.trim(),
+		)
+		.filter((line) => line.length > 0);
 }
 
 export function parseLlmOutput(rawContent: string): ParsedThought {
@@ -209,7 +249,17 @@ export function parseLlmOutput(rawContent: string): ParsedThought {
 		};
 	}
 
-	// ④ Strategy や Achievement を memory として保存
+	// ④ Strategy / Achievement は行ごとに分けて渡す。
+	//
+	// memory は「何を考えたか」を1本の文字列で見せるための控えとして残す
+	// (rationale の表示に使われている)。判断に使う側は strategy /
+	// achievement を見ること。畳んだ文字列から取り出し直すと、改行と
+	// 区切り文字の両方に振り回される。
+	const strategy = splitListLines(sections.strategy);
+	const achievement = splitListLines(sections.achievement);
+	if (strategy.length > 0) result.strategy = strategy;
+	if (achievement.length > 0) result.achievement = achievement;
+
 	const memoryChunks: string[] = [];
 
 	if (sections.strategy) {

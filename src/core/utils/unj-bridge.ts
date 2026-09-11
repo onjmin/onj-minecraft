@@ -16,10 +16,14 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { envStr } from "./env.js";
+import { envBool, envStr } from "./env.js";
 
 const UNJ_BASE_URL = envStr("UNJ_BASE_URL", "");
 const UNJ_ADMIN_API_KEY = envStr("UNJ_ADMIN_API_KEY", "");
+// unj連携そのものは.envに残したまま、一時的に両方向の転送だけ止めたいとき用。
+// UNJ_BASE_URL/UNJ_ADMIN_API_KEYを消すと復旧時に値を覚え直す必要があるため、
+// こちらはtrue/falseの切り替えだけで済むようにしている。
+const UNJ_RELAY_DISABLED = envBool("UNJ_RELAY_DISABLED", false);
 
 const UNJ_BOARD_ID = 1; // うんでも実況J
 // isMax()は1000到達で締まる。admin/thread/res.tsはisOwner=false固定で判定される
@@ -216,7 +220,7 @@ let queue: Promise<void> = Promise.resolve();
  * 失敗しても呼び出し元を止めない（記録目的の副作用のため）。
  */
 export function postToUnj(speaker: string, message: string): Promise<void> {
-	if (!UNJ_BASE_URL || !UNJ_ADMIN_API_KEY) return Promise.resolve();
+	if (!UNJ_BASE_URL || !UNJ_ADMIN_API_KEY || UNJ_RELAY_DISABLED) return Promise.resolve();
 	const task = queue.then(() => postOne(speaker, message));
 	// 1件が失敗しても後続を止めない（queueは常に解決済みで繋ぐ）
 	queue = task.catch(() => {});
@@ -275,7 +279,7 @@ export interface UnjHumanRes {
 
 /** unj連携が設定済みかどうか。unj-relay.ts側のポーリング要否の判定に使う。 */
 export function isUnjBridgeConfigured(): boolean {
-	return !!(UNJ_BASE_URL && UNJ_ADMIN_API_KEY);
+	return !!(UNJ_BASE_URL && UNJ_ADMIN_API_KEY) && !UNJ_RELAY_DISABLED;
 }
 
 /**

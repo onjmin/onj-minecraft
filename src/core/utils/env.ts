@@ -20,6 +20,15 @@ export function envStr(name: string, fallback: string): string {
 	return trimmed === "" ? fallback : trimmed;
 }
 
+/** "true"/"1" のときだけ true。それ以外（未設定・空・"false"等）は既定値。 */
+export function envBool(name: string, fallback: boolean): boolean {
+	const raw = process.env[name];
+	if (raw === undefined) return fallback;
+	const trimmed = raw.trim().toLowerCase();
+	if (trimmed === "") return fallback;
+	return trimmed === "true" || trimmed === "1";
+}
+
 /**
  * 数値として読む。空文字はもちろん、数値でない値も既定値に落とす。
  * 「0 になって全部止まる」より「既定値で動き続ける」方が事故が小さい。

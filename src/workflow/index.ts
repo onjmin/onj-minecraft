@@ -15,6 +15,7 @@ import { craftWeaponSkill } from "../skills/crafting/weapon";
 import { exploreLandSkill } from "../skills/exploring/land";
 import { gotoBaseSkill } from "../skills/goto/base";
 import { gotoCoordsSkill } from "../skills/goto/coords";
+import { gotoLandmarkSkill } from "../skills/goto/landmark";
 import { gotoPlayerSkill } from "../skills/goto/player";
 import { gotoSurfaceSkill } from "../skills/goto/surface";
 import { giveItemSkill } from "../skills/social/give";
@@ -45,6 +46,7 @@ const allSkills = [
 	gotoBaseSkill, // 拠点帰還
 	gotoPlayerSkill, // プレイヤーへ移動
 	gotoSurfaceSkill, // 地上へ移動
+	gotoLandmarkSkill, // 見かけた人工物(誰かの拠点)へ向かう
 
 	// --- Social Domain ---
 	giveItemSkill, // アイテムを人に渡す
