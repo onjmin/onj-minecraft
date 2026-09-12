@@ -84,6 +84,33 @@ export class JavaDriver implements BotDriver {
 			async findBlocksFar(names, maxDistance, count) {
 				return this.findBlocks(names, maxDistance, count);
 			},
+			// Java版はワールド全体を引けるので、自前で列を辿れば足りる。
+			async surfaceScan(radius) {
+				const here = self.getState().position;
+				const ox = Math.floor(here.x);
+				const oz = Math.floor(here.z);
+				const r = Math.max(1, Math.floor(radius));
+				const out: { x: number; z: number; y: number; name: string; open: number }[] = [];
+				for (let dx = -r; dx <= r; dx++) {
+					for (let dz = -r; dz <= r; dz++) {
+						const x = ox + dx;
+						const z = oz + dz;
+						let air = 0;
+						for (let y = 320; y >= -64; y--) {
+							const b = self.bot.blockAt(toVec3({ x, y, z }));
+							if (!b) continue;
+							if (b.name === "air") {
+								air++;
+								continue;
+							}
+							if (air === 0) break;
+							out.push({ x, z, y, name: String(b.name), open: air });
+							break;
+						}
+					}
+				}
+				return out;
+			},
 			getBiome(position) {
 				try {
 					const id = self.bot.world.getBiome(toVec3(position));
@@ -219,10 +246,18 @@ export class JavaDriver implements BotDriver {
 		await this.bot.lookAt(toVec3(position));
 	}
 
+	/** 壊したブロックの通知先。agent が埋め戻しのために設定する。 */
+	public onDug?: (position: Position, blockName: string) => void;
+
 	async dig(signal: AbortSignal, position: Position): Promise<void> {
 		const block = this.bot.blockAt(toVec3(position));
 		if (!block) throw new Error(`No block at ${position.x},${position.y},${position.z}`);
+		// 壊す前に名前を控える。壊した後では分からない。
+		const name = String(block.name ?? "");
 		await this.agent.abortableDig(signal, block);
+		if (name && name !== "air") {
+			this.onDug?.({ ...position }, name);
+		}
 	}
 
 	async pillarUp(_signal: AbortSignal, count: number): Promise<number> {

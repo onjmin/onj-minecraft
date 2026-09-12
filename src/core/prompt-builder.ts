@@ -40,6 +40,13 @@ export interface ThinkingState {
 	landmarks?: string[];
 	/** リスポーン地点として登録したベッドの位置。無ければ未登録。 */
 	spawnBed?: string;
+	/**
+	 * 自分が掘ったまま埋め戻していないマスの数。
+	 *
+	 * 他人のワールドに間借りしている以上、これは借金と同じ。見せていないと
+	 * 判断に入らない。実際、掘りっぱなしで初期リスを穴だらけにして苦情が出た。
+	 */
+	dugHoles?: number;
 
 	skills?: {
 		name: string;
@@ -162,6 +169,12 @@ Man-made structures you have seen (someone's base — go here instead of wanderi
 ${formatList(state.landmarks)}
 
 Respawn point registered at: ${state.spawnBed ?? "None (you will respawn at world spawn if you die)"}
+
+Holes you dug and have not filled back in: ${state.dugHoles ?? 0}${
+		(state.dugHoles ?? 0) > 0
+			? " — you are a guest here and players have complained about the terrain being wrecked. Fill them in (building.repair) when you have spare blocks."
+			: ""
+	}
 `.trim();
 }
 

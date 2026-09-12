@@ -1767,6 +1767,18 @@ func (s *session) dispatch(c command) {
 		s.mu.Unlock()
 		s.reply(c.ID, true, "", map[string]any{"blocks": found})
 
+	case "surfaceScan":
+		// 周りの列の「地表の高さ」をまとめて返す。
+		//
+		// TypeScript 側の地形走査は BlockView(半径16の立方体)しか見られない。
+		// 48ブロック掘り抜かれた穴の底に落ちると、本物の地表が丸ごと範囲外に
+		// なり、穴の途中の棚を地表と誤認して抜け出せなくなる。列を上へ辿る
+		// だけの計算なので、チャンクを持っているこちら側でやる方が安い。
+		s.mu.Lock()
+		cols := s.surfaceScanLocked(c.Range)
+		s.mu.Unlock()
+		s.reply(c.ID, true, "", map[string]any{"columns": cols})
+
 	case "dig":
 		bx := int32(math.Floor(float64(c.X)))
 		by := int32(math.Floor(float64(c.Y)))
@@ -2782,6 +2794,68 @@ func (s *session) requestNearby() {
 			return
 		}
 	}
+}
+
+// surfaceScanLocked は自分の周りの列ごとに「地表の高さ」を返す。
+// 呼び出し側が mu を持つこと。
+//
+// 地表とは「空が見えている一番上の固いブロック」。上から下へ辿り、空気が
+// 続いた後に最初に当たる固いブロックの Y を返す。読めていない列は返さない
+// (未取得を「空」と答えると、向こう側が空中を目標にしてしまう)。
+//
+// 走査は列あたり高々 (上限-下限) 回。半径8で289列、1列200マスでも6万回
+// 程度で、findBlocksLocked の立方体走査よりはるかに軽い。
+func (s *session) surfaceScanLocked(radius float32) []map[string]any {
+	if radius <= 0 {
+		radius = 8
+	}
+	r := int32(radius)
+	if r > 48 {
+		r = 48
+	}
+
+	feet := s.feetLocked()
+	ox := int32(math.Floor(float64(feet[0])))
+	oz := int32(math.Floor(float64(feet[2])))
+
+	// 走査する高さの範囲。要求している垂直の幅(requestVertical)より広く
+	// 取っても、持っていない領域は ok=false で素通りするだけ。
+	const scanTop = int32(320)
+	const scanBottom = int32(-64)
+
+	out := make([]map[string]any, 0, (2*r+1)*(2*r+1))
+	for dx := -r; dx <= r; dx++ {
+		for dz := -r; dz <= r; dz++ {
+			x, z := ox+dx, oz+dz
+			air := 0
+			for y := scanTop; y >= scanBottom; y-- {
+				name, ok := s.world.blockAt(x, y, z)
+				if !ok {
+					// この高さは持っていない。空気とは限らないので数えない。
+					continue
+				}
+				if name == "air" {
+					air++
+					continue
+				}
+				// 空気の下に初めて出てきた固いもの。ただし上に空気を1つも
+				// 読めていないなら、天井の下かもしれないので地表とは呼ばない。
+				if air == 0 {
+					break
+				}
+				out = append(out, map[string]any{
+					"x":    x,
+					"z":    z,
+					"y":    y,
+					"name": name,
+					// 上にどれだけ空きがあったか。天井の下か空の下かの目安。
+					"open": air,
+				})
+				break
+			}
+		}
+	}
+	return out
 }
 
 // storeChunk は届いたサブチャンクを解いて保持する。

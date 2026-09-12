@@ -49,6 +49,15 @@ const WORLD_MIN_Y = -64;
 const WORLD_MAX_Y = 320;
 /** これだけ上がれていれば、途中でも成果として認める。 */
 const PARTIAL_CLIMB = 3;
+/** サイドカーに地表を数えさせる半径。持っているチャンクの範囲に収める。 */
+const FAR_SURFACE_RADIUS = 24;
+/**
+ * 地表と認めるのに要る頭上の空き。
+ *
+ * 少ないと、洞窟の天井にある1マスの空洞を地表と読んでしまう。
+ * 空の下なら数十マス空いているので、そこそこ大きく取ってよい。
+ */
+const MIN_OPEN_ABOVE = 8;
 
 function isTransparent(name: string): boolean {
 	return !name || name === "air" || name === "water" || name === "lava";
@@ -200,14 +209,45 @@ export const gotoSurfaceSkill = createSkill<void, { y: number; method: string }>
 
 		agent.log(`[goto.surface] Current Y: ${startY}, searching for surface...`);
 
-		const radii = [16, 8, 4];
+		// まずサイドカーに本物の地表を数えさせる。
+		//
+		// 半径16の写し(BlockView)だけで探すと、深く掘り抜かれた穴の底では
+		// 本物の地表が丸ごと範囲外になり、穴の途中の棚を地表と誤認する。
+		// 実測 2026-09-12、Y=13 にいて真上 Y=61 が地表なのに
+		// 「Found surface at (2, 24, 61)」と棚を掴み、届かず失敗、を
+		// 繰り返して初期リスの穴から抜け出せなかった。
+		// 列を辿るだけの計算なので、チャンクを持っている側にやらせる。
 		let targetPos: Position | null = null;
+		try {
+			const columns = await driver.world.surfaceScan(FAR_SURFACE_RADIUS);
+			if (columns.length > 0) {
+				// 自分より高く、空きが十分ある列の中から、近い順に選ぶ。
+				const candidates = columns
+					.filter((c) => c.y > startY && c.open >= MIN_OPEN_ABOVE && isSafeBlock(c.name))
+					.sort(
+						(a, b) =>
+							Math.hypot(a.x - currentPos.x, a.z - currentPos.z) -
+							Math.hypot(b.x - currentPos.x, b.z - currentPos.z),
+					);
+				const best = candidates[0];
+				if (best) {
+					targetPos = { x: best.x + 0.5, y: best.y + 1, z: best.z + 0.5 };
+					agent.log(
+						`[goto.surface] Real surface at (${best.x}, ${best.y}, ${best.z}), ${best.y - startY} above, open=${best.open}`,
+					);
+				}
+			}
+		} catch {
+			// 数えられなくても、下の近距離走査で続ける。
+		}
+
+		const radii = [16, 8, 4];
 
 		// 自分の Y を基準にした走査帯。上を優先して見たいので上から下へ回す。
 		const scanTop = Math.min(WORLD_MAX_Y, startY + SCAN_UP);
 		const scanBottom = Math.max(WORLD_MIN_Y, startY - SCAN_DOWN);
 
-		search: for (const radius of radii) {
+		search: for (const radius of targetPos ? [] : radii) {
 			const attempts = radius <= 4 ? 4 : Math.min(12, radius);
 
 			for (let i = 0; i < attempts; i++) {

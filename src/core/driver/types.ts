@@ -99,6 +99,20 @@ export interface WorldReader {
 	 * 毎tick呼ぶものではない。間隔を空けて使うこと。
 	 */
 	findBlocksFar(names: string[], maxDistance: number, count: number): Promise<BlockInfo[]>;
+	/**
+	 * 周りの列ごとの地表(空が見えている一番上の固いブロック)を返す。
+	 *
+	 * blockAt は自分中心の半径16しか答えられない。48ブロック掘り抜かれた穴の
+	 * 底に落ちると本物の地表が範囲外になり、穴の途中の棚を地表と誤認して
+	 * 抜け出せなくなる。列を上へ辿るだけの計算なので、チャンクを持っている
+	 * サイドカー側にやらせる。往復が要るので非同期。
+	 *
+	 * open は「その地表の上に何マスの空きを読めたか」。天井の下か空の下かの
+	 * 目安になる。読めていない列は返らない。
+	 */
+	surfaceScan(
+		radius: number,
+	): Promise<{ x: number; z: number; y: number; name: string; open: number }[]>;
 	getBiome(position: Position): string;
 	/**
 	 * 体感的な明るさ 0–15。
@@ -171,6 +185,18 @@ export interface BotDriver {
 	 * エディション固有の Block オブジェクトを skills/ 側に持ち回らせないため。
 	 */
 	dig(signal: AbortSignal, position: Position): Promise<void>;
+	/**
+	 * 壊したブロックを知らせる先。壊す直前の名前を渡す。
+	 *
+	 * 他人のワールドに間借りしている以上、掘った跡は残さないのが筋なのだが、
+	 * 長いあいだ「掘る」側しか無かった。残っているログだけで破壊2300件以上、
+	 * 設置0件で、初期リス周辺が穴だらけになり「管理人のbotのせいで荒れてる」と
+	 * 苦情が出た。埋め戻すには何をどこで壊したかを覚えている必要がある。
+	 *
+	 * 掘る経路は driver.dig() 一本なので、記録もここに集約する。
+	 * 誰が覚えるか(方針)は agent 側が決める。
+	 */
+	onDug?: (position: Position, blockName: string) => void;
 	/**
 	 * 柱を積んで登る。跳んで、浮いている間に足元へブロックを置く。
 	 * 頭上を掘るだけでは登れない(縦穴が伸びるだけ)ので、上がるにはこれが要る。

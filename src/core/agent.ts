@@ -338,6 +338,57 @@ const UNARMED_RECOVERY_MAX_DEPTH = envNum("UNARMED_RECOVERY_MAX_DEPTH", 12);
 const RECOVERY_ATTEMPT_LIMIT = envNum("RECOVERY_ATTEMPT_LIMIT", 2);
 /** 抱えておく方針の数。プロンプトの "CURRENT STRATEGY (Max 3)" と揃える。 */
 const MAX_STRATEGIES = 3;
+/**
+ * 埋め戻しのために覚えておく「掘った跡」の数。
+ *
+ * 他人のワールドに間借りしているのに、長いあいだ掘る側しか無かった。
+ * 残っているログだけで破壊2300件以上・設置0件、初期リス周辺が穴だらけに
+ * なり「管理人のbotのせいで荒れてる」と苦情が出た。多すぎても持ちきれない
+ * ので上限を置き、古いものから捨てる。捨てた穴は埋まらないままになるが、
+ * 覚えていられる範囲は埋める。
+ */
+const DUG_LEDGER_LIMIT = envNum("DUG_LEDGER_LIMIT", 400);
+/** 手が届く範囲にある掘った跡は、ついでに埋める。その半径。 */
+const REFILL_REACH = envNum("REFILL_REACH", 4);
+/**
+ * 掘ってからこれだけ経った跡だけを埋め戻す。
+ *
+ * 掘った直後に埋めてはいけない。地上へ登るための階段はまさに「今掘った跡」
+ * なので、猶予が無いと踏んだ段を自分で塞ぎ、また掘り、を延々と繰り返して
+ * 永久に上がれなくなる。実測で、階段を刻んだ granite が掘った瞬間に台帳へ
+ * 載っていた。
+ *
+ * 目的は「穴を残さない」ことであって「即座に埋める」ことではない。
+ * 使い終わった頃に埋めればよい。
+ */
+const REFILL_GRACE_MS = envNum("REFILL_GRACE_MS", 10 * 60_000);
+/** 埋め戻しに使ってよいブロック。貴重な物を埋めに使わない。 */
+const FILLER_BLOCKS = [
+	"dirt",
+	"cobblestone",
+	"stone",
+	"deepslate",
+	"cobbled_deepslate",
+	"gravel",
+	"sand",
+	"andesite",
+	"diorite",
+	"granite",
+	"tuff",
+	"netherrack",
+	"grass_block",
+];
+/** 掘った跡を書き留めるファイル。再起動で「やった事」を忘れないために持つ。 */
+const DUG_LEDGER_FILE = "logs/dug-blocks.json";
+/**
+ * 四方を塞がれて掘り抜けるまでの間隔。
+ *
+ * この反射はログで579回発火していて、破壊の最大の出どころだった。
+ * 自分が掘った縦穴の中にいると四方が塞がった判定に常に当てはまるので、
+ * 歯止めが無いと「横を掘る→また塞がっている→また掘る」で穴が広がり続ける。
+ * 本当に閉じ込められているなら、間隔を空けても抜けられる。
+ */
+const ESCAPE_COOLDOWN_MS = envNum("ESCAPE_COOLDOWN_MS", 30_000);
 
 /**
  * 一回成功したら依頼が消化される類のスキル。
@@ -511,6 +562,17 @@ export class MinecraftAgent {
 	/** 思考が続けて落ちた回数。脳無しで動く判断に切り替えるために数える。 */
 	private thinkFailures = 0;
 	/**
+	 * 自分が壊したブロックの控え。埋め戻すために持つ。
+	 *
+	 * 掘る経路は driver.dig() 一本なので、そこから全部ここへ来る。
+	 * 再起動で忘れないよう、ファイルにも書き出す。
+	 */
+	private dugLedger: { position: Position; name: string; at: number }[] = [];
+	/** 台帳をディスクへ書くのを間引くための、最後に書いた時刻。 */
+	private dugLedgerSavedAt = 0;
+	/** 最後に「四方を塞がれて掘り抜けた」時刻。掘り広げ続けないために見る。 */
+	private lastEscapeDigAt = 0;
+	/**
 	 * 誰かが寝ているのに、近くにベッドが無くて自分は寝られなかったときの
 	 * 呼び出し先。統合版は全員が寝ないと朝が来ないので、寝られないなら
 	 * 席を譲って抜けるしかない。呼び出し側(bedrock.ts)が設定する。
@@ -626,6 +688,10 @@ export class MinecraftAgent {
 		if (injectedDriver) {
 			this.isJava = false;
 			this.driver = injectedDriver;
+			// 壊したものを控える。埋め戻すのに要る。
+			// ここで繋がないと、掘る側だけがある元の状態に戻る。
+			this.driver.onDug = (position, name) => this.noteDug(position, name);
+			this.loadDugLedger();
 			// 他プレイヤーとの意思疎通のため、発言の受信だけは共通で購読する
 			this.driver.on("chat", (username: string, message: string) =>
 				this.handleIncomingChat(username, message),
@@ -709,6 +775,9 @@ export class MinecraftAgent {
 
 		// エディション差を吸収する操作層。Java版なので JavaDriver を割り当てる。
 		this.driver = new JavaDriver(this);
+		// 統合版と同じく、壊したものを控える。
+		this.driver.onDug = (position, name) => this.noteDug(position, name);
+		this.loadDugLedger();
 
 		// インスタンス作成時に一度だけプラグインをロード
 		this.bot.loadPlugin(pathfinder);
@@ -1778,6 +1847,17 @@ export class MinecraftAgent {
 					(i) => i.name === "furnace" || i.name === "cobblestone" || i.name === "blackstone",
 				);
 			}
+			case "building.repair": {
+				// 今すぐ埋められる跡が残っているなら、材料が無くても出す
+				// (「何も持っていない」と正直に返して、集めに行く判断に繋がる)。
+				// 掘りたては数えない。数えると、登るために刻んだ階段を理由に
+				// 「埋め戻し」を選び続け、上がる作業が進まなくなる。
+				if (this.getFillableHoles().length > 0) return true;
+				// 台帳が空でも、埋める物を持っているなら一帯を直しに行ける。
+				// 初期リスの既存の穴は台帳に載っていないので、ここを閉じると
+				// 「直す手段はあるのに選べない」状態になる。
+				return this.driver.inventory.items().some((i) => FILLER_BLOCKS.includes(i.name));
+			}
 			case "goto.landmark":
 				// 一度も人工物を見ていないなら行き先が無い。
 				return this.getKnownLandmarks().length > 0;
@@ -2246,6 +2326,10 @@ export class MinecraftAgent {
 			spawnBed: this.spawnBed
 				? `(${this.spawnBed.x}, ${this.spawnBed.y}, ${this.spawnBed.z})`
 				: undefined,
+			// 埋め戻していない跡の数を見せる。見えていないものは直せない。
+			// 他人のワールドで穴を掘りっぱなしにしていると苦情が来る、を
+			// 判断材料として持たせる。
+			dugHoles: this.getDugHoles().length,
 			skills: skillsContext,
 			chatHistory: [chatLogContext],
 			pendingRequest,
@@ -2859,6 +2943,9 @@ export class MinecraftAgent {
 			// 丸腰で木があるなら、まず剣。籠るより前に置くのは、
 			// 剣さえあれば籠らずに済む場面が多いため。
 			this.craftSwordIfUnarmed();
+			// 通りすがりに、自分が掘った跡を1つ埋める。
+			// 出向いて直す building.repair だけでは追いつかない。
+			await this.refillDugHoles(signal);
 			// 見かけた建物を控える。地上に出たとき、向かう先として使う。
 			await this.noteLandmarksNearby();
 			// 昼のうちにベッドを叩いてリスポーン地点を移しておく。
@@ -3338,6 +3425,222 @@ export class MinecraftAgent {
 			.map((l) => ({ position: l.position, name: l.name }));
 	}
 
+	/**
+	 * 壊したブロックを控える。driver.dig() から呼ばれる。
+	 *
+	 * 覚えていないものは埋められない。掘る経路は1本なので、ここに集めれば
+	 * 取りこぼさない。同じマスを何度も掘ったときは最初の1件だけ残す
+	 * （最初に壊したものが「元の姿」なので、上書きすると戻す先が変わる）。
+	 */
+	public noteDug(position: Position, name: string): void {
+		const key = (p: Position) => `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}`;
+		const k = key(position);
+		if (this.dugLedger.some((d) => key(d.position) === k)) return;
+		// 木や葉は「荒らし」の範囲外。伐採は普通の営みで、苗も植えている。
+		// 地形(石・土・砂利など)を抜いた跡だけを埋め戻しの対象にする。
+		if (name.endsWith("_log") || name.endsWith("_leaves") || name.endsWith("_wood")) return;
+
+		this.dugLedger.push({
+			position: {
+				x: Math.floor(position.x),
+				y: Math.floor(position.y),
+				z: Math.floor(position.z),
+			},
+			name,
+			at: Date.now(),
+		});
+		if (this.dugLedger.length > DUG_LEDGER_LIMIT) {
+			this.dugLedger.splice(0, this.dugLedger.length - DUG_LEDGER_LIMIT);
+		}
+		this.saveDugLedger();
+	}
+
+	/** 埋まった(あるいは誰かが埋めた)ので台帳から落とす。 */
+	public clearDugHole(position: Position): void {
+		const k = `${Math.floor(position.x)},${Math.floor(position.y)},${Math.floor(position.z)}`;
+		this.dugLedger = this.dugLedger.filter(
+			(d) => `${d.position.x},${d.position.y},${d.position.z}` !== k,
+		);
+		this.saveDugLedger();
+	}
+
+	/**
+	 * まだ埋めていない跡を、近い順に返す。
+	 *
+	 * 借金の総額なので、掘ったばかりのものも含める。思考プロンプトの
+	 * 件数表示はこちらを使う。実際に埋めてよいものは getFillableHoles()。
+	 */
+	public getDugHoles(): { position: Position; name: string }[] {
+		const here = this.driver.getState().position;
+		return this.dugLedger
+			.slice()
+			.sort(
+				(a, b) =>
+					Math.hypot(a.position.x - here.x, a.position.y - here.y, a.position.z - here.z) -
+					Math.hypot(b.position.x - here.x, b.position.y - here.y, b.position.z - here.z),
+			)
+			.map((d) => ({ position: d.position, name: d.name }));
+	}
+
+	/**
+	 * 今埋めてよい跡だけを返す。
+	 *
+	 * 掘りたてを除く。登るために刻んだ階段は「今掘った跡」なので、これが
+	 * 無いと踏んだ段を自分で塞ぎ、また掘り、を繰り返して永久に上がれない。
+	 */
+	public getFillableHoles(): { position: Position; name: string }[] {
+		const fresh = new Set(
+			this.dugLedger
+				.filter((d) => Date.now() - d.at < REFILL_GRACE_MS)
+				.map((d) => `${d.position.x},${d.position.y},${d.position.z}`),
+		);
+		return this.getDugHoles().filter(
+			(h) => !fresh.has(`${h.position.x},${h.position.y},${h.position.z}`),
+		);
+	}
+
+	/**
+	 * 台帳をディスクへ書く。
+	 *
+	 * 再起動で忘れてよいものではない。忘れれば穴は残ったままで、
+	 * こちらは「やっていない」ことになる。書き込みは間引く。
+	 */
+	private saveDugLedger(): void {
+		if (Date.now() - this.dugLedgerSavedAt < 10_000) return;
+		this.dugLedgerSavedAt = Date.now();
+		try {
+			const file = path.join(process.cwd(), DUG_LEDGER_FILE);
+			fs.mkdirSync(path.dirname(file), { recursive: true });
+			fs.writeFileSync(file, JSON.stringify(this.dugLedger));
+		} catch {
+			// 書けなくても行動は続ける。控えが消えるだけ。
+		}
+	}
+
+	/** 起動時に台帳を読み戻す。前回までに掘った跡を引き継ぐ。 */
+	private loadDugLedger(): void {
+		try {
+			const file = path.join(process.cwd(), DUG_LEDGER_FILE);
+			if (!fs.existsSync(file)) return;
+			const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+			if (!Array.isArray(raw)) return;
+			this.dugLedger = raw
+				.filter((d: any) => d?.position && typeof d.name === "string")
+				.slice(-DUG_LEDGER_LIMIT);
+			if (this.dugLedger.length > 0) {
+				this.log(`[記録] 埋め戻していない跡が ${this.dugLedger.length} 件ある`);
+			}
+		} catch {
+			// 壊れていたら無かったことにする。
+		}
+	}
+
+	/**
+	 * 手の届く範囲にある掘った跡を、ついでに埋める。
+	 *
+	 * 専用のスキル(building.repair)で出向いて埋めるだけでは追いつかない。
+	 * 通りすがりに1つずつでも戻していれば、荒れ方は目に見えて変わる。
+	 * 持っている物で埋める。無ければ何もしない（埋めるために別の場所を
+	 * 掘ったら本末転倒）。
+	 */
+	private async refillDugHoles(signal: AbortSignal): Promise<void> {
+		if (this.dugLedger.length === 0) return;
+		const state = this.driver.getState();
+		if (!state.isReady || state.health <= 0) return;
+		// 敵が近いときに穴埋めを始めない。殴られながら置いても死ぬだけ。
+		if (this.driver.nearbyEntities(10).some((e) => isHostileMob(e.name))) return;
+
+		const here = state.position;
+		for (const hole of this.getFillableHoles()) {
+			const d = Math.hypot(
+				hole.position.x - here.x,
+				hole.position.y - here.y,
+				hole.position.z - here.z,
+			);
+			if (d > REFILL_REACH) break; // 近い順なので、遠くなったら終わり
+			// 自分が今いるマスは埋めない。埋まると窒息する。
+			const foot = {
+				x: Math.floor(here.x),
+				y: Math.floor(here.y),
+				z: Math.floor(here.z),
+			};
+			if (
+				hole.position.x === foot.x &&
+				hole.position.z === foot.z &&
+				(hole.position.y === foot.y || hole.position.y === foot.y + 1)
+			) {
+				continue;
+			}
+			const now = this.driver.world.blockAt(hole.position);
+			if (now === null) continue;
+			if (now.name !== "air") {
+				// もう埋まっている。誰かが直したか、水が流れ込んだ。
+				this.clearDugHole(hole.position);
+				continue;
+			}
+			if (await this.fillHoleAt(signal, hole.position, hole.name)) return;
+		}
+	}
+
+	/**
+	 * 1マス埋める。埋められたら true。
+	 *
+	 * 元と同じブロックを優先し、無ければありふれた物で代える。
+	 * 穴を残すより、違う物でも塞がっている方がましだと判断している。
+	 */
+	public async fillHoleAt(
+		signal: AbortSignal,
+		target: Position,
+		originalName: string,
+	): Promise<boolean> {
+		// 自分がいるマスは埋めない。埋めれば窒息する。
+		//
+		// 通りすがりの埋め戻し(refillDugHoles)側にも同じ判定があるが、
+		// スキル(building.repair)からも直接呼ぶので、ここにも置く。
+		// 片方にしか無いと、呼び口が増えたときに静かに抜ける。
+		const here = this.driver.getState().position;
+		const foot = { x: Math.floor(here.x), y: Math.floor(here.y), z: Math.floor(here.z) };
+		if (
+			target.x === foot.x &&
+			target.z === foot.z &&
+			(target.y === foot.y || target.y === foot.y + 1)
+		) {
+			return false;
+		}
+
+		const items = this.driver.inventory.items();
+		const pick =
+			items.find((i) => i.name === originalName) ??
+			items.find((i) => FILLER_BLOCKS.includes(i.name));
+		if (!pick) return false;
+
+		// 置くには足場になる隣接ブロックが要る。面は隣から穴へ向く向き。
+		const sides: Position[] = [
+			{ x: 1, y: 0, z: 0 },
+			{ x: -1, y: 0, z: 0 },
+			{ x: 0, y: 0, z: 1 },
+			{ x: 0, y: 0, z: -1 },
+			{ x: 0, y: -1, z: 0 },
+			{ x: 0, y: 1, z: 0 },
+		];
+		for (const s of sides) {
+			const ref = { x: target.x + s.x, y: target.y + s.y, z: target.z + s.z };
+			const refBlock = this.driver.world.blockAt(ref);
+			if (!refBlock?.solid) continue;
+			try {
+				await this.driver.equip(pick.name, "hand");
+				// face は ref から見て target のある向き。
+				await this.driver.placeBlock(signal, ref, { x: -s.x, y: -s.y, z: -s.z });
+				this.log(`[奉公] 掘った跡を埋めた (${target.x}, ${target.y}, ${target.z}) ${pick.name}`);
+				this.clearDugHole(target);
+				return true;
+			} catch {
+				// この面は駄目だった。次を試す。
+			}
+		}
+		return false;
+	}
+
 	/** 死んだ時刻を控える。死にすぎていないかを見るために持つ。 */
 	private noteDeath(): void {
 		this.recentDeaths.push(Date.now());
@@ -3601,12 +3904,20 @@ export class MinecraftAgent {
 
 		if (dirs.some((d) => open(d.x, d.z))) return;
 
+		// 掘り広げ続けない。
+		//
+		// 自分が掘った縦穴の中では四方が塞がった判定が常に成立するので、
+		// 歯止めが無いと横へ掘り続けて穴が広がる。実測で579回発火しており、
+		// 初期リス周辺が荒れた最大の出どころがこれだった。
+		if (Date.now() - this.lastEscapeDigAt < ESCAPE_COOLDOWN_MS) return;
+
 		// 全方向が塞がっている。壊せるものを1つ選んで抜ける。
 		for (const d of dirs) {
 			const target = { x: foot.x + d.x, y: foot.y, z: foot.z + d.z };
 			const block = driver.world.blockAt(target);
 			if (!block || !block.diggable) continue;
 			this.log(`[反射] 四方を塞がれているので ${block.name} を掘って出る`);
+			this.lastEscapeDigAt = Date.now();
 			try {
 				await driver.equipBestTool(target);
 				await driver.dig(signal, target);

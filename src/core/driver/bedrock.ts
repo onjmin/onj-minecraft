@@ -273,6 +273,7 @@ export class BedrockDriver implements BotDriver {
 			findBlocksMatching: (predicate, maxDistance, count) =>
 				this.blocks.findMatching(this.state.position, predicate, maxDistance, count),
 			findBlocksFar: (names, maxDistance, count) => this.findBlocksFar(names, maxDistance, count),
+			surfaceScan: (radius) => this.surfaceScan(radius),
 			// 統合版はバイオームもライトレベルもクライアントへ素直に送ってこない。
 			// 近似を返すと skills/ がそれを前提に判断してしまうため、
 			// 判断材料にならない値であることが分かる形で返す。
@@ -326,6 +327,34 @@ export class BedrockDriver implements BotDriver {
 			);
 		} catch {
 			// 探索の失敗で呼び出し側を止めない。見つからなかったのと同じに扱う。
+			return [];
+		}
+	}
+
+	/**
+	 * 周りの列の地表をサイドカーに数えさせる。
+	 *
+	 * BlockView(半径16)では、深い穴の底から本物の地表が見えない。列を辿る
+	 * だけの計算なので、チャンクを持っている向こう側でやる方が安い。
+	 */
+	private async surfaceScan(
+		radius: number,
+	): Promise<{ x: number; z: number; y: number; name: string; open: number }[]> {
+		try {
+			const res = await this.sidecar.send(
+				"surfaceScan",
+				{ range: Math.max(1, Math.floor(radius)) },
+				FAR_SEARCH_TIMEOUT_MS,
+			);
+			return (res.columns ?? []) as {
+				x: number;
+				z: number;
+				y: number;
+				name: string;
+				open: number;
+			}[];
+		} catch {
+			// 失敗しても呼び出し側を止めない。何も見えなかったのと同じに扱う。
 			return [];
 		}
 	}
@@ -756,7 +785,12 @@ export class BedrockDriver implements BotDriver {
 
 	// --- ワールド操作（未実装） ---
 
+	/** 壊したブロックの通知先。agent が埋め戻しのために設定する。 */
+	public onDug?: (position: Position, blockName: string) => void;
+
 	async dig(signal: AbortSignal, position: Position): Promise<void> {
+		// 壊す前に名前を控える。壊した後では分からない。
+		const before = this.blocks.blockAt(position);
 		const onAbort = () => this.sidecar.fire_and_forget("stop");
 		signal.addEventListener("abort", onAbort, { once: true });
 		try {
@@ -770,6 +804,10 @@ export class BedrockDriver implements BotDriver {
 		}
 		// 掘った結果を写しに反映させる。次の判断が古い地形を見ないように。
 		await this.refreshBlocks(true);
+		// 壊したことを知らせる。埋め戻す側がこれを頼りにする。
+		if (before && before.name !== "air") {
+			this.onDug?.({ ...position }, before.name);
+		}
 	}
 
 	async placeBlock(_signal: AbortSignal, reference: Position, face: Position): Promise<void> {
