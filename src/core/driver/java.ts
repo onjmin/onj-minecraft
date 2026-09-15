@@ -122,7 +122,9 @@ export class JavaDriver implements BotDriver {
 			},
 			getLightLevel(position) {
 				const block = self.bot.blockAt(toVec3(position));
-				if (!block) return 0;
+				// チャンク未読み込み。暗い(0)と答えると、見えていないだけの
+				// 場所を「暗い」と判断してしまう。分からないと返す。
+				if (!block) return null;
 				return Math.max(block.light ?? 0, (block as any).skyLight ?? 0);
 			},
 		};

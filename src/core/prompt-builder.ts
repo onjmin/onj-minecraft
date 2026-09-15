@@ -14,7 +14,8 @@ export interface ThinkingState {
 		biome?: string;
 		timeOfDay?: string;
 		weather?: string;
-		lightLevel?: number;
+		/** 0–15。推定できないときは null(プロンプトには unknown と出す)。 */
+		lightLevel?: number | null;
 		health?: number;
 		hunger?: number;
 		position?: { x: number; y: number; z: number };
@@ -115,6 +116,20 @@ Never repeat a skill that failed twice in the same environment unless the enviro
 `.trim();
 }
 
+/**
+ * 明るさを、意味のわかる形にして返す。
+ *
+ * 数字だけ出しても行動は変わらない。実際 15 固定を出し続けていた頃は、
+ * 暗い洞窟の底でも "Light Level: 15" と書かれていて、明かりを置く判断も
+ * 夜を避ける判断も一度も出てこなかった。敵が湧く明るさなら、そう書く。
+ */
+function formatLightLevel(level: number | null | undefined): string {
+	if (level === null || level === undefined) return "unknown";
+	// 7以下は湧き潰しができていない明るさ。地上の夜もここに入る。
+	if (level <= 7) return `${level} (DARK - hostile mobs spawn here)`;
+	return String(level);
+}
+
 function buildEnvironmentSection(state: ThinkingState): string {
 	const e = state.environment;
 
@@ -123,7 +138,7 @@ function buildEnvironmentSection(state: ThinkingState): string {
 Biome: ${e.biome ?? "unknown"}
 Time: ${e.timeOfDay ?? "unknown"}
 Weather: ${e.weather ?? "clear"}
-Light Level: ${e.lightLevel ?? "unknown"}
+Light Level: ${formatLightLevel(e.lightLevel)}
 Health: ${e.health ?? "unknown"}
 Hunger: ${e.hunger ?? "unknown"}
 Position: ${formatPosition(e.position)}

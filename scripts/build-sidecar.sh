@@ -30,6 +30,9 @@ cd /w
 mkdir -p bin
 gofmt -l . | grep . && { echo "gofmt が必要なファイルがあります"; exit 1; }
 go vet ./...
+# 明るさの推定(light.go)のように、実サーバーに出さないと確かめにくいものは
+# ここで押さえる。壊れても静かに間違った数を返すだけなので気づけない。
+go test ./...
 # Windows と Linux の両方を出す。開発機は Windows、検証は Docker のため。
 GOOS=windows GOARCH=amd64 go build -o bin/onj-bedrock.exe .
 GOOS=linux GOARCH=amd64 go build -o bin/onj-bedrock .

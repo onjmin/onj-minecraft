@@ -4,7 +4,8 @@ export interface EnvironmentSnapshot {
 	biome: string;
 	timeOfDay: "sunrise" | "day" | "sunset" | "night";
 	weather: "clear" | "rain";
-	lightLevel: number; // 0–15 averaged
+	/** 0–15 の平均。まだ読めていない場所では null。 */
+	lightLevel: number | null;
 	nearbyPlayers: string[];
 	nearbyMobs: {
 		name: string;
@@ -48,7 +49,7 @@ export function createPerceptionSnapshot(
 				biome: "unknown",
 				timeOfDay: "day",
 				weather: "clear",
-				lightLevel: 0,
+				lightLevel: null,
 				nearbyPlayers: [],
 				nearbyMobs: [],
 			},
@@ -114,24 +115,30 @@ function detectTimeOfDay(tick: number): "sunrise" | "day" | "sunset" | "night" {
 }
 
 /**
- * 足元まわり 3x3 の明るさを平均する。
- * 注意: 統合版はライトレベルをクライアントへ送らないため近似値になる。
+ * 足元まわり 3x3 の明るさを平均する。1つも読めなければ null。
+ *
+ * 注意: 統合版はライトレベルをクライアントへ送らないため、サイドカーが
+ *       頭上の遮蔽・近くの光源・時刻から推定した近似値になる。
  *       厳密な値を前提にした判定をここより上流に書かないこと。
+ *
+ * 読めなかったぶんは平均に混ぜない。0 として混ぜると、視界の端が
+ * 未読み込みなだけで「暗い」に寄っていく。
  */
-function getPerceivedLight(driver: BotDriver, position: Position): number {
+function getPerceivedLight(driver: BotDriver, position: Position): number | null {
 	const base = { x: Math.floor(position.x), y: Math.floor(position.y), z: Math.floor(position.z) };
 	const samples: number[] = [];
 
 	for (let dx = -1; dx <= 1; dx++) {
 		for (let dz = -1; dz <= 1; dz++) {
 			try {
-				samples.push(driver.world.getLightLevel({ x: base.x + dx, y: base.y, z: base.z + dz }));
+				const v = driver.world.getLightLevel({ x: base.x + dx, y: base.y, z: base.z + dz });
+				if (v !== null) samples.push(v);
 			} catch {
 				// 未対応エディションやチャンク未ロードでは単に取れない
 			}
 		}
 	}
 
-	if (samples.length === 0) return 0;
+	if (samples.length === 0) return null;
 	return Math.round(samples.reduce((a, b) => a + b, 0) / samples.length);
 }

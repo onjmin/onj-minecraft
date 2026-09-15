@@ -1888,6 +1888,23 @@ func (s *session) dispatch(c command) {
 			// 0〜23999 のゲーム内時刻。SetTime は累計tickなので余りを取る。
 			// 負になることがあるので折り返す。
 			"timeOfDay": ((s.worldTick % 24000) + 24000) % 24000,
+			// その場の明るさ(0〜15)。読み込めていなければ null。
+			//
+			// 統合版のサーバーは明るさを送ってこないので、こちらで持っている
+			// チャンクから推定する。長いあいだ 15 固定を返していて、
+			// 暗い所にいることが上流へ一度も伝わっていなかった。
+			"light": func() any {
+				feet := s.feetLocked()
+				p := blockPos{
+					int32(math.Floor(float64(feet[0]))),
+					int32(math.Floor(float64(feet[1]))),
+					int32(math.Floor(float64(feet[2]))),
+				}
+				if v, ok := s.world.lightAt(p, s.worldTick); ok {
+					return v
+				}
+				return nil
+			}(),
 			// 移動が伸びない原因を切り分けるための診断値。
 			"corrections": s.corrections,
 			"driftTotal":  s.driftTotal,

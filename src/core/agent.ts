@@ -413,6 +413,8 @@ const BURROW_FALL_SCAN = 8;
 const UNARMED_RECOVERY_MAX_DEPTH = envNum("UNARMED_RECOVERY_MAX_DEPTH", 12);
 /** 同じ死亡地点へ取りに行く回数の上限。超えたら諦める。 */
 const RECOVERY_ATTEMPT_LIMIT = envNum("RECOVERY_ATTEMPT_LIMIT", 2);
+/** 明るさをログに書く最短間隔。値が細かく揺れても埋め尽くさないため。 */
+const LIGHT_LOG_INTERVAL_MS = envNum("LIGHT_LOG_INTERVAL_MS", 15_000);
 /** 抱えておく方針の数。プロンプトの "CURRENT STRATEGY (Max 3)" と揃える。 */
 const MAX_STRATEGIES = 3;
 /**
@@ -2373,7 +2375,7 @@ export class MinecraftAgent {
 					biome: "unknown",
 					timeOfDay: "day",
 					weather: "clear",
-					lightLevel: 0,
+					lightLevel: null,
 					health: 0,
 					hunger: 0,
 					position: { x: 0, y: 0, z: 0 },
@@ -3088,8 +3090,42 @@ export class MinecraftAgent {
 	 * ここに置かないと判断待ちの間ずっと不利なままになる。
 	 * 本番のスポーン地点は壁に囲まれており、実際にそこで動けなくなっていた。
 	 */
+	/** 直前に書いた明るさ。値が動いたときだけ書く。 */
+	private lastLoggedLight: number | null | undefined = undefined;
+	/** 直前に書いた時刻。値が細かく揺れても書き続けないようにする。 */
+	private lastLightLogAt = 0;
+
+	/**
+	 * 明るさが変わったらログに残す。
+	 *
+	 * 統合版はサーバーが明るさを送ってこないため、ドライバは長いあいだ
+	 * 15 固定を返していた。暗い所にいることがプロンプトにもログにも
+	 * 残らず、「なぜ mob に殺され続けるのか」を後から追えなかった。
+	 * 死因の6割が暗い所にしか湧かない相手なので、ここは残す価値がある。
+	 */
+	private noteDarkness(): void {
+		const state = this.driver.getState();
+		const light = this.driver.world.getLightLevel(state.position);
+		if (light === this.lastLoggedLight) return;
+		// 値が1ずつ揺れるだけでログを埋めないよう、間隔を空ける。
+		if (Date.now() - this.lastLightLogAt < LIGHT_LOG_INTERVAL_MS) return;
+		this.lastLoggedLight = light;
+		this.lastLightLogAt = Date.now();
+
+		const y = Math.floor(state.position.y);
+		if (light === null) {
+			this.log(`[明るさ] 不明（チャンク未読み込み） Y=${y}`);
+			return;
+		}
+		// 高さと時刻も併記する。値が動かないとき、推定が壊れているのか
+		// 本当に暗い所に居続けているのかを、ログだけで見分けられるようにする。
+		const meaning = light <= 7 ? "暗い。mob が湧く" : "明るい";
+		this.log(`[明るさ] ${light} — ${meaning} Y=${y} 時刻=${state.timeOfDay}`);
+	}
+
 	private async reflexSurvival(signal: AbortSignal): Promise<void> {
 		try {
+			this.noteDarkness();
 			await this.recoverDeathLootIfAlive();
 			this.returnToSurfaceIfBuried();
 			await this.wearBestArmor();

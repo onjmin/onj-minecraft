@@ -123,12 +123,16 @@ export interface WorldReader {
 	): Promise<{ x: number; z: number; y: number; name: string; open: number }[]>;
 	getBiome(position: Position): string;
 	/**
-	 * 体感的な明るさ 0–15。
-	 * 注意: 統合版はライトレベルをクライアントへ送らないため、
-	 *       BedrockDriver では時刻・Y座標・遮蔽からの近似値を返す。
-	 *       厳密な値を前提にした判定を skills/ 側に書かないこと。
+	 * その場の明るさ 0–15。分からないときは null。
+	 *
+	 * 統合版はサーバーが明るさを送ってこない。サイドカーが持っている
+	 * チャンクから、頭上の遮蔽と近くの光源、それに時刻で推定する。
+	 * 読み込めていない場所では推定もできないので null になる。
+	 *
+	 * null を 0 や 15 に丸めないこと。BedrockDriver は長いあいだ 15 固定を
+	 * 返していて、暗い所にいることが上流へ一度も伝わっていなかった。
 	 */
-	getLightLevel(position: Position): number;
+	getLightLevel(position: Position): number | null;
 }
 
 export interface InventoryReader {

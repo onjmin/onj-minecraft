@@ -274,11 +274,22 @@ export class BedrockDriver implements BotDriver {
 				this.blocks.findMatching(this.state.position, predicate, maxDistance, count),
 			findBlocksFar: (names, maxDistance, count) => this.findBlocksFar(names, maxDistance, count),
 			surfaceScan: (radius) => this.surfaceScan(radius),
-			// 統合版はバイオームもライトレベルもクライアントへ素直に送ってこない。
+			// 統合版はバイオームをクライアントへ素直に送ってこない。
 			// 近似を返すと skills/ がそれを前提に判断してしまうため、
 			// 判断材料にならない値であることが分かる形で返す。
 			getBiome: () => "unknown",
-			getLightLevel: () => 15,
+			// 明るさはサイドカーが自前で推定している(sidecar/bedrock/light.go)。
+			// 計算しているのは足元ぶんだけなので、離れた座標には答えない。
+			// 「分からない」を「明るい」に丸めた 15 固定が、暗い所へ
+			// 突っ込み続けていた原因そのものだった。混ぜ直さないこと。
+			getLightLevel: (position) => {
+				const feet = this.state.position;
+				const far =
+					Math.abs(position.x - feet.x) > 4 ||
+					Math.abs(position.y - feet.y) > 4 ||
+					Math.abs(position.z - feet.z) > 4;
+				return far ? null : this.light;
+			},
 		};
 
 		this.inventory = {
@@ -363,6 +374,12 @@ export class BedrockDriver implements BotDriver {
 	get recentPackets(): string[] {
 		return this.sidecar.recentEvents;
 	}
+
+	/**
+	 * 足元の明るさ(0〜15)。サイドカーが state のたびに計算して寄越す。
+	 * まだチャンクを読めていない場所では null。
+	 */
+	private light: number | null = null;
 
 	/**
 	 * 移動がどれだけサーバーに棄却されているかの診断値。
@@ -527,6 +544,9 @@ export class BedrockDriver implements BotDriver {
 		this.state.pitch = Number(st.pitch ?? 0);
 		this.state.health = Number(st.health ?? 20);
 		this.state.food = Number(st.food ?? 20);
+		// 明るさはサイドカーが推定して state に乗せてくる。読み込めていない
+		// 場所では null が来る。ここで 0 や 15 に丸めないこと。
+		this.light = typeof st.light === "number" ? st.light : null;
 		// 時刻はサイドカーが自前で進めている。サーバーからの SetTime が
 		// 届いたときだけ値が飛ぶので、飛んだら残す。誰かが寝た・管理者が
 		// 時刻を変えた、あるいはこちらの進み方が間違っている、の判別に要る。
