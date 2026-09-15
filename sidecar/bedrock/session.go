@@ -243,6 +243,8 @@ type session struct {
 	world *world
 	// 進行中の採掘。tick ループが毎回 BlockActions を積む。
 	digging *digTask
+	// 既知の安全地帯(村・ベッド・拠点)。逃走時に defendLocked が参照する。
+	safeSpots []safeSpot
 	// 次の tick で送る設置。統合版の設置は player_auth_input に載せる。
 	pendingPlace *protocol.UseItemTransactionData
 
@@ -548,15 +550,19 @@ func (s *session) handle(pk packet.Packet) {
 		s.mu.Unlock()
 
 	case *packet.AddActor:
+		name := strings.TrimPrefix(v.EntityType, "minecraft:")
+		pos := mgl32.Vec3{v.Position[0], v.Position[1], v.Position[2]}
 		s.mu.Lock()
 		s.entities[v.EntityRuntimeID] = &entityInfo{
 			RuntimeID: v.EntityRuntimeID,
 			UniqueID:  v.EntityUniqueID,
-			Name:      strings.TrimPrefix(v.EntityType, "minecraft:"),
-			Type:      strings.TrimPrefix(v.EntityType, "minecraft:"),
-			Pos:       mgl32.Vec3{v.Position[0], v.Position[1], v.Position[2]},
+			Name:      name,
+			Type:      name,
+			Pos:       pos,
 		}
 		s.unique[v.EntityUniqueID] = v.EntityRuntimeID
+		// 村人がいる=村がある可能性が高い。逃げ込む先の候補として覚える。
+		s.villagerSafeSpotLocked(name, pos)
 		s.mu.Unlock()
 
 	case *packet.TakeItemActor:
@@ -1222,7 +1228,31 @@ func (s *session) defendLocked(n uint64) bool {
 			s.controls["sprint"] = false
 			return false
 		}
-		// 背を向けて走る。向きは逃げる方向に合わせる。
+		// 背を向けて走るだけでは、逃げた先でまた別の敵に出くわすだけになる。
+		// 村・ベッド・拠点として覚えている場所が近くにあれば、そこを目指す。
+		// 敵をはさんで反対側にあるような場所へは行かせない(away と大まかに
+		// 同じ向きのときだけ採用する)。
+		away := mgl32.Vec2{-dx, -dz}
+		if sp, ok := s.nearestSafeSpotLocked(feet, safeSpotSeekRange); ok &&
+			safeSpotDirectionHelps(feet, sp.Pos, away) {
+			d := sp.Pos.Sub(feet).Len()
+			if d <= safeSpotArriveRange {
+				// もう着いている。ここでじっとして様子を見た方がよい。
+				s.controls["forward"] = false
+				s.controls["sprint"] = false
+				s.fighting = 0
+				return true
+			}
+			sx, sz := sp.Pos[0]-s.pos[0], sp.Pos[2]-s.pos[2]
+			s.yaw = float32(math.Atan2(float64(-sx), float64(sz)) * 180 / math.Pi)
+			s.controls["forward"] = true
+			s.controls["sprint"] = true
+			s.controls["jump"] = false
+			s.fighting = 0
+			return true
+		}
+
+		// 覚えている安全地帯が無い・使えないときは、従来どおり背を向けて走る。
 		s.yaw = float32(math.Atan2(float64(dx), float64(-dz)) * 180 / math.Pi)
 		s.controls["forward"] = true
 		s.controls["sprint"] = true
@@ -1494,6 +1524,31 @@ func (s *session) dispatch(c command) {
 		}
 		s.mu.Unlock()
 		// 結果は到達または時間切れのときに返す。
+
+	case "safe_spot_add":
+		// スキル側が「訪問して安全だと確認した場所」を明示的に覚えさせる口。
+		// 自動検知(ベッド・村人)が拾えない、他プレイヤーの拠点などのために使う。
+		source := c.Message
+		if source == "" {
+			source = "manual"
+		}
+		s.mu.Lock()
+		s.addSafeSpotLocked(mgl32.Vec3{c.X, c.Y, c.Z}, source)
+		n := len(s.safeSpots)
+		s.mu.Unlock()
+		s.reply(c.ID, true, "", map[string]any{"count": n})
+
+	case "safe_spot_list":
+		s.mu.Lock()
+		list := make([]map[string]any, 0, len(s.safeSpots))
+		for _, sp := range s.safeSpots {
+			list = append(list, map[string]any{
+				"position": vec(sp.Pos),
+				"source":   sp.Source,
+			})
+		}
+		s.mu.Unlock()
+		s.reply(c.ID, true, "", map[string]any{"spots": list})
 
 	case "stop":
 		s.mu.Lock()
@@ -2651,6 +2706,9 @@ func (s *session) storeChunk(cx, cz int32, count int, payload []byte) {
 	s.mu.Lock()
 	for _, sc := range subs {
 		s.world.put(cx, cz, sc)
+		// ベッドがあれば、そこは誰かの寝床=拠点である可能性が高い。
+		// 逃げ込む先の候補として覚える。
+		s.scanChunkForBedsLocked(cx, cz, sc)
 	}
 	first := !s.chunkReported && len(subs) > 0
 	if first {
