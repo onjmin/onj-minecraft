@@ -527,7 +527,23 @@ export class BedrockDriver implements BotDriver {
 		this.state.pitch = Number(st.pitch ?? 0);
 		this.state.health = Number(st.health ?? 20);
 		this.state.food = Number(st.food ?? 20);
-		this.state.timeOfDay = Number(st.timeOfDay ?? 6000);
+		// 時刻はサイドカーが自前で進めている。サーバーからの SetTime が
+		// 届いたときだけ値が飛ぶので、飛んだら残す。誰かが寝た・管理者が
+		// 時刻を変えた、あるいはこちらの進み方が間違っている、の判別に要る。
+		const nextTime = Number(st.timeOfDay ?? 6000);
+		const prevTime = this.state.timeOfDay;
+		const elapsedTicks = this.lastStateAt > 0 ? ((Date.now() - this.lastStateAt) / 50) : 0;
+		const drift = ((nextTime - prevTime - elapsedTicks) % 24000 + 24000) % 24000;
+		if (this.lastStateAt === 0) {
+			// 最初の1回は生の値を残す。0 のままなら SetTime を受けていない、
+			// 変わらないなら世界の時刻が止まっている、の区別がつかなくなる。
+			console.log(`[bedrock] 接続時のワールド時刻: ${nextTime}`);
+		}
+		if (this.lastStateAt > 0 && drift > 600 && drift < 23400) {
+			console.log(`[bedrock] 時刻が飛んだ: ${prevTime} -> ${nextTime}`);
+		}
+		this.lastStateAt = Date.now();
+		this.state.timeOfDay = nextTime;
 		this.lastDiagnostics = {
 			corrections: Number(st.corrections ?? 0),
 			driftTotal: Number(st.driftTotal ?? 0),
@@ -630,6 +646,9 @@ export class BedrockDriver implements BotDriver {
 
 	// --- 行動 ---
 
+	/** 最後に状態を読んだ時刻。時刻の飛びを見るために持つ。 */
+	private lastStateAt = 0;
+
 	async goto(signal: AbortSignal, goal: MoveGoal): Promise<void> {
 		const target = this.resolveGoal(goal);
 		if (!target) notImplemented(`この移動目標(${goal.kind})`);
@@ -673,7 +692,9 @@ export class BedrockDriver implements BotDriver {
 				const at = this.blocks.blockAt(goal.position);
 				if (at?.solid) {
 					const spot = this.standableNear(goal.position);
-					return { x: spot.x, z: spot.z, distance: Math.max(goal.distance, 1.2) };
+					// 高さも渡す。水平だけで見ると、地下にある物の真上に
+					// 立った時点で「着いた」ことになる。
+					return { x: spot.x, y: spot.y, z: spot.z, distance: Math.max(goal.distance, 1.2) };
 				}
 				// 固くない目標(落ちているアイテムなど)は高さも合わせる。
 				// 水平だけだと、掘った穴の真上で「着いた」ことになる。
@@ -684,7 +705,8 @@ export class BedrockDriver implements BotDriver {
 					distance: goal.distance,
 					// 固くない目標＝落ちている物などを拾いに行く場面。
 					// そのために地形を掘るのは無駄で、他人の世界も壊す。
-					noDig: true,
+					// dig:true を渡されたときだけ掘ってよい。
+					noDig: goal.dig !== true,
 				};
 			}
 			case "block":
@@ -700,8 +722,15 @@ export class BedrockDriver implements BotDriver {
 			case "lookAtBlock": {
 				// そのブロックを操作できる位置まで行く。ブロックの上には立てないので、
 				// 隣で立てる場所を探す。見つからなければブロックの真横を狙う。
+				//
+				// 高さも渡すこと。水平距離だけで到達を判定すると、地下にある
+				// ベッドの真上(地表)に立った時点で「着いた」と返ってくる。
+				// 実測 02:24:30、8ブロック下のベッドに対して goto は成功を
+				// 返し、直後の activateBlock が「遠すぎて届きません（10.5
+				// ブロック）」で落ちていた。リスポーン地点の登録が何度も
+				// 失敗していたのはこれが原因。
 				const spot = this.standableNear(goal.position);
-				return { x: spot.x, z: spot.z, distance: 1.2 };
+				return { x: spot.x, y: spot.y, z: spot.z, distance: 1.2 };
 			}
 			default:
 				return null;

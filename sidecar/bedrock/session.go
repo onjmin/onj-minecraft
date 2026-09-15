@@ -199,6 +199,8 @@ type session struct {
 	// ワールドの総経過tick。SetTime はゲーム内時刻ではなく累計を送ってくるので、
 	// 昼夜の判定に使うには 24000 で割った余りを取る必要がある。
 	worldTick int32
+	// doDaylightCycle が切られているか。切られている世界では時刻が進まない。
+	dayCycleStopped bool
 	// 最後に殴った tick。連打を防ぐ。0 なら戦っていない。
 	fighting uint64
 	// 逃げ始めた tick と、逃げ終えた tick。走りっぱなしを防ぐ。
@@ -324,8 +326,40 @@ func (s *session) close(reason string) {
 	})
 }
 
+// initWorldTime は接続直後の仮の時刻を置く。
+//
+// 時刻はクライアントが自分で進めるもので、SetTime は同期のためにたまに
+// 来るだけ(gophertunnel の説明にも「クライアントが自分で進める」とある)。
+// 実測、この Realm では SetTime は接続後に一度も来ず、受け取った値を入れる
+// だけの実装では時計が 0(夜明け)で止まったままだった。そのため「夜」を
+// 一度も検知できず、夜にこもる反射が全ログを通して発火0件だった。
+//
+// ここで置く StartGame.Time は当てにならない。実測 19821(夜)で始まったが、
+// 直後に来た SyncWorldClocks は 1190(朝)だった。正は SyncWorldClocks で、
+// そちらが届いた時点で上書きされる。ここは届くまでの繋ぎでしかない。
+//
+// doDaylightCycle が切られている世界では時刻そのものが止まる。進めると
+// 昼のまま夜だと誤認するので、その場合は固定時刻を使い、進めない。
+func (s *session) initWorldTime() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.worldTick = int32(((s.game.Time % 24000) + 24000) % 24000)
+	for _, r := range s.game.GameRules {
+		if !strings.EqualFold(r.Name, "dodaylightcycle") {
+			continue
+		}
+		if on, ok := r.Value.(bool); ok && !on {
+			s.dayCycleStopped = true
+			s.worldTick = ((s.game.DayCycleLockTime % 24000) + 24000) % 24000
+		}
+	}
+	fmt.Fprintf(os.Stderr, "[sidecar] ワールド時刻 %d から開始（昼夜の進行: %v）\n",
+		s.worldTick, !s.dayCycleStopped)
+}
+
 // serve は接続が切れるか標準入力が閉じるまで動き続ける。
 func (s *session) serve(ctx context.Context) {
+	s.initWorldTime()
 	go s.readPackets()
 	go s.tick()
 	go s.readCommands()
@@ -439,9 +473,29 @@ func (s *session) handle(pk packet.Packet) {
 		}
 
 	case *packet.SetTime:
+		// 届いたときだけ合わせ直す。ふだんは tick() が自前で進めている。
 		s.mu.Lock()
 		s.worldTick = v.Time
 		s.mu.Unlock()
+
+	case *packet.SyncWorldClocks:
+		// 26.x の時刻同期。SetTime の後継で、こちらは実際に飛んでくる。
+		// 自前で進める時計はサーバーの実TPSより速くなりがち(Realm は 20TPS
+		// 出ていない)。実測、夜だと判断してベッドを叩いても tile.bed.noSleep
+		// が返る程度には先行していた。届いたら必ず合わせ直す。
+		if v.PayloadType == protocol.ClockPayloadTypeSyncState && len(v.SyncStates) > 0 {
+			st := v.SyncStates[0]
+			s.mu.Lock()
+			before := s.worldTick
+			s.worldTick = int32(((int64(st.Time) % 24000) + 24000) % 24000)
+			s.dayCycleStopped = st.Paused
+			after := s.worldTick
+			s.mu.Unlock()
+			if d := after - before; d > 200 || d < -200 {
+				fmt.Fprintf(os.Stderr, "[sidecar] 時刻を合わせ直した %d -> %d（停止: %v）\n",
+					before, after, st.Paused)
+			}
+		}
 
 	case *packet.DeathInfo:
 		// 死んだ。持ち物は全部その場に落ちる。黙って再開すると、集めた物が
@@ -896,6 +950,20 @@ func (s *session) tick() {
 		case <-t.C:
 		}
 		n++
+		// 時刻は自前で進める。
+		//
+		// 統合版の SetTime は接続時と、時刻が飛んだとき(就寝・/time set)に
+		// しか来ない。受け取ったきりの値を使うと時刻が止まったままになり、
+		// 夜がいつまでも来ない。実測、接続から15分たっても sunrise のまま
+		// で、「夜で丸腰」の反射は残っている全ログを通して一度も発火して
+		// いなかった。夜にこもれなかった本当の理由はこれ。
+		// クライアントは本来こうして自前で進める。SetTime が届いたら
+		// そちらへ合わせ直す(上の handlePacket)。
+		s.mu.Lock()
+		if !s.dayCycleStopped {
+			s.worldTick++
+		}
+		s.mu.Unlock()
 		s.checkDig()
 		if err := s.conn.WritePacket(s.buildInput(n)); err != nil {
 			s.close(fmt.Sprintf("入力の送信に失敗: %v", err))
@@ -1072,7 +1140,16 @@ func (s *session) steerLocked(n uint64) {
 		return
 	}
 	if time.Now().After(g.deadline) {
-		s.finishGoalLocked(false, fmt.Sprintf("目標に届かなかった（残り %.1f ブロック）", dist))
+		// 水平距離だけでは何が起きたのか分からない。高さの差と、
+		// 柱を積める足場の数を添える。実測、地下27メートルで
+		// 「残り 0.0 ブロック」とだけ出て、上がれない理由が読めなかった。
+		gap := float64(0)
+		if g.hasY {
+			gap = float64(g.y - s.feetLocked()[1])
+		}
+		s.finishGoalLocked(false, fmt.Sprintf(
+			"目標に届かなかった（残り %.1f ブロック / 高さ差 %.1f / 足場 %d / 経路 %d手）",
+			dist, gap, s.capsLocked().Blocks, len(g.path)))
 		return
 	}
 
@@ -1106,6 +1183,19 @@ func (s *session) steerLocked(n uint64) {
 			caps.CanDig = false
 		}
 		g.path = s.world.findPath(from, to, tol, planMaxNodes, caps)
+
+		// 水を使った経路は珍しいので記録する。掘る・積むに次ぐ3本目の
+		// 上がり方として、実際に使えているかを後から確かめられるように。
+		swims := 0
+		for _, st := range g.path {
+			if st.Action == stepSwim || st.Action == stepSwimUp {
+				swims++
+			}
+		}
+		if swims > 0 {
+			fmt.Fprintf(os.Stderr, "[sidecar] 水を使う経路を引いた（%d手中 %d手が泳ぎ）\n",
+				len(g.path), swims)
+		}
 	}
 
 	// 次の通過点。着いたら捨てて次へ。
@@ -1141,6 +1231,21 @@ func (s *session) steerLocked(n uint64) {
 	// Minecraft の yaw は南(+Z)が0で、西(-X)へ向かって増える。
 	dx, dz := tx-s.pos[0], tz-s.pos[2]
 	s.yaw = float32(math.Atan2(float64(-dx), float64(dz)) * 180 / math.Pi)
+
+	// 踏み出す先が火や溶岩なら踏み込まない。
+	//
+	// 経路が引けなかったとき、ここは目標へ真っ直ぐ歩く。その線上に何が
+	// あっても止まらない。実測 2026-09-13 15:06、goto.coords で拠点の
+	// チェストへ向かう途中、火の中へ歩いて入って焼け死んだ。経路の有無に
+	// 関わらず、足を出す先だけは必ず見る。止まれば目標は時間切れになるが、
+	// 死ぬよりは良い。
+	if s.hazardAheadLocked() {
+		s.controls["forward"] = false
+		s.controls["jump"] = false
+		// 同じ方向へ出し続けても仕方がない。引き直させる。
+		g.path = nil
+		return
+	}
 	s.controls["forward"] = true
 
 	// 進んでいなければ段差とみなして跳ぶ。壁なら跳んでも進まないので、
@@ -1155,6 +1260,39 @@ func (s *session) steerLocked(n uint64) {
 		g.lastPos = s.pos
 	}
 	s.controls["jump"] = stepUp || g.stalledTicks >= 2
+}
+
+// hazardAheadLocked は、今向いている方向のすぐ先が踏んではいけない場所か。
+//
+// 足元・足の高さ・頭の高さの3段を見る。溶岩は落ちれば即死、火は歩いて
+// 抜けても燃え続ける。1歩ぶん(0.6)と2歩ぶん(1.2)の先を見て、どちらかが
+// 危ないなら踏み込まない。
+//
+// 既に危険の中にいるときは止めない。止めたらそこで焼かれ続けるだけで、
+// 出るにはどこかへ歩くしかない。
+// 呼び出し側が mu を持つこと。
+func (s *session) hazardAheadLocked() bool {
+	feet := s.feetLocked()
+	fx := int32(math.Floor(float64(feet[0])))
+	fy := int32(math.Floor(float64(feet[1])))
+	fz := int32(math.Floor(float64(feet[2])))
+	if name, ok := s.world.blockAt(fx, fy, fz); ok && hazardBlocks[name] {
+		return false
+	}
+
+	rad := float64(s.yaw) * math.Pi / 180
+	dx := float32(-math.Sin(rad))
+	dz := float32(math.Cos(rad))
+	for _, reach := range []float32{0.6, 1.2} {
+		x := int32(math.Floor(float64(feet[0] + dx*reach)))
+		z := int32(math.Floor(float64(feet[2] + dz*reach)))
+		for _, dy := range []int32{-1, 0, 1} {
+			if name, ok := s.world.blockAt(x, fy+dy, z); ok && hazardBlocks[name] {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // defendLocked は敵が近いときの反応。処理したなら true を返し、
@@ -1175,6 +1313,12 @@ func (s *session) defendLocked(n uint64) bool {
 				dx := e.Pos[0] - s.pos[0]
 				dz := e.Pos[2] - s.pos[2]
 				s.yaw = float32(math.Atan2(float64(dx), float64(-dz)) * 180 / math.Pi)
+				// 逃げた先が火や溶岩では意味が無い。殴られる方がまし。
+				if s.hazardAheadLocked() {
+					s.controls["forward"] = false
+					s.controls["sprint"] = false
+					return true
+				}
 				s.controls["forward"] = true
 				s.controls["sprint"] = true
 				if n%4 == 0 {
@@ -2530,28 +2674,30 @@ func (s *session) dispatch(c command) {
 		s.mu.Unlock()
 
 		// クラフト枠は画面を開いている状態でしか使えない。
-		// 2x2 は持ち物の画面、3x3 は作業台の画面。実クライアントは開いた
-		// ときにこれを送る。送らないとサーバーは置き先を不正と判断する
-		// (FailedToValidateDstSlot)。
-		if err := s.conn.WritePacket(&packet.Interact{
+		// 2x2 は持ち物の画面、3x3 は作業台の画面。開いている画面と枠が
+		// 食い違うと、サーバーは置き先を不正と判断する。
+		//
+		// 両方を開かないこと。作業台のレシピなのに先に持ち物の画面を
+		// 開くと、サーバーから見て手前の画面は持ち物(2x2)のままになる。
+		// そこへ 3x3 の枠(32..40)へ置く要求を出すので CannotPlaceItem(55)
+		// で弾かれる。実測 2026-09-13、木の剣がこれで作れなかった。
+		// 実クライアントも、作業台を開くときに持ち物は開かない。
+		if chosen.NeedsTable && c.Value {
+			// 開いた確認を取ること。以前は500ミリ秒待つだけで、開いていなくても
+			// 送っていた。サーバーは受理を返すのに何も作られない、という形で
+			// 失敗する。実測で木の剣を17回試して1本もできなかった。
+			//
+			// 中身は待たない。作業台は中身を持たないので、待てば必ず落ちる。
+			if _, err := s.openBlockAt(c.X, c.Y, c.Z, false); err != nil {
+				s.reply(c.ID, false, fmt.Sprintf("作業台を開けません: %v", err), nil)
+				return
+			}
+		} else if err := s.conn.WritePacket(&packet.Interact{
 			ActionType:            packet.InteractActionOpenInventory,
 			TargetEntityRuntimeID: s.game.EntityRuntimeID,
 		}); err != nil {
 			s.reply(c.ID, false, fmt.Sprintf("持ち物を開けません: %v", err), nil)
 			return
-		}
-
-		// 作業台が要るレシピは、その作業台を実際に開く。持ち物の画面のままだと
-		// 3x3 の枠(32..40)が存在しないので置き先が不正になる。
-		//
-		// 開いた確認を取ること。以前は500ミリ秒待つだけで、開いていなくても
-		// 送っていた。サーバーは受理を返すのに何も作られない、という形で
-		// 失敗する。実測で木の剣を17回試して1本もできなかった。
-		if chosen.NeedsTable && c.Value {
-			if _, err := s.openContainerAt(c.X, c.Y, c.Z); err != nil {
-				s.reply(c.ID, false, fmt.Sprintf("作業台を開けません: %v", err), nil)
-				return
-			}
 		}
 
 		if os.Getenv("BEDROCK_TRACE_CRAFT") == "1" {
@@ -3032,8 +3178,20 @@ func (s *session) requestRespawn() {
 }
 
 // openContainerAt はその位置のコンテナを開き、中身が届くまで待つ。
-// 開くのは設置と同じ ClickBlock。サーバーが対象を見て開いてくれる。
+// チェストやかまどのように、中に物が入っているものに使う。
 func (s *session) openContainerAt(x, y, z float32) (*openContainer, error) {
+	return s.openBlockAt(x, y, z, true)
+}
+
+// openBlockAt はその位置のブロックの画面を開く。
+// 開くのは設置と同じ ClickBlock。サーバーが対象を見て開いてくれる。
+//
+// needContent が false なら ContainerOpen が来た時点で戻る。作業台には
+// 「中身」が無く、サーバーは ContainerOpen は返すが InventoryContent は
+// 返さない。中身を待つと必ず5秒で時間切れになり、クラフトが
+// 「コンテナが開きませんでした」で落ちる。実測 2026-09-13、木の剣を
+// 作る反射が1197回空振りしていた原因がこれ。材料も作業台も揃っていた。
+func (s *session) openBlockAt(x, y, z float32, needContent bool) (*openContainer, error) {
 	bx := int32(math.Floor(float64(x)))
 	by := int32(math.Floor(float64(y)))
 	bz := int32(math.Floor(float64(z)))
@@ -3068,7 +3226,10 @@ func (s *session) openContainerAt(x, y, z float32) (*openContainer, error) {
 		s.mu.Lock()
 		box := s.container
 		s.mu.Unlock()
-		if box != nil && box.Filled {
+		if box == nil {
+			continue
+		}
+		if !needContent || box.Filled {
 			return box, nil
 		}
 	}
@@ -3264,9 +3425,14 @@ func (s *session) capsLocked() caps {
 	blocks := 0
 	for _, it := range s.slots {
 		// 置ける「ブロック」かどうかを名前だけで厳密に判定はできない。
-		// ホットバーにあるものを候補として数え、実際に置けるかは
-		// 置いてみて判断する。置けなければ経路を引き直すことになる。
-		if it.Slot >= 0 && it.Slot <= 8 && isPlaceableName(it.Name) {
+		// 候補として数え、実際に置けるかは置いてみて判断する。
+		//
+		// ホットバー(0..8)に限らないこと。拾った物がどのスロットに入るかは
+		// こちらで決められない。手持ちに原木が11個あっても、それが9番以降に
+		// 入っているだけで「足場ゼロ」と数え、柱を積む手を経路探索から
+		// 外していた。地下27メートルから上がれなかった一因。
+		// 持ち替えは holdPlaceableLocked がやる。
+		if isPlaceableName(it.Name) {
 			blocks += it.Count
 		}
 	}
@@ -3292,6 +3458,19 @@ func isPlaceableName(name string) bool {
 // 呼び出し側が mu を持つこと。
 func (s *session) prepareStepLocked(st step) bool {
 	switch st.Action {
+	case stepSwimUp:
+		// 浮上し切るまで次の歩へ進まない。
+		//
+		// 通過点の消化は水平距離だけで見ているので、真上への歩はその場で
+		// 「着いた」ことになって消えてしまう。実際には1ミリも上がらない。
+		// 柱積み(stepTower)と同じく、ここで待たせる。
+		if s.feetLocked()[1] >= float32(st.Pos.Y)-0.2 {
+			return true
+		}
+		s.controls["jump"] = true
+		s.controls["forward"] = false
+		return false
+
 	case stepDig:
 		for _, b := range st.Dig {
 			if s.world.passable(b) {
@@ -3325,7 +3504,7 @@ func (s *session) prepareStepLocked(st step) bool {
 		if s.pendingPlace != nil {
 			return false
 		}
-		if held, ok := s.rawSlots[int(s.heldSlot)]; !ok || held.Stack.Count == 0 {
+		if !s.heldPlaceableLocked() {
 			if !s.holdPlaceableLocked() {
 				s.goal.path = nil
 				return false
@@ -3369,8 +3548,7 @@ func (s *session) prepareStepLocked(st step) bool {
 			s.goal.path = nil
 			return false
 		}
-		held, ok := s.rawSlots[int(s.heldSlot)]
-		if !ok || held.Stack.Count == 0 {
+		if !s.heldPlaceableLocked() {
 			if !s.holdPlaceableLocked() {
 				s.goal.path = nil
 				return false
@@ -3385,7 +3563,7 @@ func (s *session) prepareStepLocked(st step) bool {
 			BlockPosition:    protocol.BlockPos{ref.X, ref.Y, ref.Z},
 			BlockFace:        face,
 			HotBarSlot:       s.heldSlot,
-			HeldItem:         held,
+			HeldItem:         s.rawSlots[int(s.heldSlot)],
 			Position:         s.pos,
 			ClickedPosition:  clickOffset(face),
 			BlockRuntimeID:   uint32(clicked),
@@ -3424,7 +3602,27 @@ func (s *session) supportForLocked(fill blockPos) (blockPos, int32, bool) {
 
 // holdPlaceableLocked は置けそうなものをホットバーから選んで持つ。
 // 持ち替えを仕掛けたら true。候補が無ければ false。
+// heldPlaceableLocked は今握っている物が置けるブロックか。
+//
+// 「何か握っている」で済ませてはいけない。反射が剣を握らせるので、
+// 柱を積む場面でも手には wooden_sword が入っている。剣で置こうとしても
+// 何も起きず、足場が出来ないまま同じtickを繰り返して一生上がれない。
+// 実測 2026-09-13、足場12個・経路ありで地下27メートルから上がれなかった。
+// 呼び出し側が mu を持つこと。
+func (s *session) heldPlaceableLocked() bool {
+	item, ok := s.rawSlots[int(s.heldSlot)]
+	if !ok || item.Stack.Count == 0 {
+		return false
+	}
+	name, ok := s.itemNames[item.Stack.ItemType.NetworkID]
+	if !ok {
+		return false
+	}
+	return isPlaceableName(name)
+}
+
 func (s *session) holdPlaceableLocked() bool {
+	// まずホットバーを見る。持ち替えるだけで済む。
 	for _, it := range s.slots {
 		if it.Slot < 0 || it.Slot > 8 || !isPlaceableName(it.Name) {
 			continue
@@ -3439,6 +3637,36 @@ func (s *session) holdPlaceableLocked() bool {
 				HotBarSlot:      byte(slot),
 			})
 		}(int32(it.Slot), item)
+		return true
+	}
+
+	// ホットバーに無ければ、奥のスロットから手前へ移してから握る。
+	// 拾った物がどこへ入るかはこちらで決められないので、ここを諦めると
+	// 「持っているのに置けない」で詰まる。
+	for _, it := range s.slots {
+		if it.Slot <= 8 || !isPlaceableName(it.Name) {
+			continue
+		}
+		src := int32(it.Slot)
+		dst := int32(0)
+		// 空いているホットバー枠を探す。無ければ0番と入れ替える。
+		for slot := int32(0); slot <= 8; slot++ {
+			if item, ok := s.rawSlots[int(slot)]; !ok || item.Stack.Count == 0 {
+				dst = slot
+				break
+			}
+		}
+		item := s.rawSlots[int(src)]
+		s.heldSlot = dst
+		go func(from, to int32, i protocol.ItemInstance) {
+			// ホットバーへ移す。実クライアントも数字キーでこれを送る。
+			_ = s.conn.WritePacket(&packet.MobEquipment{
+				EntityRuntimeID: s.game.EntityRuntimeID,
+				NewItem:         i,
+				InventorySlot:   byte(from),
+				HotBarSlot:      byte(to),
+			})
+		}(src, dst, item)
 		return true
 	}
 	return false

@@ -53,8 +53,16 @@ export interface EntityInfo {
  * この記述子を Driver 側で各エディションの経路探索に変換する。
  */
 export type MoveGoal =
-	/** 指定座標に distance ブロック以内まで近づく（GoalNear 相当） */
-	| { kind: "near"; position: Position; distance: number }
+	/**
+	 * 指定座標に distance ブロック以内まで近づく（GoalNear 相当）。
+	 *
+	 * dig を true にすると、経路が無いときに掘って進んでよい。既定は掘らない。
+	 * 落ちている物を拾いに行くのに地形を壊すのは無駄で、他人の世界も荒れる。
+	 * ただし地上へ戻るときのように、掘らないと成立しない移動もある。
+	 * 実測 2026-09-13、地下27メートルからの復帰が「経路 0手」で止まり続けた。
+	 * 頭上が岩なので、掘る手を外した経路探索では一手も選べない。
+	 */
+	| { kind: "near"; position: Position; distance: number; dig?: boolean }
 	/** 指定ブロックにぴったり乗る（GoalBlock 相当） */
 	| { kind: "block"; position: Position }
 	/** 指定ブロックを操作できる隣接位置まで行く（GoalGetToBlock 相当） */
