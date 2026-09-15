@@ -273,6 +273,7 @@ export class BedrockDriver implements BotDriver {
 			findBlocksMatching: (predicate, maxDistance, count) =>
 				this.blocks.findMatching(this.state.position, predicate, maxDistance, count),
 			findBlocksFar: (names, maxDistance, count) => this.findBlocksFar(names, maxDistance, count),
+			surfaceScan: (radius) => this.surfaceScan(radius),
 			// 統合版はバイオームもライトレベルもクライアントへ素直に送ってこない。
 			// 近似を返すと skills/ がそれを前提に判断してしまうため、
 			// 判断材料にならない値であることが分かる形で返す。
@@ -326,6 +327,34 @@ export class BedrockDriver implements BotDriver {
 			);
 		} catch {
 			// 探索の失敗で呼び出し側を止めない。見つからなかったのと同じに扱う。
+			return [];
+		}
+	}
+
+	/**
+	 * 周りの列の地表をサイドカーに数えさせる。
+	 *
+	 * BlockView(半径16)では、深い穴の底から本物の地表が見えない。列を辿る
+	 * だけの計算なので、チャンクを持っている向こう側でやる方が安い。
+	 */
+	private async surfaceScan(
+		radius: number,
+	): Promise<{ x: number; z: number; y: number; name: string; open: number }[]> {
+		try {
+			const res = await this.sidecar.send(
+				"surfaceScan",
+				{ range: Math.max(1, Math.floor(radius)) },
+				FAR_SEARCH_TIMEOUT_MS,
+			);
+			return (res.columns ?? []) as {
+				x: number;
+				z: number;
+				y: number;
+				name: string;
+				open: number;
+			}[];
+		} catch {
+			// 失敗しても呼び出し側を止めない。何も見えなかったのと同じに扱う。
 			return [];
 		}
 	}
@@ -498,7 +527,23 @@ export class BedrockDriver implements BotDriver {
 		this.state.pitch = Number(st.pitch ?? 0);
 		this.state.health = Number(st.health ?? 20);
 		this.state.food = Number(st.food ?? 20);
-		this.state.timeOfDay = Number(st.timeOfDay ?? 6000);
+		// 時刻はサイドカーが自前で進めている。サーバーからの SetTime が
+		// 届いたときだけ値が飛ぶので、飛んだら残す。誰かが寝た・管理者が
+		// 時刻を変えた、あるいはこちらの進み方が間違っている、の判別に要る。
+		const nextTime = Number(st.timeOfDay ?? 6000);
+		const prevTime = this.state.timeOfDay;
+		const elapsedTicks = this.lastStateAt > 0 ? ((Date.now() - this.lastStateAt) / 50) : 0;
+		const drift = ((nextTime - prevTime - elapsedTicks) % 24000 + 24000) % 24000;
+		if (this.lastStateAt === 0) {
+			// 最初の1回は生の値を残す。0 のままなら SetTime を受けていない、
+			// 変わらないなら世界の時刻が止まっている、の区別がつかなくなる。
+			console.log(`[bedrock] 接続時のワールド時刻: ${nextTime}`);
+		}
+		if (this.lastStateAt > 0 && drift > 600 && drift < 23400) {
+			console.log(`[bedrock] 時刻が飛んだ: ${prevTime} -> ${nextTime}`);
+		}
+		this.lastStateAt = Date.now();
+		this.state.timeOfDay = nextTime;
 		this.lastDiagnostics = {
 			corrections: Number(st.corrections ?? 0),
 			driftTotal: Number(st.driftTotal ?? 0),
@@ -601,6 +646,9 @@ export class BedrockDriver implements BotDriver {
 
 	// --- 行動 ---
 
+	/** 最後に状態を読んだ時刻。時刻の飛びを見るために持つ。 */
+	private lastStateAt = 0;
+
 	async goto(signal: AbortSignal, goal: MoveGoal): Promise<void> {
 		const target = this.resolveGoal(goal);
 		if (!target) notImplemented(`この移動目標(${goal.kind})`);
@@ -644,7 +692,9 @@ export class BedrockDriver implements BotDriver {
 				const at = this.blocks.blockAt(goal.position);
 				if (at?.solid) {
 					const spot = this.standableNear(goal.position);
-					return { x: spot.x, z: spot.z, distance: Math.max(goal.distance, 1.2) };
+					// 高さも渡す。水平だけで見ると、地下にある物の真上に
+					// 立った時点で「着いた」ことになる。
+					return { x: spot.x, y: spot.y, z: spot.z, distance: Math.max(goal.distance, 1.2) };
 				}
 				// 固くない目標(落ちているアイテムなど)は高さも合わせる。
 				// 水平だけだと、掘った穴の真上で「着いた」ことになる。
@@ -655,7 +705,8 @@ export class BedrockDriver implements BotDriver {
 					distance: goal.distance,
 					// 固くない目標＝落ちている物などを拾いに行く場面。
 					// そのために地形を掘るのは無駄で、他人の世界も壊す。
-					noDig: true,
+					// dig:true を渡されたときだけ掘ってよい。
+					noDig: goal.dig !== true,
 				};
 			}
 			case "block":
@@ -671,8 +722,15 @@ export class BedrockDriver implements BotDriver {
 			case "lookAtBlock": {
 				// そのブロックを操作できる位置まで行く。ブロックの上には立てないので、
 				// 隣で立てる場所を探す。見つからなければブロックの真横を狙う。
+				//
+				// 高さも渡すこと。水平距離だけで到達を判定すると、地下にある
+				// ベッドの真上(地表)に立った時点で「着いた」と返ってくる。
+				// 実測 02:24:30、8ブロック下のベッドに対して goto は成功を
+				// 返し、直後の activateBlock が「遠すぎて届きません（10.5
+				// ブロック）」で落ちていた。リスポーン地点の登録が何度も
+				// 失敗していたのはこれが原因。
 				const spot = this.standableNear(goal.position);
-				return { x: spot.x, z: spot.z, distance: 1.2 };
+				return { x: spot.x, y: spot.y, z: spot.z, distance: 1.2 };
 			}
 			default:
 				return null;
@@ -756,7 +814,12 @@ export class BedrockDriver implements BotDriver {
 
 	// --- ワールド操作（未実装） ---
 
+	/** 壊したブロックの通知先。agent が埋め戻しのために設定する。 */
+	public onDug?: (position: Position, blockName: string) => void;
+
 	async dig(signal: AbortSignal, position: Position): Promise<void> {
+		// 壊す前に名前を控える。壊した後では分からない。
+		const before = this.blocks.blockAt(position);
 		const onAbort = () => this.sidecar.fire_and_forget("stop");
 		signal.addEventListener("abort", onAbort, { once: true });
 		try {
@@ -770,6 +833,10 @@ export class BedrockDriver implements BotDriver {
 		}
 		// 掘った結果を写しに反映させる。次の判断が古い地形を見ないように。
 		await this.refreshBlocks(true);
+		// 壊したことを知らせる。埋め戻す側がこれを頼りにする。
+		if (before && before.name !== "air") {
+			this.onDug?.({ ...position }, before.name);
+		}
 	}
 
 	async placeBlock(_signal: AbortSignal, reference: Position, face: Position): Promise<void> {

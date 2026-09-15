@@ -49,6 +49,22 @@ const WORLD_MIN_Y = -64;
 const WORLD_MAX_Y = 320;
 /** これだけ上がれていれば、途中でも成果として認める。 */
 const PARTIAL_CLIMB = 3;
+/** サイドカーに地表を数えさせる半径。持っているチャンクの範囲に収める。 */
+const FAR_SURFACE_RADIUS = 24;
+/**
+ * 自分の列の地表がこれより上なら「地下にいる」と見なす。
+ *
+ * 1〜2マスのずれは、立っているブロックの上面と地表の数え方の差で出る。
+ * それを地下と呼ぶと、地上にいるのに毎回登り直すことになる。
+ */
+const SURFACE_GAP = 3;
+/**
+ * 地表と認めるのに要る頭上の空き。
+ *
+ * 少ないと、洞窟の天井にある1マスの空洞を地表と読んでしまう。
+ * 空の下なら数十マス空いているので、そこそこ大きく取ってよい。
+ */
+const MIN_OPEN_ABOVE = 8;
 
 function isTransparent(name: string): boolean {
 	return !name || name === "air" || name === "water" || name === "lava";
@@ -189,25 +205,91 @@ export const gotoSurfaceSkill = createSkill<void, { y: number; method: string }>
 		// 立方体の外にいる間は全部 null になり、地下にいても地表と即答して
 		// 何もせずに終わる。判定は skyAbove に寄せてある。
 		const headY = startY + 1;
-		const sky = skyAbove(driver, Math.floor(currentPos.x), headY + 1, Math.floor(currentPos.z));
-		if (sky === "open") {
+		const myX = Math.floor(currentPos.x);
+		const myZ = Math.floor(currentPos.z);
+
+		// 本物の地表をサイドカーに数えさせる。ここで先に引くのは、
+		// 「もう地表にいる」の判断にも要るため。
+		//
+		// skyAbove(BlockView)だけでは決められない。半径16の外は null になり、
+		// 高さ16を超える洞窟の中では天井が立方体から出てしまって「空」と
+		// 区別がつかない。実測 2026-09-13、Y=39 の洞窟で
+		// 「Already on the surface at Y=39」を返し続け、地表(Y=66)へ
+		// 一度も上がらないまま8分間そこにいた。反射は「地下に埋まっている」と
+		// 918回言っているのに、スキルが「もう地上だ」と即答して噛み合わない。
+		let columns: { x: number; z: number; y: number; name: string; open: number }[] = [];
+		try {
+			columns = await driver.world.surfaceScan(FAR_SURFACE_RADIUS);
+		} catch {
+			// 数えられなくても、下の近距離走査で続ける。
+		}
+		// 自分の列がそのまま返るとは限らない。読めていない列は返らないので、
+		// 見つからなければ一番近い列で代用する。実測、同じ場所で
+		// 「Already on the surface at Y=39」と「Y=39 は地下」が交互に出た。
+		const myColumn =
+			columns.find((c) => c.x === myX && c.z === myZ) ??
+			columns
+				.filter((c) => Math.abs(c.x - myX) <= 2 && Math.abs(c.z - myZ) <= 2)
+				.sort(
+					(a, b) =>
+						Math.hypot(a.x - myX, a.z - myZ) - Math.hypot(b.x - myX, b.z - myZ),
+				)[0];
+
+		const sky = skyAbove(driver, myX, headY + 1, myZ);
+		// 自分の列の地表が分かっているなら、そちらを正とする。頭上が
+		// 空いて見えても、地表がずっと上なら地下にいる。
+		const buriedByScan = myColumn ? myColumn.y > startY + SURFACE_GAP : false;
+		if (sky === "open" && !buriedByScan) {
 			agent.log(`[goto.surface] Already on the surface at Y=${startY}.`);
 			return skillResult.ok(`Already on the surface at Y=${startY}.`, {
 				y: startY,
 				method: "already-surface",
 			});
 		}
+		if (buriedByScan && myColumn) {
+			agent.log(
+				`[goto.surface] Y=${startY} は地下。自分の列の地表は Y=${myColumn.y}（${myColumn.y - startY} 上）`,
+			);
+		}
 
 		agent.log(`[goto.surface] Current Y: ${startY}, searching for surface...`);
 
-		const radii = [16, 8, 4];
+		// 数えた地表から目標を選ぶ。
+		//
+		// 半径16の写し(BlockView)だけで探すと、深く掘り抜かれた穴の底では
+		// 本物の地表が丸ごと範囲外になり、穴の途中の棚を地表と誤認する。
+		// 実測 2026-09-12、Y=13 にいて真上 Y=61 が地表なのに
+		// 「Found surface at (2, 24, 61)」と棚を掴み、届かず失敗、を
+		// 繰り返して初期リスの穴から抜け出せなかった。
+		// 列を辿るだけの計算なので、チャンクを持っている側にやらせる。
 		let targetPos: Position | null = null;
+		{
+			if (columns.length > 0) {
+				// 自分より高く、空きが十分ある列の中から、近い順に選ぶ。
+				const candidates = columns
+					.filter((c) => c.y > startY && c.open >= MIN_OPEN_ABOVE && isSafeBlock(c.name))
+					.sort(
+						(a, b) =>
+							Math.hypot(a.x - currentPos.x, a.z - currentPos.z) -
+							Math.hypot(b.x - currentPos.x, b.z - currentPos.z),
+					);
+				const best = candidates[0];
+				if (best) {
+					targetPos = { x: best.x + 0.5, y: best.y + 1, z: best.z + 0.5 };
+					agent.log(
+						`[goto.surface] Real surface at (${best.x}, ${best.y}, ${best.z}), ${best.y - startY} above, open=${best.open}`,
+					);
+				}
+			}
+		}
+
+		const radii = [16, 8, 4];
 
 		// 自分の Y を基準にした走査帯。上を優先して見たいので上から下へ回す。
 		const scanTop = Math.min(WORLD_MAX_Y, startY + SCAN_UP);
 		const scanBottom = Math.max(WORLD_MIN_Y, startY - SCAN_DOWN);
 
-		search: for (const radius of radii) {
+		search: for (const radius of targetPos ? [] : radii) {
 			const attempts = radius <= 4 ? 4 : Math.min(12, radius);
 
 			for (let i = 0; i < attempts; i++) {
@@ -245,9 +327,28 @@ export const gotoSurfaceSkill = createSkill<void, { y: number; method: string }>
 			}
 		}
 
+		// 頭上が塞がっていて、地表がずっと上にあるなら、経路探索は通らない。
+		// 経路の手は「既にある空洞を登る」ものしか無く、天井を掘って
+		// 上がる手は持っていない。実測、毎回30秒かけて「経路 0手」で
+		// 失敗してから掘り上がりに落ちていた。先に掘る。
+		const ceiling = driver.world.blockAt({ x: myX, y: startY + 2, z: myZ });
+		const roofed = !!ceiling && ceiling.name !== "air";
+		const farBelow = myColumn ? myColumn.y - startY > 4 : false;
+		if (targetPos && roofed && farBelow) {
+			agent.log("[goto.surface] 頭上が塞がっている。経路探索を飛ばして掘り上がる");
+			targetPos = null;
+		}
+
 		if (targetPos) {
 			try {
-				await agent.driver.goto(signal, { kind: "near", position: targetPos, distance: 1 });
+				await agent.driver.goto(signal, {
+					kind: "near",
+					position: targetPos,
+					distance: 1,
+					// 地上へ戻る道は掘ってよい。天井の下にいるときは、
+					// 掘る手を外すと一手も選べず「経路 0手」で終わる。
+					dig: true,
+				});
 				return skillResult.ok(`Reached surface at Y=${Math.floor(targetPos.y)}.`, {
 					y: Math.floor(targetPos.y),
 					method: "pathfinder",
@@ -258,6 +359,15 @@ export const gotoSurfaceSkill = createSkill<void, { y: number; method: string }>
 		}
 
 		agent.log(`[goto.surface] No surface path found, attempting dig-up...`);
+
+		// 掘り上がりの終点。自分の列の本物の地表を使う。
+		//
+		// skyAbove だけで「着いた」と判断してはいけない。洞窟の天井が
+		// BlockView(半径16)の外にあると、空気しか読めずに open を返す。
+		// 実測 2026-09-13、Y=39 で掘り上がりに入った直後に
+		// 「Reached surface」と即答して1ブロックも掘らずに終わり、
+		// それを何十回も繰り返していた。
+		const surfaceY = myColumn ? myColumn.y : null;
 
 		const MAX_CLIMB = 30;
 		/** 同じ高さで足踏みしてよい回数。超えたらこの列では上がれない。 */
@@ -298,8 +408,13 @@ export const gotoSurfaceSkill = createSkill<void, { y: number; method: string }>
 			const fy = Math.floor(here.y);
 			const fz = Math.floor(here.z);
 
-			// 空が見えたら終わり。掘り切る前でも、出られていれば用は足りている。
-			if (skyAbove(driver, fx, fy + 2, fz) === "open") {
+			// 地表の高さまで上がれたら終わり。
+			// 数えられていないときだけ、頭上の見え方で判断する。
+			const arrived =
+				surfaceY !== null
+					? fy >= surfaceY - 1
+					: skyAbove(driver, fx, fy + 2, fz) === "open";
+			if (arrived) {
 				return skillResult.ok(`Reached surface at Y=${fy}.`, { y: fy, method: "dig-up" });
 			}
 
@@ -351,11 +466,18 @@ export const gotoSurfaceSkill = createSkill<void, { y: number; method: string }>
 			// 1マス上がる。まず経路探索(柱積み)に任せ、駄目なら階段を掘る。
 			// 柱積みは手元に置けるブロックが要るので、死んで手ぶらの状態では
 			// 階段だけが頼りになる。
+			//
+			// 目標は「2マス上」にする。到達判定は高さ1.5マスまでを許すので、
+			// 1マス上を目標にすると、立っているその場所が最初から到達条件を
+			// 満たしてしまう。経路探索は即座に成功を返し、ボットは一度も
+			// 登らない。実測 2026-09-13、Y=39〜40 を往復して
+			// 「Could not climb: nothing to stand on」を繰り返していた。
 			try {
 				await driver.goto(signal, {
 					kind: "near",
-					position: { x: fx + 0.5, y: fy + 1, z: fz + 0.5 },
+					position: { x: fx + 0.5, y: fy + 2, z: fz + 0.5 },
 					distance: 1,
+					dig: true,
 				});
 			} catch {
 				// 次の手へ。

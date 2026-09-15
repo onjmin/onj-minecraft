@@ -15,6 +15,7 @@ import { BedrockDriver } from "../core/driver/bedrock";
 import { envNum } from "../core/utils/env";
 import { kusabot } from "../profiles/kusabot";
 import { buildingBaseSkill } from "../skills/building/base";
+import { buildingRepairSkill } from "../skills/building/repair";
 import { collectDirtSkill } from "../skills/collecting/dirt";
 import { huntAnimalsSkill } from "../skills/collecting/hunting";
 import { mineOresSkill } from "../skills/collecting/mining";
@@ -61,6 +62,8 @@ const bedrockSkills = [
 	craftTorchSkill,
 	craftSmeltingSkill,
 	buildingBaseSkill,
+	// 掘った跡を埋め戻す。他人のワールドに穴を残さないための奉公。
+	buildingRepairSkill,
 	giveItemSkill,
 ];
 

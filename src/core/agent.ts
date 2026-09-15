@@ -103,10 +103,78 @@ function armorRank(itemName: string): number {
 	const i = ARMOR_MATERIALS.findIndex((m) => itemName.startsWith(m));
 	return i < 0 ? 99 : i;
 }
+/**
+ * 夜か。mob が湧き、地上を歩けば囲まれる時間帯。
+ * 同じ式が反射のあちこちに散らばっていたので一箇所に寄せる。
+ */
+function isNightTime(timeOfDay: number): boolean {
+	return timeOfDay >= 13000 && timeOfDay <= 23000;
+}
 /** この体力を下回ったら、昼でも潜って回復を待つ。 */
 const SHELTER_HEALTH = envNum("SHELTER_HEALTH", 8);
 /** 一度潜ったら、次に潜り直すまで置く間隔。掘り進み続けないための歯止め。 */
 const BURROW_COOLDOWN_MS = envNum("BURROW_COOLDOWN_MS", 60_000);
+/**
+ * 夜、これ以内に寝床があるなら、潜らずにそこへ戻る。
+ *
+ * 人が湧きつぶした安全な場所にベッドを置いてくれても、夜の反射は
+ * 「その場を掘って潜る」しか持っていなかった。用意された寝床は
+ * リスポーン地点としてしか使われず、夜は外を歩いて殺されていた。
+ */
+const HOME_RETREAT_RADIUS = envNum("HOME_RETREAT_RADIUS", 40);
+/** 寝床に着いたとみなす距離。この中にいる間は動かない。 */
+const HOME_ARRIVE_RADIUS = envNum("HOME_ARRIVE_RADIUS", 4);
+/**
+ * 寝床の周りで敵を見る範囲。
+ *
+ * 統合版でベッドに入れるのは敵が8マス以内にいないとき。同じ範囲で見れば、
+ * サーバーが「近くに敵がいる」と言う場面と判断が揃う。
+ */
+const HOME_THREAT_RADIUS = envNum("HOME_THREAT_RADIUS", 8);
+/** 寝床へ向かい直すまでに置く間隔。経路探索を毎周投げないための歯止め。 */
+const HOME_RETREAT_COOLDOWN_MS = envNum("HOME_RETREAT_COOLDOWN_MS", 20_000);
+/**
+ * 寝床へ着けなかったあと、次に試すまで置く間隔。
+ *
+ * goto は届かないまま成功を返すことがある。実測 02:24:30、10.5 ブロック
+ * 手前のベッドへ「行った」あとも距離が変わらなかった(ベッドが屋内や
+ * 地下にあって経路が無い)。着けないことに気付かずに待ち続けると、
+ * 夜通し外に突っ立つ。しばらくは潜る側に任せる。
+ */
+const HOME_UNREACHABLE_MS = envNum("HOME_UNREACHABLE_MS", 5 * 60_000);
+/**
+ * 届かなかったベッドを避けておく時間。
+ *
+ * 一番近いベッドが、地下や締め切った屋内にあって経路が無いことがある。
+ * 実測 (252,56,97) のベッドは真上まで行けるが8ブロック下で、30秒歩いた末に
+ * 「目標に届かなかった（残り 0.1 ブロック）」。毎回そこを選び直していては
+ * 少し離れた、実際に入れる寝床へ永久に辿り着かない。
+ */
+const BED_BLACKLIST_MS = envNum("BED_BLACKLIST_MS", 60 * 60_000);
+/** 一度に見るベッドの数。近い順に、入れるものが見つかるまで試す。 */
+const BED_CANDIDATES = envNum("BED_CANDIDATES", 5);
+/**
+ * 登録に失敗したあと、次のベッドを試すまでの間隔。
+ *
+ * 成功したあとの間隔(SPAWN_BED_COOLDOWN_MS=20分)をそのまま使うと、
+ * 入れないベッドが5つ並んでいるだけで1時間半かかる。失敗は安い。
+ */
+const SPAWN_BED_RETRY_MS = envNum("SPAWN_BED_RETRY_MS", 60_000);
+/**
+ * 潜った/寝床に着いたあと、動かずに待つ時間。
+ *
+ * これが無いと、潜った1秒後にスキルが動き出して自分の穴から出ていく。
+ * 実測 01:40:22 に潜り、01:40:23 に exploring.explore_land が始まっていた。
+ */
+const SHELTER_HOLD_MS = envNum("SHELTER_HOLD_MS", 5_000);
+/**
+ * 人から頼まれごとを受けてから、こもるのを控える時間。
+ *
+ * 夜に安全を優先するのは自分の都合で、頼んだ人はこちらが穴にいる理由を
+ * 知らない。頼まれた直後だけは外に出る。依頼の TTL(10分)をそのまま使うと
+ * 「木を集めて」の一言で一晩中出歩くことになるので、短く区切る。
+ */
+const SHELTER_YIELD_MS = envNum("SHELTER_YIELD_MS", 3 * 60_000);
 /** 埋まっているかを見る高さ。屋根はこの範囲に収まる前提。 */
 const BURIED_SCAN_HEIGHT = 32;
 /** 頭上にこれだけ固いものが積まっていたら「埋まっている」と見なす。
@@ -114,6 +182,15 @@ const BURIED_SCAN_HEIGHT = 32;
 const BURIED_THICKNESS = envNum("BURIED_THICKNESS", 4);
 /** これだけ続けて一瞬で終わったら、乗り換えの猶予を外す。 */
 const SPIN_LIMIT = envNum("SKILL_SPIN_LIMIT", 3);
+/**
+ * 地下に埋まっている間、地上へ戻る行動を手放さない時間。
+ *
+ * 地上へ戻るのは判断ではなく前提条件。木も動物も地上にあるので、
+ * 地下にいる限り何も進まない。実測 2026-09-13、27ブロック下から
+ * 上がるのに毎回9秒で LLM が別の行動へ乗り換え、11時間そこに居続けた。
+ * 登るには柱積みや階段掘りで分単位かかるので、その間は守る。
+ */
+const BURIED_TASK_LOCK_MS = envNum("BURIED_TASK_LOCK_MS", 180_000);
 
 /**
  * 人から受けた依頼を追いかける制限時間。
@@ -338,6 +415,64 @@ const UNARMED_RECOVERY_MAX_DEPTH = envNum("UNARMED_RECOVERY_MAX_DEPTH", 12);
 const RECOVERY_ATTEMPT_LIMIT = envNum("RECOVERY_ATTEMPT_LIMIT", 2);
 /** 抱えておく方針の数。プロンプトの "CURRENT STRATEGY (Max 3)" と揃える。 */
 const MAX_STRATEGIES = 3;
+/**
+ * 埋め戻しのために覚えておく「掘った跡」の数。
+ *
+ * 他人のワールドに間借りしているのに、長いあいだ掘る側しか無かった。
+ * 残っているログだけで破壊2300件以上・設置0件、初期リス周辺が穴だらけに
+ * なり「管理人のbotのせいで荒れてる」と苦情が出た。多すぎても持ちきれない
+ * ので上限を置き、古いものから捨てる。捨てた穴は埋まらないままになるが、
+ * 覚えていられる範囲は埋める。
+ */
+const DUG_LEDGER_LIMIT = envNum("DUG_LEDGER_LIMIT", 400);
+/** 手が届く範囲にある掘った跡は、ついでに埋める。その半径。 */
+const REFILL_REACH = envNum("REFILL_REACH", 4);
+/**
+ * 掘ってからこれだけ経った跡だけを埋め戻す。
+ *
+ * 掘った直後に埋めてはいけない。地上へ登るための階段はまさに「今掘った跡」
+ * なので、猶予が無いと踏んだ段を自分で塞ぎ、また掘り、を延々と繰り返して
+ * 永久に上がれなくなる。実測で、階段を刻んだ granite が掘った瞬間に台帳へ
+ * 載っていた。
+ *
+ * 目的は「穴を残さない」ことであって「即座に埋める」ことではない。
+ * 使い終わった頃に埋めればよい。
+ */
+const REFILL_GRACE_MS = envNum("REFILL_GRACE_MS", 10 * 60_000);
+/** 埋め戻しに使ってよいブロック。貴重な物を埋めに使わない。 */
+const FILLER_BLOCKS = [
+	"dirt",
+	"cobblestone",
+	"stone",
+	"deepslate",
+	"cobbled_deepslate",
+	"gravel",
+	"sand",
+	"andesite",
+	"diorite",
+	"granite",
+	"tuff",
+	"netherrack",
+	"grass_block",
+];
+/** 掘った跡を書き留めるファイル。再起動で「やった事」を忘れないために持つ。 */
+const DUG_LEDGER_FILE = "logs/dug-blocks.json";
+/**
+ * 寝床(リスポーン地点として登録したベッド)の控え。
+ *
+ * 再起動で忘れると、次の夜また一から探すことになる。人が用意してくれた
+ * 安全な場所を、こちらの都合で忘れてよい理由は無い。
+ */
+const HOME_FILE = "logs/home.json";
+/**
+ * 四方を塞がれて掘り抜けるまでの間隔。
+ *
+ * この反射はログで579回発火していて、破壊の最大の出どころだった。
+ * 自分が掘った縦穴の中にいると四方が塞がった判定に常に当てはまるので、
+ * 歯止めが無いと「横を掘る→また塞がっている→また掘る」で穴が広がり続ける。
+ * 本当に閉じ込められているなら、間隔を空けても抜けられる。
+ */
+const ESCAPE_COOLDOWN_MS = envNum("ESCAPE_COOLDOWN_MS", 30_000);
 
 /**
  * 一回成功したら依頼が消化される類のスキル。
@@ -499,6 +634,14 @@ export class MinecraftAgent {
 	private spawnBed: Position | null = null;
 	/** 最後にリスポーン地点の登録を試みた時刻。往復を繰り返さないために見る。 */
 	private lastSpawnBedAt = 0;
+	/** 最後に寝床へ向かい直した時刻。経路探索を毎周投げないために見る。 */
+	private lastHomeRetreatAt = 0;
+	/** 寝床へ着けなかったので、この時刻までは試さない。0 は未設定。 */
+	private homeUnreachableUntil = 0;
+	/** 寝床の周りを調べたか。書き出すのは接続ごとに一度でよい。 */
+	private inspectedHome = false;
+	/** 届かなかったベッド。"x,y,z" -> いつまで避けるか。 */
+	private unreachableBeds = new Map<string, number>();
 	/**
 	 * 見かけた人工物の位置。
 	 *
@@ -510,6 +653,17 @@ export class MinecraftAgent {
 	private lastLandmarkScanAt = 0;
 	/** 思考が続けて落ちた回数。脳無しで動く判断に切り替えるために数える。 */
 	private thinkFailures = 0;
+	/**
+	 * 自分が壊したブロックの控え。埋め戻すために持つ。
+	 *
+	 * 掘る経路は driver.dig() 一本なので、そこから全部ここへ来る。
+	 * 再起動で忘れないよう、ファイルにも書き出す。
+	 */
+	private dugLedger: { position: Position; name: string; at: number }[] = [];
+	/** 台帳をディスクへ書くのを間引くための、最後に書いた時刻。 */
+	private dugLedgerSavedAt = 0;
+	/** 最後に「四方を塞がれて掘り抜けた」時刻。掘り広げ続けないために見る。 */
+	private lastEscapeDigAt = 0;
 	/**
 	 * 誰かが寝ているのに、近くにベッドが無くて自分は寝られなかったときの
 	 * 呼び出し先。統合版は全員が寝ないと朝が来ないので、寝られないなら
@@ -559,6 +713,10 @@ export class MinecraftAgent {
 	 * 隠れ穴を「埋まっている」と誤読して掘り返すのを止めるためのもの。
 	 */
 	private sheltering = false;
+	/** この時刻まで、今の行動を別の行動に乗り換えない。0 は未設定。 */
+	private taskLockUntil = 0;
+	/** 乗り換えを止めている行動の名前。 */
+	private taskLockName = "";
 	/** 人から話しかけられて、次の判断を急ぎたいときに立てる。 */
 	private humanRequestPending = false;
 	/** 思考ループの待ちを途中で切り上げるための呼び出し口。 */
@@ -626,6 +784,11 @@ export class MinecraftAgent {
 		if (injectedDriver) {
 			this.isJava = false;
 			this.driver = injectedDriver;
+			// 壊したものを控える。埋め戻すのに要る。
+			// ここで繋がないと、掘る側だけがある元の状態に戻る。
+			this.driver.onDug = (position, name) => this.noteDug(position, name);
+			this.loadDugLedger();
+			this.loadHome();
 			// 他プレイヤーとの意思疎通のため、発言の受信だけは共通で購読する
 			this.driver.on("chat", (username: string, message: string) =>
 				this.handleIncomingChat(username, message),
@@ -709,6 +872,10 @@ export class MinecraftAgent {
 
 		// エディション差を吸収する操作層。Java版なので JavaDriver を割り当てる。
 		this.driver = new JavaDriver(this);
+		// 統合版と同じく、壊したものを控える。
+		this.driver.onDug = (position, name) => this.noteDug(position, name);
+		this.loadDugLedger();
+		this.loadHome();
 
 		// インスタンス作成時に一度だけプラグインをロード
 		this.bot.loadPlugin(pathfinder);
@@ -1104,7 +1271,11 @@ export class MinecraftAgent {
 				const heardAt = this.lastHeardAt;
 
 				const lastOther = this.conversation.lastFromOthers();
-				const knowledge = lastOther ? await fetchMinecraftKnowledge(lastOther.message) : null;
+				// 伏せた発言（乗っ取り狙い）で Wiki を引いても意味がない。
+				const knowledge =
+					lastOther && !lastOther.injected
+						? await fetchMinecraftKnowledge(lastOther.message)
+						: null;
 				if (knowledge) {
 					this.log(`[Wiki検索] ${lastOther?.message} -> 参考知識を取得`);
 				}
@@ -1778,6 +1949,17 @@ export class MinecraftAgent {
 					(i) => i.name === "furnace" || i.name === "cobblestone" || i.name === "blackstone",
 				);
 			}
+			case "building.repair": {
+				// 今すぐ埋められる跡が残っているなら、材料が無くても出す
+				// (「何も持っていない」と正直に返して、集めに行く判断に繋がる)。
+				// 掘りたては数えない。数えると、登るために刻んだ階段を理由に
+				// 「埋め戻し」を選び続け、上がる作業が進まなくなる。
+				if (this.getFillableHoles().length > 0) return true;
+				// 台帳が空でも、埋める物を持っているなら一帯を直しに行ける。
+				// 初期リスの既存の穴は台帳に載っていないので、ここを閉じると
+				// 「直す手段はあるのに選べない」状態になる。
+				return this.driver.inventory.items().some((i) => FILLER_BLOCKS.includes(i.name));
+			}
 			case "goto.landmark":
 				// 一度も人工物を見ていないなら行き先が無い。
 				return this.getKnownLandmarks().length > 0;
@@ -1866,9 +2048,39 @@ export class MinecraftAgent {
 					await this.ensureOnLand(controller.signal);
 					await this.reflexSurvival(controller.signal);
 
+					// 潜った/寝床に着いたなら、この周はスキルを動かさない。
+					//
+					// 反射で身を隠しても、直後にここでスキルが走っていたので
+					// 自分の穴から出ていっていた。実測 01:40:22 に潜り、
+					// 01:40:23 に exploring.explore_land が始まる。これを
+					// 一晩くり返し、10分で11回死んでいる。夜の反射の目的は
+					// 「留まる」ことなので、留まらせるところまでやる。
+					if (this.sheltering) {
+						await new Promise((r) => setTimeout(r, SHELTER_HOLD_MS));
+						continue;
+					}
+
 					let result: SkillResponse | undefined;
 
 					const args = this.currentSkillArgs[skill.name] || {};
+
+					// 引数の要るスキルを、引数無しで掴まされていないか。
+					//
+					// LLM が "Skill: goto.coords" とだけ返すことがある。その
+					// まま走らせると「座標が未指定」で即失敗し、次の思考まで
+					// 秒3回それを繰り返す。実測 2026-09-13、14:08 台の
+					// ログはこれで埋まっていた。選び直す方が早い。
+					if (
+						skill.inputSchema &&
+						Object.keys(skill.inputSchema).length > 0 &&
+						Object.keys(args).length === 0
+					) {
+						this.log(`${skill.name} は引数が要るのに指定が無い。別の行動に切り替える`);
+						this.pickSkillWithoutBrain();
+						await new Promise((r) => setTimeout(r, 1000));
+						continue;
+					}
+
 					let executionBeganAt = 0;
 					// 実行に入れた時点で暴走カウンタは戻す（結果の成否は下で扱う）
 					if (this.consecutiveFailures > 0 && this.currentTaskName !== this.lastFailedTask) {
@@ -1908,6 +2120,11 @@ export class MinecraftAgent {
 						continue;
 					}
 
+					// 失敗の理由を残す。これが無いと、ログには start と end しか
+					// 出ず、何十回失敗していても原因が分からない。実測、
+					// crafting.weapon が1197回空振りしていたのに、ログからは
+					// 何が起きているのか読めなかった。
+					if (!result.success) this.log(`${skill.name} 失敗: ${result.summary}`);
 					this.recordSkillOutcome(skill.name, result.success);
 					// 依頼を果たしたら消す。pendingRequest は TTL(10分)か新しい
 					// 依頼で上書きされるまで残り続ける仕組みで、これ自体は
@@ -2246,6 +2463,10 @@ export class MinecraftAgent {
 			spawnBed: this.spawnBed
 				? `(${this.spawnBed.x}, ${this.spawnBed.y}, ${this.spawnBed.z})`
 				: undefined,
+			// 埋め戻していない跡の数を見せる。見えていないものは直せない。
+			// 他人のワールドで穴を掘りっぱなしにしていると苦情が来る、を
+			// 判断材料として持たせる。
+			dugHoles: this.getDugHoles().length,
 			skills: skillsContext,
 			chatHistory: [chatLogContext],
 			pendingRequest,
@@ -2343,6 +2564,26 @@ export class MinecraftAgent {
 			// 行動を最後までやらせる」ためのもので、一瞬で失敗し続ける行動を
 			// 抱え込むためではない。実測で collecting.hunting が10分に149回
 			// 即失敗し、その間ほかの行動が一切選ばれなかった。
+			// 前提条件として掴んでいる行動は手放さない。
+			//
+			// 地下からの復帰は、判断で選ぶものではなく、他の何をするにも
+			// 先に済ませる必要があるもの。空振りが続いた直後は spinning が
+			// 立って猶予(MIN_UNINTERRUPTED_MS)が外れるので、そこを通り抜けて
+			// 乗り換えが通ってしまう。実測、登り始めて9秒で
+			// exploring.explore_land に切り替わり、以後ずっと地下にいた。
+			const taskLocked =
+				Date.now() < this.taskLockUntil &&
+				this.currentTaskName === this.taskLockName &&
+				!isSameTask &&
+				// 人に頼まれたことは通す。地下から出られなくても、返事はする。
+				!wasHumanRequest;
+			if (taskLocked) {
+				this.log(
+					`${this.currentTaskName} を続けます（前提条件のため ${foundSkillName} への切り替えは保留）`,
+				);
+				return;
+			}
+
 			const spinning = this.instantRepeats >= SPIN_LIMIT;
 			const tooEarlyToSwitch =
 				!isSameTask &&
@@ -2859,6 +3100,9 @@ export class MinecraftAgent {
 			// 丸腰で木があるなら、まず剣。籠るより前に置くのは、
 			// 剣さえあれば籠らずに済む場面が多いため。
 			this.craftSwordIfUnarmed();
+			// 通りすがりに、自分が掘った跡を1つ埋める。
+			// 出向いて直す building.repair だけでは追いつかない。
+			await this.refillDugHoles(signal);
 			// 見かけた建物を控える。地上に出たとき、向かう先として使う。
 			await this.noteLandmarksNearby();
 			// 昼のうちにベッドを叩いてリスポーン地点を移しておく。
@@ -3044,6 +3288,12 @@ export class MinecraftAgent {
 		if (!point) return;
 		const state = this.driver.getState();
 		if (state.health <= 0) return;
+		// 夜は取りに行かない。落とし物があるのは、たった今殺された場所で、
+		// 殺した相手はまだそこにいる。実測 01:37〜01:40 の死亡はほとんどが
+		// この往復の最中で、拾っては落とすを繰り返していた。
+		if (isNightTime(state.timeOfDay)) return;
+		// 死に続けているなら、回収より止まる方が先。
+		if (this.isDyingRepeatedly()) return;
 		if (this.currentTaskName === gotoDeathPointSkill.name) return;
 		if (!this.skills.has(gotoDeathPointSkill.name)) return;
 
@@ -3116,18 +3366,41 @@ export class MinecraftAgent {
 		// ことにすると、木の下や庇の下でも発動する。実測で goto.surface が
 		// 「もう地上にいる」と即答するのに、この判定だけ埋まっていると言い、
 		// 10分に54回そのスキルを掴まされていた。
+		if (this.solidAboveCount(foot) < BURIED_THICKNESS) {
+			// 出られた。掴んでいた行動を手放してよい。
+			if (this.taskLockName === gotoSurfaceSkill.name) {
+				this.taskLockUntil = 0;
+				this.taskLockName = "";
+			}
+			return;
+		}
+
+		// 既に地上へ戻る行動を掴んでいるなら、言い直さない。
+		if (this.currentTaskName !== gotoSurfaceSkill.name) {
+			this.log("[反射] 地下に埋まっている。地上へ戻る");
+			this.currentTaskName = gotoSurfaceSkill.name;
+			this.currentTaskSince = Date.now();
+			this.instantRepeats = 0;
+		}
+		// 登り切るまで手放さない。
+		this.taskLockUntil = Date.now() + BURIED_TASK_LOCK_MS;
+		this.taskLockName = gotoSurfaceSkill.name;
+	}
+
+	/**
+	 * 頭上に積まっている固いブロックの数。
+	 *
+	 * 「埋まっているか」と「もう隠れているか」で同じ数字を見る。屋根が
+	 * 厚いなら、そこは既に地下であり、同時に mob から隠れてもいる。
+	 */
+	private solidAboveCount(foot: Position): number {
 		let solidAbove = 0;
 		for (let y = foot.y + 2; y <= foot.y + 2 + BURIED_SCAN_HEIGHT; y++) {
 			const above = this.driver.world.blockAt({ x: foot.x, y, z: foot.z });
 			if (above === null) break;
 			if (above.name !== "air") solidAbove++;
 		}
-		if (solidAbove < BURIED_THICKNESS) return;
-
-		this.log("[反射] 地下に埋まっている。地上へ戻る");
-		this.currentTaskName = gotoSurfaceSkill.name;
-		this.currentTaskSince = Date.now();
-		this.instantRepeats = 0;
+		return solidAbove;
 	}
 
 	/**
@@ -3180,8 +3453,8 @@ export class MinecraftAgent {
 		// BlockView(半径16)ではなくサイドカーのチャンクを引く。同期版は
 		// maxDistance を黙って16に切り詰めるので、BED_SEARCH_RADIUS=48 と
 		// 書いてあっても16しか見ていなかった。
-		const beds = await this.driver.world.findBlocksFar(BED_NAMES, BED_SEARCH_RADIUS, 1);
-		const bed = beds[0];
+		const beds = await this.driver.world.findBlocksFar(BED_NAMES, BED_SEARCH_RADIUS, BED_CANDIDATES);
+		const bed = this.pickReachableBed(beds);
 		if (!bed) {
 			// 無いものは探し直しても無い。毎周探して報告し続けないよう、
 			// 知らせを消してこの夜は諦める。
@@ -3202,6 +3475,7 @@ export class MinecraftAgent {
 			// (registerSpawnAtBed)が同じベッドへもう一度歩かないよう控える。
 			this.spawnBed = { ...bed.position };
 			this.lastSpawnBedAt = Date.now();
+			this.saveHome();
 		} catch (e) {
 			if (!signal.aborted) this.log(`ベッドに入れなかった: ${e}`);
 			// 一度失敗したら諦める。夜が明けるまで往復し続ける方が邪魔になる。
@@ -3234,8 +3508,7 @@ export class MinecraftAgent {
 		if (state.dimension && !state.dimension.includes("overworld")) return;
 		// 夜のベッド探しは、暗い中を32ブロック歩くのと同じ。昼にやる。
 		// 夜に寝る話は sleepIfOthersSleeping が別に持っている。
-		const night = state.timeOfDay >= 13000 && state.timeOfDay <= 23000;
-		if (night) return;
+		if (isNightTime(state.timeOfDay)) return;
 		// 追われている最中に寄り道しない。
 		if (this.driver.nearbyEntities(16).some((e) => isHostileMob(e.name))) return;
 		if (state.health <= SHELTER_HEALTH) return;
@@ -3245,8 +3518,8 @@ export class MinecraftAgent {
 		// 見つかった場合も、届かなかった場合も、同じだけ間を置けばよい。
 		this.lastSpawnBedAt = Date.now();
 
-		const beds = await this.driver.world.findBlocksFar(BED_NAMES, BED_SEARCH_RADIUS, 1);
-		const bed = beds[0];
+		const beds = await this.driver.world.findBlocksFar(BED_NAMES, BED_SEARCH_RADIUS, BED_CANDIDATES);
+		const bed = this.pickReachableBed(beds);
 		if (!bed) return;
 
 		// 直前に登録したのと同じベッドなら、行くだけ無駄。
@@ -3266,11 +3539,18 @@ export class MinecraftAgent {
 		);
 		try {
 			await this.driver.goto(signal, { kind: "getToBlock", position: bed.position });
-			await this.driver.activateBlock(bed.position);
+			await this.activateBedWithRetry(signal, bed.position);
 			this.spawnBed = { ...bed.position };
+			this.saveHome();
 			this.log("[反射] リスポーン地点を登録した");
 		} catch (e) {
-			if (!signal.aborted) this.log(`リスポーン地点を登録できなかった: ${e}`);
+			if (!signal.aborted) {
+				this.log(`リスポーン地点を登録できなかった: ${e}`);
+				// そのベッドは「近いが入れない」。次は別のベッドを見る。
+				this.noteUnreachableBed(bed.position);
+				// 失敗したぶんは待たない。次の候補をすぐ試す。
+				this.lastSpawnBedAt = Date.now() - SPAWN_BED_COOLDOWN_MS + SPAWN_BED_RETRY_MS;
+			}
 		}
 	}
 
@@ -3338,6 +3618,258 @@ export class MinecraftAgent {
 			.map((l) => ({ position: l.position, name: l.name }));
 	}
 
+	/**
+	 * 壊したブロックを控える。driver.dig() から呼ばれる。
+	 *
+	 * 覚えていないものは埋められない。掘る経路は1本なので、ここに集めれば
+	 * 取りこぼさない。同じマスを何度も掘ったときは最初の1件だけ残す
+	 * （最初に壊したものが「元の姿」なので、上書きすると戻す先が変わる）。
+	 */
+	public noteDug(position: Position, name: string): void {
+		const key = (p: Position) => `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}`;
+		const k = key(position);
+		if (this.dugLedger.some((d) => key(d.position) === k)) return;
+		// 木や葉は「荒らし」の範囲外。伐採は普通の営みで、苗も植えている。
+		// 地形(石・土・砂利など)を抜いた跡だけを埋め戻しの対象にする。
+		if (name.endsWith("_log") || name.endsWith("_leaves") || name.endsWith("_wood")) return;
+
+		this.dugLedger.push({
+			position: {
+				x: Math.floor(position.x),
+				y: Math.floor(position.y),
+				z: Math.floor(position.z),
+			},
+			name,
+			at: Date.now(),
+		});
+		if (this.dugLedger.length > DUG_LEDGER_LIMIT) {
+			this.dugLedger.splice(0, this.dugLedger.length - DUG_LEDGER_LIMIT);
+		}
+		this.saveDugLedger();
+	}
+
+	/** 埋まった(あるいは誰かが埋めた)ので台帳から落とす。 */
+	public clearDugHole(position: Position): void {
+		const k = `${Math.floor(position.x)},${Math.floor(position.y)},${Math.floor(position.z)}`;
+		this.dugLedger = this.dugLedger.filter(
+			(d) => `${d.position.x},${d.position.y},${d.position.z}` !== k,
+		);
+		this.saveDugLedger();
+	}
+
+	/**
+	 * まだ埋めていない跡を、近い順に返す。
+	 *
+	 * 借金の総額なので、掘ったばかりのものも含める。思考プロンプトの
+	 * 件数表示はこちらを使う。実際に埋めてよいものは getFillableHoles()。
+	 */
+	public getDugHoles(): { position: Position; name: string }[] {
+		const here = this.driver.getState().position;
+		return this.dugLedger
+			.slice()
+			.sort(
+				(a, b) =>
+					Math.hypot(a.position.x - here.x, a.position.y - here.y, a.position.z - here.z) -
+					Math.hypot(b.position.x - here.x, b.position.y - here.y, b.position.z - here.z),
+			)
+			.map((d) => ({ position: d.position, name: d.name }));
+	}
+
+	/**
+	 * 今埋めてよい跡だけを返す。
+	 *
+	 * 掘りたてを除く。登るために刻んだ階段は「今掘った跡」なので、これが
+	 * 無いと踏んだ段を自分で塞ぎ、また掘り、を繰り返して永久に上がれない。
+	 */
+	public getFillableHoles(): { position: Position; name: string }[] {
+		const fresh = new Set(
+			this.dugLedger
+				.filter((d) => Date.now() - d.at < REFILL_GRACE_MS)
+				.map((d) => `${d.position.x},${d.position.y},${d.position.z}`),
+		);
+		return this.getDugHoles().filter(
+			(h) => !fresh.has(`${h.position.x},${h.position.y},${h.position.z}`),
+		);
+	}
+
+	/**
+	 * 台帳をディスクへ書く。
+	 *
+	 * 再起動で忘れてよいものではない。忘れれば穴は残ったままで、
+	 * こちらは「やっていない」ことになる。書き込みは間引く。
+	 */
+	private saveDugLedger(): void {
+		if (Date.now() - this.dugLedgerSavedAt < 10_000) return;
+		this.dugLedgerSavedAt = Date.now();
+		try {
+			const file = path.join(process.cwd(), DUG_LEDGER_FILE);
+			fs.mkdirSync(path.dirname(file), { recursive: true });
+			fs.writeFileSync(file, JSON.stringify(this.dugLedger));
+		} catch {
+			// 書けなくても行動は続ける。控えが消えるだけ。
+		}
+	}
+
+	/** 寝床の位置をディスクへ書く。再起動しても帰る場所を忘れないため。 */
+	private saveHome(): void {
+		if (!this.spawnBed) return;
+		try {
+			const file = path.join(process.cwd(), HOME_FILE);
+			fs.mkdirSync(path.dirname(file), { recursive: true });
+			fs.writeFileSync(file, JSON.stringify(this.spawnBed));
+		} catch {
+			// 書けなくても行動は続く。次に見つけたベッドで登録し直すだけ。
+		}
+	}
+
+	/** 起動時に寝床を読み戻す。 */
+	private loadHome(): void {
+		// .env の指定が最優先。人が「ここが安全だ」と言っている場所を、
+		// こちらの都合で上書きしない。
+		const configured = this.configuredHome();
+		if (configured) {
+			this.spawnBed = configured;
+			this.log("[記録] 寝床は指定された (" + configured.x + ", " + configured.y + ", " + configured.z + ")");
+			return;
+		}
+		try {
+			const file = path.join(process.cwd(), HOME_FILE);
+			if (!fs.existsSync(file)) return;
+			const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+			if (typeof raw?.x !== "number" || typeof raw?.y !== "number" || typeof raw?.z !== "number") {
+				return;
+			}
+			this.spawnBed = { x: raw.x, y: raw.y, z: raw.z };
+			this.log(`[記録] 寝床は (${raw.x}, ${raw.y}, ${raw.z})`);
+		} catch {
+			// 壊れていたら無かったことにする。
+		}
+	}
+
+	/** 起動時に台帳を読み戻す。前回までに掘った跡を引き継ぐ。 */
+	private loadDugLedger(): void {
+		try {
+			const file = path.join(process.cwd(), DUG_LEDGER_FILE);
+			if (!fs.existsSync(file)) return;
+			const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+			if (!Array.isArray(raw)) return;
+			this.dugLedger = raw
+				.filter((d: any) => d?.position && typeof d.name === "string")
+				.slice(-DUG_LEDGER_LIMIT);
+			if (this.dugLedger.length > 0) {
+				this.log(`[記録] 埋め戻していない跡が ${this.dugLedger.length} 件ある`);
+			}
+		} catch {
+			// 壊れていたら無かったことにする。
+		}
+	}
+
+	/**
+	 * 手の届く範囲にある掘った跡を、ついでに埋める。
+	 *
+	 * 専用のスキル(building.repair)で出向いて埋めるだけでは追いつかない。
+	 * 通りすがりに1つずつでも戻していれば、荒れ方は目に見えて変わる。
+	 * 持っている物で埋める。無ければ何もしない（埋めるために別の場所を
+	 * 掘ったら本末転倒）。
+	 */
+	private async refillDugHoles(signal: AbortSignal): Promise<void> {
+		if (this.dugLedger.length === 0) return;
+		const state = this.driver.getState();
+		if (!state.isReady || state.health <= 0) return;
+		// 敵が近いときに穴埋めを始めない。殴られながら置いても死ぬだけ。
+		if (this.driver.nearbyEntities(10).some((e) => isHostileMob(e.name))) return;
+
+		const here = state.position;
+		for (const hole of this.getFillableHoles()) {
+			const d = Math.hypot(
+				hole.position.x - here.x,
+				hole.position.y - here.y,
+				hole.position.z - here.z,
+			);
+			if (d > REFILL_REACH) break; // 近い順なので、遠くなったら終わり
+			// 自分が今いるマスは埋めない。埋まると窒息する。
+			const foot = {
+				x: Math.floor(here.x),
+				y: Math.floor(here.y),
+				z: Math.floor(here.z),
+			};
+			if (
+				hole.position.x === foot.x &&
+				hole.position.z === foot.z &&
+				(hole.position.y === foot.y || hole.position.y === foot.y + 1)
+			) {
+				continue;
+			}
+			const now = this.driver.world.blockAt(hole.position);
+			if (now === null) continue;
+			if (now.name !== "air") {
+				// もう埋まっている。誰かが直したか、水が流れ込んだ。
+				this.clearDugHole(hole.position);
+				continue;
+			}
+			if (await this.fillHoleAt(signal, hole.position, hole.name)) return;
+		}
+	}
+
+	/**
+	 * 1マス埋める。埋められたら true。
+	 *
+	 * 元と同じブロックを優先し、無ければありふれた物で代える。
+	 * 穴を残すより、違う物でも塞がっている方がましだと判断している。
+	 */
+	public async fillHoleAt(
+		signal: AbortSignal,
+		target: Position,
+		originalName: string,
+	): Promise<boolean> {
+		// 自分がいるマスは埋めない。埋めれば窒息する。
+		//
+		// 通りすがりの埋め戻し(refillDugHoles)側にも同じ判定があるが、
+		// スキル(building.repair)からも直接呼ぶので、ここにも置く。
+		// 片方にしか無いと、呼び口が増えたときに静かに抜ける。
+		const here = this.driver.getState().position;
+		const foot = { x: Math.floor(here.x), y: Math.floor(here.y), z: Math.floor(here.z) };
+		if (
+			target.x === foot.x &&
+			target.z === foot.z &&
+			(target.y === foot.y || target.y === foot.y + 1)
+		) {
+			return false;
+		}
+
+		const items = this.driver.inventory.items();
+		const pick =
+			items.find((i) => i.name === originalName) ??
+			items.find((i) => FILLER_BLOCKS.includes(i.name));
+		if (!pick) return false;
+
+		// 置くには足場になる隣接ブロックが要る。面は隣から穴へ向く向き。
+		const sides: Position[] = [
+			{ x: 1, y: 0, z: 0 },
+			{ x: -1, y: 0, z: 0 },
+			{ x: 0, y: 0, z: 1 },
+			{ x: 0, y: 0, z: -1 },
+			{ x: 0, y: -1, z: 0 },
+			{ x: 0, y: 1, z: 0 },
+		];
+		for (const s of sides) {
+			const ref = { x: target.x + s.x, y: target.y + s.y, z: target.z + s.z };
+			const refBlock = this.driver.world.blockAt(ref);
+			if (!refBlock?.solid) continue;
+			try {
+				await this.driver.equip(pick.name, "hand");
+				// face は ref から見て target のある向き。
+				await this.driver.placeBlock(signal, ref, { x: -s.x, y: -s.y, z: -s.z });
+				this.log(`[奉公] 掘った跡を埋めた (${target.x}, ${target.y}, ${target.z}) ${pick.name}`);
+				this.clearDugHole(target);
+				return true;
+			} catch {
+				// この面は駄目だった。次を試す。
+			}
+		}
+		return false;
+	}
+
 	/** 死んだ時刻を控える。死にすぎていないかを見るために持つ。 */
 	private noteDeath(): void {
 		this.recentDeaths.push(Date.now());
@@ -3363,17 +3895,34 @@ export class MinecraftAgent {
 		// 死んでいる間は何もしない。復帰の要求はサイドカーが出している。
 		if (state.health <= 0) return false;
 
-		const night = state.timeOfDay >= 13000 && state.timeOfDay <= 23000;
+		const night = isNightTime(state.timeOfDay);
 		// 傷ついていて、しかも敵が近いときだけ退く。体力だけで判断すると、
 		// 回復しないまま延々と潜り直して何も進まなくなる。実測で HP1 のまま
 		// 18回潜っていた。潜っても満腹度が足りなければ回復しない。
+		// 満腹度が0では体力は戻らない。「回復を待つ」ための待機が、
+		// 食べ物を探しに行く手を塞ぐだけになる。実測 2026-09-13、
+		// 体力1・満腹度0のまま地下で11時間動けずにいた。
 		const hurt =
+			state.food > 0 &&
 			state.health <= SHELTER_HEALTH &&
 			this.driver.nearbyEntities(12).some((e) => isHostileMob(e.name));
 		// 装備が揃っていても、死に続けているなら出歩かせない。死亡ログは
 		// 死んだ本人ではなく、周りの全員のチャット欄を潰す。
 		const dying = this.isDyingRepeatedly();
 		if (!night && !hurt && !dying) return false;
+
+		// 頼まれた直後は出る。瀕死(hurt)のときだけは、頼まれごとより先に
+		// 死んでしまうので譲らない。
+		if (!hurt && this.hasFreshHumanRequest()) return false;
+
+		// 寝床があるなら、穴を掘るより先にそこへ戻る。
+		//
+		// 湧きつぶした安全な場所にベッドまで置いてもらっているのに、
+		// こちらはそれをリスポーン地点としか見ておらず、夜は外で
+		// その場を掘っていた。屋根のある寝床の方が、掘った穴より安全で、
+		// 掘った跡も残らない。傷の手当てだけなら近場で潜る方が早いので、
+		// 夜と「死に続けている」ときに限る。
+		if ((night || dying) && (await this.retreatToHome(signal))) return true;
 
 		const armed = this.hasWeapon();
 		// 着ている防具は items() に出てこない。持ち物だけを見ると、
@@ -3389,10 +3938,19 @@ export class MinecraftAgent {
 		const pos = state.position;
 		const foot = { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) };
 		if (this.isSheltered(foot)) return true;
+		// 厚い岩の下にいるなら、それはもう隠れている。ここで掘ると
+		// 毎晩1マスずつ下へ沈むだけになる。実測、Y=66 から Y=39 まで
+		// 27ブロック下がっていた。
+		if (this.solidAboveCount(foot) >= BURIED_THICKNESS) return true;
 
 		// 掘り進み続けないための最後の歯止め。判定を読み違えても、
 		// 最悪この間隔で1マスしか掘れない。
-		if (Date.now() - this.lastBurrowAt < BURROW_COOLDOWN_MS) return true;
+		//
+		// ただし敵が目の前にいるときは待たない。1分待つ間に殺される。
+		const threatened = this.driver
+			.nearbyEntities(HOME_THREAT_RADIUS)
+			.some((e) => isHostileMob(e.name));
+		if (!threatened && Date.now() - this.lastBurrowAt < BURROW_COOLDOWN_MS) return true;
 
 		this.log(
 			dying
@@ -3404,6 +3962,269 @@ export class MinecraftAgent {
 		this.lastBurrowAt = Date.now();
 		await this.burrow(signal);
 		return true;
+	}
+
+	/** 人から頼まれた直後か。自分から申し出たぶんは数えない。 */
+	private hasFreshHumanRequest(): boolean {
+		const request = this.pendingRequest;
+		if (!request || request.selfInitiated) return false;
+		return Date.now() - request.at <= SHELTER_YIELD_MS;
+	}
+
+	/**
+	 * 寝床へ戻る。戻れた(または既にいる)なら true。
+	 *
+	 * 帰る場所は registerSpawnAtBed が登録したベッド。人が用意した寝床は
+	 * たいてい湧きつぶした屋内にあるので、そこにいる限り夜をやり過ごせる。
+	 *
+	 * 遠すぎるときは戻らない。夜道を100ブロック歩くのは、その場で潜るより
+	 * 危ない。戻れなかったときも false を返し、呼び出し側の「潜る」へ譲る。
+	 */
+	private async retreatToHome(signal: AbortSignal): Promise<boolean> {
+		// 登録できていなくても、見かけたベッドは帰る先になる。
+		// リスポーン地点の登録は届かずに失敗することがあり(実測 6.1 ブロック
+		// 手前で「遠すぎて届きません」)、そのあと 20分 は登録し直さない。
+		// 「登録できていない」ことと「帰る場所を知らない」ことは別。
+		const home = this.configuredHome() ?? this.spawnBed ?? this.nearestKnownBed();
+		if (!home) return false;
+		// 直前に着けなかったなら、しばらくは潜る方に任せる。
+		if (Date.now() < this.homeUnreachableUntil) return false;
+
+		// 追われている最中は歩かない。
+		//
+		// 丸腰で背中を向けて歩くのは、その場で隠れるより悪い。しかも
+		// 「着いていない間は敵を見ない」ままだと、寝床に敵がいて離れ、
+		// 離れたから戻る、を敵の前で繰り返すことになる。実測
+		// 2026-09-13 15:42、寝床に入る→敵がいる→戻る、の往復の途中で
+		// ゾンビに殺された。敵が近いなら、その場で隠れる方へ譲る。
+		if (this.driver.nearbyEntities(HOME_THREAT_RADIUS).some((e) => isHostileMob(e.name))) {
+			return false;
+		}
+
+		const pos = this.driver.getState().position;
+		const dist = Math.hypot(home.x - pos.x, home.y - pos.y, home.z - pos.z);
+		if (dist > HOME_RETREAT_RADIUS) return false;
+
+		if (dist <= HOME_ARRIVE_RADIUS) {
+			this.homeUnreachableUntil = 0;
+
+			this.inspectHomeSurroundings(home);
+
+			// 寝床に着いた＝安全、ではない。
+			//
+			// 「寝床の4マス以内」は「湧きつぶした部屋の中」とは限らない。
+			// 壁の外側で止まっていることもあるし、部屋の中まで mob が
+			// 入ってきていることもある。実測 2026-09-13 15:38:06 に寝床へ
+			// 入り、15:39:24 にゾンビに殺された。サーバーも
+			// tile.bed.notSafe(近くに敵がいる)を返していた。
+			// 敵がいるなら、突っ立っていないで隠れ直す（呼び出し側の
+			// 「潜る」へ譲る）。
+			if (this.driver.nearbyEntities(HOME_THREAT_RADIUS).some((e) => isHostileMob(e.name))) {
+				this.log("[反射] 寝床に敵がいる。ここには留まらない");
+				return false;
+			}
+
+			// もう寝床にいる。ここから動かない。寝られるなら寝る。
+			await this.sleepAtHome(home);
+			return true;
+		}
+
+		// 向かっている途中でも「隠れている扱い」を続ける。ここで false を
+		// 返すと、間隔待ちのあいだだけスキルが動いて、寝床から離れる方向へ
+		// 歩き直すことになる。
+		if (Date.now() - this.lastHomeRetreatAt < HOME_RETREAT_COOLDOWN_MS) return true;
+		this.lastHomeRetreatAt = Date.now();
+
+		this.log(
+			`[反射] 寝床へ戻る (${home.x}, ${home.y}, ${home.z}) — ${Math.round(dist)}ブロック`,
+		);
+		try {
+			await this.driver.goto(signal, { kind: "near", position: home, distance: 2 });
+		} catch (e) {
+			if (!signal.aborted) this.log(`寝床へ戻れなかった: ${e}`);
+			// 戻れないなら、その場で潜る判断に任せる。
+			this.homeUnreachableUntil = Date.now() + HOME_UNREACHABLE_MS;
+			return false;
+		}
+
+		// 本当に着いたかを測って確かめる。goto は届かないまま成功を返す
+		// ことがあるので、返り値は根拠にならない。着いていないのに
+		// 「寝床にいる」ことにすると、反射がスキルを止めたまま夜通し
+		// 外に突っ立つ。潜る判断へ譲った方がまだ安全。
+		const after = this.driver.getState().position;
+		if (Math.hypot(after.x - home.x, after.y - home.y, after.z - home.z) > HOME_ARRIVE_RADIUS) {
+			this.log("[反射] 寝床へ着けなかった。潜る方にする");
+			this.homeUnreachableUntil = Date.now() + HOME_UNREACHABLE_MS;
+			this.noteUnreachableBed(home);
+			// 登録済みの寝床に入れないなら、控えも捨てる。入れない場所を
+			// 帰る先として持ち続けると、毎晩そこへ向かって失敗する。
+			if (this.spawnBed && this.bedKey(this.spawnBed) === this.bedKey(home)) this.spawnBed = null;
+			return false;
+		}
+
+		await this.sleepAtHome(home);
+		return true;
+	}
+
+	/**
+	 * ベッドを叩く。届かなければ一歩寄って、もう一度だけ試す。
+	 *
+	 * getToBlock で向かっても手前で止まることがある。実測 02:02:54、
+	 * 6.1 ブロック手前で「遠すぎて届きません」と返っていた。ここで諦めると
+	 * 次の登録まで 20分 空くので、その場で寄り直す。
+	 */
+	private async activateBedWithRetry(signal: AbortSignal, at: Position): Promise<void> {
+		try {
+			await this.driver.activateBlock(at);
+			return;
+		} catch (e) {
+			if (signal.aborted) throw e;
+			this.log(`[反射] ベッドに届かない。寄り直す: ${e}`);
+		}
+		await this.driver.goto(signal, { kind: "near", position: at, distance: 1 });
+		await this.driver.activateBlock(at);
+	}
+
+	/**
+	 * 寝床の周りの様子を一度だけ書き出す。
+	 *
+	 * 「湧きつぶした安全な場所」に置かれた寝床のはずが、そこで夜に
+	 * 何度も殺されている(実測 2026-09-13、死亡地点が (287,65,165)
+	 * (281,68,163) (277,66,160) と寝床の数ブロック以内に固まっている)。
+	 * 部屋に入れていないのか、部屋に穴があるのかは、こちらからは見えない。
+	 * 囲いと扉の有無を控えておけば、人が直せる。
+	 */
+	private inspectHomeSurroundings(home: Position): void {
+		if (this.inspectedHome) return;
+		this.inspectedHome = true;
+
+		const bed = { x: Math.floor(home.x), y: Math.floor(home.y), z: Math.floor(home.z) };
+		let wall = 0;
+		let gap = 0;
+		let unknown = 0;
+		// 寝床を囲む 5x5 の壁(足と頭の高さ)を数える。
+		for (const dy of [0, 1]) {
+			for (let dx = -2; dx <= 2; dx++) {
+				for (let dz = -2; dz <= 2; dz++) {
+					if (Math.abs(dx) !== 2 && Math.abs(dz) !== 2) continue;
+					const b = this.driver.world.blockAt({ x: bed.x + dx, y: bed.y + dy, z: bed.z + dz });
+					if (b === null) unknown++;
+					else if (b.solid) wall++;
+					else gap++;
+				}
+			}
+		}
+		const roof = this.driver.world.blockAt({ x: bed.x, y: bed.y + 2, z: bed.z });
+		const doors: string[] = [];
+		for (let dx = -5; dx <= 5; dx++) {
+			for (let dy = -1; dy <= 2; dy++) {
+				for (let dz = -5; dz <= 5; dz++) {
+					const b = this.driver.world.blockAt({ x: bed.x + dx, y: bed.y + dy, z: bed.z + dz });
+					if (!b) continue;
+					if (b.name.includes("door") || b.name.includes("fence_gate")) {
+						doors.push(b.name + "(" + b.position.x + "," + b.position.y + "," + b.position.z + ")");
+					}
+				}
+			}
+		}
+		this.log(
+			"[診断] 寝床(" + bed.x + "," + bed.y + "," + bed.z + ") の囲い: 壁" + wall +
+				" 隙間" + gap + " 未取得" + unknown + " / 屋根 " + (roof ? roof.name : "不明") +
+				" / 扉 " + (doors.length > 0 ? doors.slice(0, 4).join(" ") : "無し"),
+		);
+	}
+
+	/**
+	 * .env で指定された寝床。指定があればこちらを正とする。
+	 *
+	 * 自動で選ぶと「一番近いベッド」になる。実測 2026-09-13、そうして
+	 * 選ばれた (286,66,166) は屋根が無く(囲い 32 マス中 12)、野ざらしの
+	 * ベッドだった。そこへ毎晩帰っては殺されていた。人が湧きつぶした
+	 * 部屋がどれかは、人にしか分からない。
+	 *
+	 * 書き方: HOME_POSITION=x,y,z
+	 */
+	private configuredHome(): Position | null {
+		const raw = process.env.HOME_POSITION;
+		if (!raw) return null;
+		const parts = raw.split(",").map((v) => Number(v.trim()));
+		if (parts.length !== 3 || parts.some((v) => !Number.isFinite(v))) return null;
+		return { x: parts[0], y: parts[1], z: parts[2] };
+	}
+
+	/** そのベッドに屋根があるか。読めない位置なら false（根拠にしない）。 */
+	private hasRoof(p: Position): boolean {
+		const above = this.driver.world.blockAt({ x: Math.floor(p.x), y: Math.floor(p.y) + 2, z: Math.floor(p.z) });
+		return !!above && above.solid;
+	}
+
+	/** 覚えているベッドのうち、一番近くて、避けていないもの。 */
+	private nearestKnownBed(): Position | null {
+		const bed = this.getKnownLandmarks().find(
+			(l) => BED_NAMES.includes(l.name) && !this.isBedAvoided(l.position),
+		);
+		return bed ? bed.position : null;
+	}
+
+	/**
+	 * 候補のうち、避けていない一番近いベッド。屋根のあるものを優先する。
+	 *
+	 * 野ざらしのベッドを寝床にすると、夜に帰るたびにそこで殺される。
+	 * 屋根が読めない距離のベッドは判断材料にならないので、その場合は
+	 * 従来どおり近い順。
+	 */
+	private pickReachableBed<T extends { position: Position }>(beds: T[]): T | undefined {
+		const usable = beds.filter((b) => !this.isBedAvoided(b.position));
+		return usable.find((b) => this.hasRoof(b.position)) ?? usable[0];
+	}
+
+	private bedKey(p: Position): string {
+		return `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}`;
+	}
+
+	private isBedAvoided(p: Position): boolean {
+		const until = this.unreachableBeds.get(this.bedKey(p));
+		if (until === undefined) return false;
+		if (Date.now() >= until) {
+			this.unreachableBeds.delete(this.bedKey(p));
+			return false;
+		}
+		return true;
+	}
+
+	/** 届かなかったベッドを覚える。しばらく別のベッドを見る。 */
+	private noteUnreachableBed(p: Position): void {
+		this.unreachableBeds.set(this.bedKey(p), Date.now() + BED_BLACKLIST_MS);
+		this.log(`[反射] (${p.x}, ${p.y}, ${p.z}) のベッドには入れない。しばらく別を見る`);
+	}
+
+	/**
+	 * 寝床にいる間、夜ならベッドに入る。
+	 *
+	 * 統合版は全員が寝ないと夜を飛ばせないので、これで朝になるとは限らない。
+	 * それでも、入っていれば mob に狙われにくく、他の人が寝たときに夜を
+	 * 飛ばせる。入り直すと自分が起きてしまうので、間隔を置く。
+	 */
+	private async sleepAtHome(home: Position): Promise<void> {
+		const state = this.driver.getState();
+		if (!isNightTime(state.timeOfDay)) return;
+		if (Date.now() - this.lastBedActivatedAt < SLEEP_REQUEST_TTL_MS) return;
+		// 登録したときのベッドが、今もそこにあるか。人が片付けたベッドを
+		// 叩いても何も起きない。
+		const block = this.driver.world.blockAt(home);
+		if (!block || !BED_NAMES.includes(block.name)) return;
+
+		try {
+			await this.driver.activateBlock(home);
+			this.lastBedActivatedAt = Date.now();
+			// 統合版はベッドを叩いた時点でリスポーン地点が移る。ここで
+			// 登録できたことになるので、帰る先として覚え直す。
+			this.spawnBed = { ...home };
+			this.saveHome();
+			this.log("[反射] 寝床に入る");
+		} catch {
+			// 入れなくても、屋内にいるだけで夜はしのげる。
+		}
 	}
 
 	/**
@@ -3601,12 +4422,20 @@ export class MinecraftAgent {
 
 		if (dirs.some((d) => open(d.x, d.z))) return;
 
+		// 掘り広げ続けない。
+		//
+		// 自分が掘った縦穴の中では四方が塞がった判定が常に成立するので、
+		// 歯止めが無いと横へ掘り続けて穴が広がる。実測で579回発火しており、
+		// 初期リス周辺が荒れた最大の出どころがこれだった。
+		if (Date.now() - this.lastEscapeDigAt < ESCAPE_COOLDOWN_MS) return;
+
 		// 全方向が塞がっている。壊せるものを1つ選んで抜ける。
 		for (const d of dirs) {
 			const target = { x: foot.x + d.x, y: foot.y, z: foot.z + d.z };
 			const block = driver.world.blockAt(target);
 			if (!block || !block.diggable) continue;
 			this.log(`[反射] 四方を塞がれているので ${block.name} を掘って出る`);
+			this.lastEscapeDigAt = Date.now();
 			try {
 				await driver.equipBestTool(target);
 				await driver.dig(signal, target);

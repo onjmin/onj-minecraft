@@ -26,6 +26,8 @@ const (
 	stepDig           // 塞いでいるブロックを壊してから進む
 	stepBridge        // 足場が無いので置いてから進む
 	stepTower         // 跳んで足元に置き、1段上がる（柱積み）
+	stepSwim          // 水の中を進む（足場は要らない）
+	stepSwimUp        // 水の中を浮上して1段上がる
 )
 
 type step struct {
@@ -61,6 +63,11 @@ var passableBlocks = map[string]bool{
 var hazardBlocks = map[string]bool{
 	"lava": true, "flowing_lava": true, "fire": true, "soul_fire": true,
 	"magma": true, "cactus": true, "sweet_berry_bush": true,
+	// 焚き火も踏めば燃える。拠点の中にあることが多く、実際に拠点の
+	// チェストへ向かう途中で焼け死んでいる(2026-09-13 15:06)。
+	"campfire": true, "soul_campfire": true,
+	// 落ちれば出られない。
+	"powder_snow": true,
 }
 
 // 壊せないもの。掘る手を選ぶ前に除く。
@@ -97,6 +104,16 @@ func (w *world) solidFloor(p blockPos) bool {
 	return !passableBlocks[name]
 }
 
+// inWater はそこが水の中か。
+//
+// 水の中では足場が要らない。立てなくても浮いて進めるし、跳べば上がれる。
+// これを扱えないと、水路や滝を一切使えない。実測 2026-09-13、水を伝って
+// 上がれないために、地下から出る手が「掘る」か「柱積み」しか無かった。
+func (w *world) inWater(p blockPos) bool {
+	name, ok := w.blockAt(p.X, p.Y, p.Z)
+	return ok && (name == "water" || name == "flowing_water")
+}
+
 // standable はそこに立てるか。足元と頭上が空いていて、その下が足場であること。
 func (w *world) standable(p blockPos) bool {
 	if !w.passable(p) || !w.passable(blockPos{p.X, p.Y + 1, p.Z}) {
@@ -124,9 +141,11 @@ const maxDrop = 3
 
 // 行動の重み。掘るのも置くのも時間がかかるので、歩ける道があればそちらを選ぶ。
 const (
-	costWalk   = 1.0
-	costJump   = 1.5
-	costFall   = 1.2
+	costWalk = 1.0
+	costJump = 1.5
+	costFall = 1.2
+	// 泳ぐのは歩くより遅いが、柱積み(置く)や掘るよりはずっと速い。
+	costSwim   = 2.0
 	costDig    = 5.0 // 1ブロックあたり
 	costBridge = 4.0
 )
@@ -245,6 +264,12 @@ func (w *world) moves(p blockPos, c caps) []move {
 			continue
 		}
 
+		// 水の中は足場が無くても進める。泳いで渡る。
+		if w.inWater(foot) && w.passable(head) {
+			out = append(out, move{step{Pos: foot, Action: stepSwim}, costSwim})
+			continue
+		}
+
 		// 落ちる
 		if w.passable(foot) && w.passable(head) {
 			for dy := int32(1); dy <= maxDrop; dy++ {
@@ -291,6 +316,19 @@ func (w *world) moves(p blockPos, c caps) []move {
 					costWalk + costBridge,
 				})
 			}
+		}
+	}
+
+	// 水の中は泳いで真上へ上がる。置く物も掘る力も要らない。
+	//
+	// 水中でジャンプを押し続けると浮上する。実プレイヤーが水流で上がるのと
+	// 同じ手で、持ち物が空でも使える。地下から地上へ戻る道として、掘る・
+	// 積むに次ぐ3本目になる。
+	if w.inWater(p) {
+		up := blockPos{p.X, p.Y + 1, p.Z}
+		// 水面から上がるときは、その上に頭が入る空きが要る。
+		if w.inWater(up) || (w.passable(up) && w.passable(blockPos{p.X, p.Y + 2, p.Z})) {
+			out = append(out, move{step{Pos: up, Action: stepSwimUp}, costSwim})
 		}
 	}
 
@@ -342,6 +380,10 @@ func stepName(action int) string {
 		return "bridge"
 	case stepTower:
 		return "tower"
+	case stepSwim:
+		return "swim"
+	case stepSwimUp:
+		return "swimUp"
 	default:
 		return "unknown"
 	}
