@@ -19,12 +19,17 @@ services:
   bedrock-dev:
     image: itzg/minecraft-bedrock-server
     container_name: onj-bedrock-dev
-    # サイドカーの gophertunnel は protocol 2169 (1.26.45) に固定されている。
+    # サイドカーの gophertunnel は protocol 2193 (1.26.50) に固定されている。
     # ここがずれると接続すらできない。Java 側で 26.2 に上げて繋がらなくなった
     # のと同じ失敗なので、必ず突き合わせてから上げること。
+    #
+    # 1.26.51.1 は 1.26.50 と同じ protocol 2193 で、本番 Realm もこの帯にいる。
+    # LATEST にしないのは、Mojang が版を上げた瞬間に手元だけ先に進んで、
+    # 本番で何が起きているのか分からなくなるため。上げるときは
+    # BEDROCK_SERVER_VERSION で試してから、ここを書き換える。
     environment:
       EULA: "TRUE"
-      VERSION: "1.26.45.1"
+      VERSION: "${BEDROCK_SERVER_VERSION:-1.26.51.1}"
       # 認証を通さずに繋ぐため。開発専用で、外部に開けないこと。
       ONLINE_MODE: "false"
       # online-mode を切ると allow-list は使えない（サーバーが起動を拒否する）。

@@ -52,10 +52,18 @@ require (
 // 本家 gophertunnel には NetherNet クライアント(minecraft/p2p)と
 // JSON-RPC シグナリング(minecraft/service/signaling)が無い。
 // Realms は NETHERNET_JSONRPC なので、それらを持つフォークを使う。
-replace github.com/sandertv/gophertunnel => github.com/hashimthearab/gophertunnel v1.25.3-0.20260826204037-503152e50a95
+//
+// そのフォーク(hashimthearab)は 1.26.45 / protocol 2169 で止まっている。
+// 2026-09-16 に Realm が 1.26.50 へ上がり、2169 では "client outdated" で
+// 弾かれるようになった。上流の 26.50 対応は feature/26.50 ブランチにあって
+// master に入っていないため、フォークの p2p 部分に上流の 26.50 を
+// マージしたものを onjmin 側に置いて、そこを指している。
+// 上流とフォークが 1.26.50 に追いついたら、この replace は畳んでよい。
+replace github.com/sandertv/gophertunnel => github.com/onjmin/gophertunnel v1.61.1-0.20260916012416-fc7b63c350ec
 
 // フォークの gophertunnel は go-raknet のフォーク側にある ServerID を使うため、
 // こちらも合わせて差し替える必要がある。
-replace github.com/sandertv/go-raknet => github.com/hashimthearab/go-raknet v1.15.1-0.20260625072737-109968c5e6ff
+// 依存側 go.mod の replace は効かないので、フォークが要求する版をここで指定する。
+replace github.com/sandertv/go-raknet => github.com/hashimthearab/go-raknet v1.15.1-0.20260823160122-7b23a10585ae
 
 replace github.com/df-mc/go-xsapi/v2 => github.com/HashimTheArab/go-xsapi/v2 v2.0.0-20260815130220-1dd83707307e

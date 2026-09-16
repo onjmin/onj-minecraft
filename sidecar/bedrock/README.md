@@ -27,8 +27,12 @@ Mojang が公開している公式スキーマ(https://github.com/Mojang/bedrock
 設置や使用(transaction)・インベントリ操作(item_stack_request)を全て運ぶ統合チャネルなので、
 これが壊れていると能動的な操作がほぼ全滅する。
 
-gophertunnel は Minecraft のリリースに追随しており protocol=2169 / version=1.26.45 と一致するため、
+gophertunnel は Minecraft のリリースに追随しており protocol=2193 / version=1.26.50 と一致するため、
 プロトコルの正しさをこちらに委譲する。
+
+Realm は勝手に最新版へ上がるので、この版が遅れると接続が `client outdated` で
+弾かれる。実際 2026-09-16 に 1.26.50 が出た直後、2169 のままだった間は
+一切繋がらなかった。そのときは `go.mod` の replace 先を上げてビルドし直す。
 
 ## 構成
 
