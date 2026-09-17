@@ -47,6 +47,13 @@ const SCAN_DOWN = 16;
 /** ワールドの高さの上下限。ここを外れる座標は引くだけ無駄。 */
 const WORLD_MIN_Y = -64;
 const WORLD_MAX_Y = 320;
+/**
+ * 刻んだ段に乗れたかを確かめるまでの待ち。
+ *
+ * 跳んでいる途中の高さを成功と読まないための間。落下と着地が収まる程度で
+ * よく、長く取ると1段ごとにこれだけ足される。
+ */
+const SETTLE_MS = 500;
 /** これだけ上がれていれば、途中でも成果として認める。 */
 const PARTIAL_CLIMB = 3;
 /** サイドカーに地表を数えさせる半径。持っているチャンクの範囲に収める。 */
@@ -170,10 +177,17 @@ async function digStepUp(agent: MinecraftAgent, signal: AbortSignal): Promise<bo
 
 		// 実際に上がれたかで判断する。経路探索が「着いた」と言っても、
 		// Y が変わっていなければ登れていない。
-		if (Math.floor(driver.getState().position.y) > fy) {
-			agent.log(
-				`[goto.surface] Cut a step and climbed to Y=${Math.floor(driver.getState().position.y)}.`,
-			);
+		//
+		// 登った「瞬間」で見てはいけない。跳んだ頂点や、刻んだ段の角に
+		// 乗りかけたところを掴むと、その後ずり落ちても成功として返る。
+		// 実測 2026-09-16、判定とログで getState() を別々に引いていたため
+		// 「Y=41 から登って Y=41」「Y=28 から登って Y=28」というログが
+		// 出ていた。判定は上がったと言い、その直後には元の高さに戻っている。
+		// 落ち着くまで待ってから、一度引いた値だけで決める。
+		await new Promise((r) => setTimeout(r, SETTLE_MS));
+		const settledY = Math.floor(driver.getState().position.y);
+		if (settledY > fy) {
+			agent.log(`[goto.surface] Cut a step and climbed to Y=${settledY}.`);
 			return true;
 		}
 	}
@@ -230,10 +244,7 @@ export const gotoSurfaceSkill = createSkill<void, { y: number; method: string }>
 			columns.find((c) => c.x === myX && c.z === myZ) ??
 			columns
 				.filter((c) => Math.abs(c.x - myX) <= 2 && Math.abs(c.z - myZ) <= 2)
-				.sort(
-					(a, b) =>
-						Math.hypot(a.x - myX, a.z - myZ) - Math.hypot(b.x - myX, b.z - myZ),
-				)[0];
+				.sort((a, b) => Math.hypot(a.x - myX, a.z - myZ) - Math.hypot(b.x - myX, b.z - myZ))[0];
 
 		const sky = skyAbove(driver, myX, headY + 1, myZ);
 		// 自分の列の地表が分かっているなら、そちらを正とする。頭上が
@@ -263,23 +274,21 @@ export const gotoSurfaceSkill = createSkill<void, { y: number; method: string }>
 		// 繰り返して初期リスの穴から抜け出せなかった。
 		// 列を辿るだけの計算なので、チャンクを持っている側にやらせる。
 		let targetPos: Position | null = null;
-		{
-			if (columns.length > 0) {
-				// 自分より高く、空きが十分ある列の中から、近い順に選ぶ。
-				const candidates = columns
-					.filter((c) => c.y > startY && c.open >= MIN_OPEN_ABOVE && isSafeBlock(c.name))
-					.sort(
-						(a, b) =>
-							Math.hypot(a.x - currentPos.x, a.z - currentPos.z) -
-							Math.hypot(b.x - currentPos.x, b.z - currentPos.z),
-					);
-				const best = candidates[0];
-				if (best) {
-					targetPos = { x: best.x + 0.5, y: best.y + 1, z: best.z + 0.5 };
-					agent.log(
-						`[goto.surface] Real surface at (${best.x}, ${best.y}, ${best.z}), ${best.y - startY} above, open=${best.open}`,
-					);
-				}
+		if (columns.length > 0) {
+			// 自分より高く、空きが十分ある列の中から、近い順に選ぶ。
+			const candidates = columns
+				.filter((c) => c.y > startY && c.open >= MIN_OPEN_ABOVE && isSafeBlock(c.name))
+				.sort(
+					(a, b) =>
+						Math.hypot(a.x - currentPos.x, a.z - currentPos.z) -
+						Math.hypot(b.x - currentPos.x, b.z - currentPos.z),
+				);
+			const best = candidates[0];
+			if (best) {
+				targetPos = { x: best.x + 0.5, y: best.y + 1, z: best.z + 0.5 };
+				agent.log(
+					`[goto.surface] Real surface at (${best.x}, ${best.y}, ${best.z}), ${best.y - startY} above, open=${best.open}`,
+				);
 			}
 		}
 
@@ -373,17 +382,25 @@ export const gotoSurfaceSkill = createSkill<void, { y: number; method: string }>
 		/** 同じ高さで足踏みしてよい回数。超えたらこの列では上がれない。 */
 		const STUCK_LIMIT = 3;
 
-		// 掘り上がりは1ブロックに数秒かかる。30ブロック掘り切るまで成功と
-		// 認めないと、地下深くからは何度やっても失敗になる。実測で64回試して
-		// 成功率0%。上がったぶんを成果として返す。
+		// 途中まで登れたなら、そのぶんは報告する。ただし成功とは呼ばない。
+		//
+		// 元は「30ブロック掘り切るまで成功と認めないと、地下深くからは何度
+		// やっても失敗になる(実測64回試して成功率0%)」という理由で、3ブロック
+		// 以上登れていれば ok を返していた。これが指標を壊していた。
+		// 選択のプロンプトにはスキルごとの成功率が添えられる(skillReliability)
+		// ので、LLM はこの数字で手応えを測る。実測 2026-09-16、298回試して
+		// 失敗は135回、つまり成功率55%と表示されながら、8時間で一度も地表に
+		// 出ていない。3マス登って落ちる往復が「まあまあ効いている手段」として
+		// 見えていた。地表に着いていないなら失敗。進んだ距離と残りは文面に
+		// 入れるので、進捗そのものは LLM から見えたままになる。
 		const climbedBlocks = () => Math.floor(driver.getState().position.y) - startY;
 		const partial = (): SkillResponse<{ y: number; method: string }> | null => {
 			const gained = climbedBlocks();
 			if (gained < PARTIAL_CLIMB) return null;
-			return skillResult.ok(`Climbed ${gained} blocks toward the surface.`, {
-				y: startY + gained,
-				method: "dig-up-partial",
-			});
+			const nowY = startY + gained;
+			const remain =
+				surfaceY !== null ? ` Still ${surfaceY - nowY} below the surface (Y=${surfaceY}).` : "";
+			return skillResult.fail(`Climbed ${gained} blocks but did not reach the surface.${remain}`);
 		};
 
 		// 掘るのは「頭のすぐ上」だけにする。
@@ -397,6 +414,8 @@ export const gotoSurfaceSkill = createSkill<void, { y: number; method: string }>
 		// 目標を手の届く1マスに固定し、上がるのは経路探索と階段に任せる。
 		let lastY = startY;
 		let stuck = 0;
+		/** 経路探索(柱積み)がまだ見込みがあるか。一度失敗したら二度と頼まない。 */
+		let pillarUpWorks = true;
 
 		while (climbedBlocks() < MAX_CLIMB) {
 			if (signal.aborted) {
@@ -411,9 +430,7 @@ export const gotoSurfaceSkill = createSkill<void, { y: number; method: string }>
 			// 地表の高さまで上がれたら終わり。
 			// 数えられていないときだけ、頭上の見え方で判断する。
 			const arrived =
-				surfaceY !== null
-					? fy >= surfaceY - 1
-					: skyAbove(driver, fx, fy + 2, fz) === "open";
+				surfaceY !== null ? fy >= surfaceY - 1 : skyAbove(driver, fx, fy + 2, fz) === "open";
 			if (arrived) {
 				return skillResult.ok(`Reached surface at Y=${fy}.`, { y: fy, method: "dig-up" });
 			}
@@ -464,6 +481,12 @@ export const gotoSurfaceSkill = createSkill<void, { y: number; method: string }>
 			}
 
 			// 1マス上がる。まず経路探索(柱積み)に任せ、駄目なら階段を掘る。
+			//
+			// ただし一度駄目だったら、この呼び出しの間はもう頼まない。
+			// 柱積みは置けるブロックが要るので、手ぶらのまま同じ場所で
+			// 何度呼んでも結果は変わらない。実測 2026-09-16、足踏み3回で
+			// 失敗するまでの90秒はほぼこの待ちで、その間に刻めた段は0。
+			// 待つのをやめたぶんを階段掘りの試行に回す。
 			// 柱積みは手元に置けるブロックが要るので、死んで手ぶらの状態では
 			// 階段だけが頼りになる。
 			//
@@ -472,15 +495,21 @@ export const gotoSurfaceSkill = createSkill<void, { y: number; method: string }>
 			// 満たしてしまう。経路探索は即座に成功を返し、ボットは一度も
 			// 登らない。実測 2026-09-13、Y=39〜40 を往復して
 			// 「Could not climb: nothing to stand on」を繰り返していた。
-			try {
-				await driver.goto(signal, {
-					kind: "near",
-					position: { x: fx + 0.5, y: fy + 2, z: fz + 0.5 },
-					distance: 1,
-					dig: true,
-				});
-			} catch {
-				// 次の手へ。
+			if (pillarUpWorks) {
+				try {
+					await driver.goto(signal, {
+						kind: "near",
+						position: { x: fx + 0.5, y: fy + 2, z: fz + 0.5 },
+						distance: 1,
+						dig: true,
+					});
+				} catch {
+					// 次の手へ。
+				}
+				if (Math.floor(driver.getState().position.y) <= fy) {
+					pillarUpWorks = false;
+					agent.log("[goto.surface] 柱積みでは上がれない。以降は階段だけで登る");
+				}
 			}
 			if (Math.floor(driver.getState().position.y) <= fy) {
 				await digStepUp(agent, signal);
@@ -490,6 +519,9 @@ export const gotoSurfaceSkill = createSkill<void, { y: number; method: string }>
 			if (nowY <= lastY) {
 				stuck++;
 				if (stuck >= STUCK_LIMIT) {
+					agent.noteStall(
+						`goto.surface: at Y=${nowY} there is nothing to stand on and no stairs can be cut; this spot cannot be climbed out of.`,
+					);
 					return partial() ?? skillResult.fail("Could not climb: nothing to stand on.");
 				}
 			} else {

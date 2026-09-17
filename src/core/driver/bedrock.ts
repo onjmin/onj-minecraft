@@ -552,8 +552,8 @@ export class BedrockDriver implements BotDriver {
 		// 時刻を変えた、あるいはこちらの進み方が間違っている、の判別に要る。
 		const nextTime = Number(st.timeOfDay ?? 6000);
 		const prevTime = this.state.timeOfDay;
-		const elapsedTicks = this.lastStateAt > 0 ? ((Date.now() - this.lastStateAt) / 50) : 0;
-		const drift = ((nextTime - prevTime - elapsedTicks) % 24000 + 24000) % 24000;
+		const elapsedTicks = this.lastStateAt > 0 ? (Date.now() - this.lastStateAt) / 50 : 0;
+		const drift = (((nextTime - prevTime - elapsedTicks) % 24000) + 24000) % 24000;
 		if (this.lastStateAt === 0) {
 			// 最初の1回は生の値を残す。0 のままなら SetTime を受けていない、
 			// 変わらないなら世界の時刻が止まっている、の区別がつかなくなる。
@@ -834,12 +834,7 @@ export class BedrockDriver implements BotDriver {
 
 	// --- ワールド操作（未実装） ---
 
-	/** 壊したブロックの通知先。agent が埋め戻しのために設定する。 */
-	public onDug?: (position: Position, blockName: string) => void;
-
 	async dig(signal: AbortSignal, position: Position): Promise<void> {
-		// 壊す前に名前を控える。壊した後では分からない。
-		const before = this.blocks.blockAt(position);
 		const onAbort = () => this.sidecar.fire_and_forget("stop");
 		signal.addEventListener("abort", onAbort, { once: true });
 		try {
@@ -853,10 +848,6 @@ export class BedrockDriver implements BotDriver {
 		}
 		// 掘った結果を写しに反映させる。次の判断が古い地形を見ないように。
 		await this.refreshBlocks(true);
-		// 壊したことを知らせる。埋め戻す側がこれを頼りにする。
-		if (before && before.name !== "air") {
-			this.onDug?.({ ...position }, before.name);
-		}
 	}
 
 	async placeBlock(_signal: AbortSignal, reference: Position, face: Position): Promise<void> {

@@ -20,6 +20,43 @@ function isQuadTree(saplingName: string): boolean {
 
 /** 木を1本片付けるのにかける上限。超えたら手持ちのぶんで切り上げる。 */
 const FELL_BUDGET_MS = envNum("WOOD_FELL_BUDGET_MS", 40_000);
+
+/**
+ * 木の候補を選ぶときの、縦方向の重み。
+ *
+ * 距離をそのまま比べると、12ブロック上の木と12ブロック横の木が同じ順位に
+ * なる。実際の到達コストは桁で違う。経路探索の重みは歩き 1.0 に対して
+ * 1段上がるのに掘るぶんを足すと十数倍で、そこまで極端にすると遠回りを
+ * 選びすぎるので、控えめに 4 倍とする。実測 2026-09-16、12〜13ブロック上の
+ * 木を狙い続け、40秒の伐採予算では登り切れずに取得0を繰り返していた。
+ * 降りるのは落ちれば済むので軽くする。
+ */
+const CLIMB_WEIGHT = envNum("WOOD_CLIMB_WEIGHT", 4);
+const DESCEND_WEIGHT = envNum("WOOD_DESCEND_WEIGHT", 1.5);
+
+/**
+ * 遠くを探すときの木の名前。
+ *
+ * 同期の find* 系はボット中心の立方体(半径16)しか見ないので、その外にある
+ * 木は「無い」ことになる。実測、木が見つからないと28ブロックのランダムな
+ * 移動を6回繰り返して諦めていた。当てのない移動より、名前で遠くを引いて
+ * そちらへ向かう方が早い。述語を渡せないので名前を並べる。
+ */
+const LOG_NAMES = [
+	"oak_log",
+	"spruce_log",
+	"birch_log",
+	"jungle_log",
+	"acacia_log",
+	"dark_oak_log",
+	"mangrove_log",
+	"cherry_log",
+	"pale_oak_log",
+	"crimson_stem",
+	"warped_stem",
+];
+/** 遠くの木を探す半径。サイドカーが持っているチャンクの範囲に収める。 */
+const FAR_LOG_RADIUS = envNum("WOOD_FAR_RADIUS", 96);
 /** 何ブロック掘るごとに落下物を拾うか。 */
 const PICKUP_EVERY = 5;
 /** 1回の伐採で壊してよい葉の数。通り道を空けるぶんだけ。 */
@@ -50,24 +87,62 @@ export const collectWoodSkill = createSkill<void, { felledCount: number; planted
 		let logs = woodScanner.findNearbyLogs(driver);
 		for (let hop = 0; logs.length === 0 && hop < SEARCH_HOPS; hop++) {
 			const from = driver.getState().position;
-			const angle = Math.random() * Math.PI * 2;
-			agent.log(`[collecting.wood] 近くに木が無い。${SEARCH_HOP_DISTANCE}ブロック移動して探す`);
+			// まず、立方体の外に木が見えていないか引く。見えているなら
+			// そちらへ向かう。当てずっぽうに歩くのは、それが空振りしたときだけ。
+			let target: Position | null = null;
 			try {
-				await driver.goto(signal, {
-					kind: "xz",
-					x: from.x + Math.cos(angle) * SEARCH_HOP_DISTANCE,
-					z: from.z + Math.sin(angle) * SEARCH_HOP_DISTANCE,
-					distance: 4,
-				});
+				const far = await woodScanner.findDistantLogs(driver);
+				if (far.length > 0) target = far[0].position;
+			} catch {
+				// 引けなくても、下の移動で地形は読み込まれる。
+			}
+			const angle = Math.random() * Math.PI * 2;
+			try {
+				if (target) {
+					// 高さも指定して向かう。
+					//
+					// 水平座標だけ(kind:"xz")で向かうと、真上や真下の木に対して
+					// 「もう着いている」ことになり、一歩も動かないまま試行だけを
+					// 使い切る。実測 2026-09-17 00:15:28、水平2ブロック先の木に
+					// 対して 0ブロック移動を6回繰り返し、1秒で諦めていた。
+					// 高さを渡せば、経路探索が登る手順(digUp/tower)を組む。
+					agent.log(
+						`[collecting.wood] 近くに木が無い。水平${Math.round(Math.hypot(target.x - from.x, target.z - from.z))} / 高さ${Math.round(target.y - from.y)} の木へ向かう`,
+					);
+					await driver.goto(signal, {
+						kind: "near",
+						position: target,
+						distance: 3,
+						dig: true,
+					});
+				} else {
+					agent.log(`[collecting.wood] 近くに木が無い。${SEARCH_HOP_DISTANCE}ブロック移動して探す`);
+					await driver.goto(signal, {
+						kind: "xz",
+						x: from.x + Math.cos(angle) * SEARCH_HOP_DISTANCE,
+						z: from.z + Math.sin(angle) * SEARCH_HOP_DISTANCE,
+						distance: 4,
+					});
+				}
 			} catch (moveErr) {
 				if (signal.aborted) throw moveErr;
 				// 届かなくても、動いたぶんは地形が読み込まれている。
 			}
 			logs = woodScanner.findNearbyLogs(driver);
 			const now = driver.getState().position;
+			const moved = Math.hypot(now.x - from.x, now.y - from.y, now.z - from.z);
 			agent.log(
-				`[collecting.wood] ${hop + 1}回目: ${Math.hypot(now.x - from.x, now.z - from.z).toFixed(0)}ブロック動いて 原木 ${logs.length} 件`,
+				`[collecting.wood] ${hop + 1}回目: ${moved.toFixed(0)}ブロック動いて 原木 ${logs.length} 件`,
 			);
+			// 一歩も動けていないなら、同じ相手に同じ手を繰り返しても同じ。
+			// 試行を1秒で使い切らせない。
+			if (logs.length === 0 && moved < 1) {
+				agent.log("[collecting.wood] 動けていない。ここでは木に近づけない");
+				agent.noteStall(
+					"collecting.wood: trees are visible but the path to them is blocked; wood cannot be gathered without moving elsewhere.",
+				);
+				break;
+			}
 		}
 
 		let felledCount = 0;
@@ -427,6 +502,17 @@ function findPlaceableForSaplings(driver: BotDriver, radius: number, isQuad: boo
 	return candidates.map((c) => c.pos);
 }
 
+/**
+ * そこまでの「行きにくさ」。距離ではなく、登るぶんを重く見た値。
+ *
+ * 並べ替えにしか使わないので単位に意味は無い。水平1ブロックを1とする。
+ */
+function reachCost(origin: Position, p: Position): number {
+	const flat = Math.hypot(p.x - origin.x, p.z - origin.z);
+	const dy = p.y - origin.y;
+	return flat + (dy > 0 ? dy * CLIMB_WEIGHT : -dy * DESCEND_WEIGHT);
+}
+
 function isPlantable(block: BlockInfo | null): boolean {
 	return block !== null && (block.name === "dirt" || block.name === "grass_block");
 }
@@ -436,9 +522,21 @@ export const woodScanner = {
 		const state = driver.getState();
 		if (!state.isReady) return [];
 		const origin = state.position;
-		const distanceTo = (p: Position) => Math.hypot(p.x - origin.x, p.y - origin.y, p.z - origin.z);
 		return driver.world
 			.findBlocksMatching((name) => isLog(name), radius, 10)
-			.sort((a, b) => distanceTo(a.position) - distanceTo(b.position));
+			.sort((a, b) => reachCost(origin, a.position) - reachCost(origin, b.position));
+	},
+
+	/**
+	 * 立方体(半径16)の外にある木を、サイドカーのチャンクから探す。
+	 *
+	 * 見つかるのは位置だけなので、そこまで歩いてから通常の探索に戻す。
+	 */
+	findDistantLogs: async (driver: BotDriver, radius = FAR_LOG_RADIUS): Promise<BlockInfo[]> => {
+		const state = driver.getState();
+		if (!state.isReady) return [];
+		const origin = state.position;
+		const found = await driver.world.findBlocksFar(LOG_NAMES, radius, 16);
+		return found.sort((a, b) => reachCost(origin, a.position) - reachCost(origin, b.position));
 	},
 };

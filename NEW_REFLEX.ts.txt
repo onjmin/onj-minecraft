@@ -1,0 +1,238 @@
+	/**
+	 * 生存のための手入れと判断。戻り値が true の間はスキル層を動かさない。
+	 *
+	 * 上半分は手入れで、拒否権も共有フラグも持たないので順不同でよい。
+	 * 下半分の判断は裁定者が1つだけ選ぶ。以前はここに15個の反射が並び、
+	 * それぞれが true を返して他を黙らせ、`sheltering` や `currentTaskName`
+	 * を書き換えて隣に合図していた。その噛み合わせが実測で4時間26分の
+	 * 停止を生んでいる(2026-09-17 07:10〜11:36)。
+	 */
+	private async reflexSurvival(signal: AbortSignal): Promise<boolean> {
+		try {
+			this.noteDarkness();
+			this.noteInventory();
+			await this.wearBestArmor();
+			await this.equipBestWeapon();
+			// 通りすがりに、自分が掘った跡を1つ埋める。
+			// 出向いて直す building.repair だけでは追いつかない。
+			await this.refillDugHoles(signal);
+			// 見かけた建物を控える。地上に出たとき、向かう先として使う。
+			await this.noteLandmarksNearby();
+			// 昼のうちにベッドを叩いてリスポーン地点を移しておく。
+			await this.registerSpawnAtBed(signal);
+			// 待たせず自分から動く。await しない: LLM 呼び出しを含むので、
+			// ここで待つと反射ループそのものが詰まる。
+			this.maybeGreetNearbyPlayer();
+
+			const snapshot = await this.buildSurvivalSnapshot();
+			const decision = await this.arbiter.tick(snapshot, this.survivalActions, signal);
+			this.metrics.noteTick(snapshot, decision.rule?.name ?? null);
+			this.metrics.reportIfDue(METRICS_REPORT_MS);
+			return decision.rule !== null;
+		} catch (e) {
+			// 反射行動で本来の行動を止めない。
+			if (!signal.aborted) this.log(`反射行動でつまずいた: ${e}`);
+			return false;
+		}
+	}
+
+	/**
+	 * 生存判断が見る世界の姿を撮る。
+	 *
+	 * driver を触るのはここだけ。以降の判断はこのコピーだけを見るので、
+	 * サーバーもボットも無しで試せる。
+	 */
+	private async buildSurvivalSnapshot(): Promise<SurvivalSnapshot> {
+		const state = this.driver.getState();
+		const pos = state.position;
+		const foot = { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) };
+		const distanceTo = (p: Position) => Math.hypot(p.x - pos.x, p.y - pos.y, p.z - pos.z);
+		const hostilesNear = this.driver.nearbyEntities(12).filter((e) => isHostileMob(e.name)).length;
+		const hostilesClose = this.driver.nearbyEntities(6).filter((e) => isHostileMob(e.name)).length;
+		const preyDistances = this.driver
+			.nearbyEntities(HUNT_RANGE)
+			.filter((e) => PREY_NAMES.has(e.name))
+			.map((e) => distanceTo(e.position))
+			.sort((a, b) => a - b);
+		const items = this.driver.inventory.items();
+		const names = items.map((i) => i.name);
+		const planks = items
+			.filter((i) => i.name.endsWith("_planks"))
+			.reduce((sum, i) => sum + i.count, 0);
+		const logs = items
+			.filter(
+				(i) => i.name.endsWith("_log") || i.name.endsWith("_stem") || i.name.endsWith("_wood"),
+			)
+			.reduce((sum, i) => sum + i.count, 0);
+		// 着ている防具は items() に出てこない。持ち物だけを見ると、
+		// フル装備でも「丸腰」と判定されて毎晩潜ることになる。
+		const armored =
+			this.driver.inventory.armor().some((i) => i !== null) ||
+			names.some((n) => ARMOR_SUFFIXES.some((suf) => n.endsWith(suf)));
+		const point = this.getDeathPoint();
+		return {
+			at: Date.now(),
+			ready: state.isReady,
+			health: state.health,
+			food: state.food,
+			foot,
+			timeOfDay: state.timeOfDay,
+			night: isNightTime(state.timeOfDay),
+			hostilesNear,
+			hostilesClose,
+			preyDistance: preyDistances.length > 0 ? preyDistances[0] : null,
+			depthBelowSurface: await this.depthBelowSurface(),
+			solidAbove: this.solidAboveCount(foot),
+			boxedIn: this.isBoxedIn(foot),
+			sheltered: this.isSheltered(foot),
+			armed: this.hasWeapon(),
+			armored,
+			craftableWeapon: planks + logs * 4 >= 6,
+			edible: pickFood(names),
+			cookable: pickCookable(names),
+			inventoryCount: items.length,
+			recentDeaths: this.countRecentDeaths(),
+			deathPoint: point ? { ...point } : null,
+			homeDistance: this.spawnBed ? distanceTo(this.spawnBed) : null,
+			sleepRequested: Date.now() - this.othersSleepingAt <= SLEEP_REQUEST_TTL_MS,
+			humanRequestFresh: this.hasFreshHumanRequest(),
+		};
+	}
+
+	/**
+	 * ルールが使える操作。ここから先は世界を触ってよい。
+	 *
+	 * ルールは互いを黙らせる手段を持たないので、この一覧に「他をやめさせる」
+	 * 類の操作は置かない。
+	 */
+	private readonly survivalActions: SurvivalActions = {
+		log: (message: string) => this.log(message),
+		eat: (signal: AbortSignal) => this.eatNow(signal),
+		secureFood: (signal: AbortSignal) => this.runSurvivalSkill(secureFoodSkill, signal),
+		shelter: (signal: AbortSignal) => this.shelterNow(signal),
+		goToSurface: async (signal: AbortSignal) => {
+			await this.runSurvivalSkill(gotoSurfaceSkill, signal);
+		},
+		escapeBoxedIn: (signal: AbortSignal) => this.escapeIfBoxedIn(signal),
+		recoverLoot: (signal: AbortSignal) => this.recoverLootNow(signal),
+		sleep: (signal: AbortSignal) => this.sleepIfOthersSleeping(signal),
+		armSelf: async (signal: AbortSignal) => {
+			await this.runSurvivalSkill(craftWeaponSkill, signal);
+		},
+	};
+
+	/**
+	 * 生存側がスキルを1回動かす。
+	 *
+	 * 成否だけでなく「世界が変わったか」を見る。成功を返しても持ち物も位置も
+	 * 変わっていないなら空振りで、実測 2026-09-15 の crafting.weapon は
+	 * 材料が同じまま792回それを繰り返していた。空振りは計測に残し、
+	 * 思考にも覚え書きとして渡す。
+	 */
+	private async runSurvivalSkill(
+		skill: { name: string; handler: (a: any) => Promise<SkillResponse<any>> },
+		signal: AbortSignal,
+	): Promise<boolean> {
+		const before = snapshotInventory(this.driver);
+		const from = this.driver.getState().position;
+		const startedAt = Date.now();
+		let ok = false;
+		try {
+			const result = await skill.handler({ agent: this, signal, args: {} });
+			ok = result.success;
+			if (!ok) this.log(`[生存] ${skill.name} 失敗: ${result.summary}`);
+		} catch (e) {
+			if (!signal.aborted) this.log(`[生存] ${skill.name} 失敗: ${e}`);
+		}
+		const gained = gainedSince(this.driver, before);
+		const to = this.driver.getState().position;
+		const moved = Math.hypot(to.x - from.x, to.y - from.y, to.z - from.z);
+		const changed = totalGain(gained) > 0 || moved > 1;
+		this.metrics.noteSkill(skill.name, ok, changed, totalGain(gained), Date.now() - startedAt);
+		if (ok && !changed) {
+			this.noteStall(`${skill.name} は成功を返したが、持ち物も位置も変わっていない`);
+		}
+		return ok;
+	}
+
+	/** 食べる。満腹度が実際に増えたときだけ true。 */
+	private async eatNow(signal: AbortSignal): Promise<boolean> {
+		const before = this.driver.getState().food;
+		const ate = await this.driver.eat(signal);
+		const after = this.driver.getState().food;
+		if (!ate || after <= before) return false;
+		this.noteMeal(before, after);
+		this.log(`[生存] 食事をとった (満腹度 ${before} → ${after})`);
+		return true;
+	}
+
+	/** 食事を計測に残す。スキル側からも呼ぶ。 */
+	public noteMeal(before: number, after: number): void {
+		this.metrics.noteMeal(before, after);
+	}
+
+	/**
+	 * 退く。寝床があれば戻り、無ければその場に潜る。
+	 *
+	 * 「いつ退くか」はルール表が決めるので、ここは行動だけを持つ。
+	 * 既に潜れているなら何もしない。ここで掘ると毎晩1マスずつ沈み、
+	 * 実測では Y=66 から Y=39 まで下がっていた。
+	 */
+	private async shelterNow(signal: AbortSignal): Promise<void> {
+		if (await this.retreatToHome(signal)) return;
+		const pos = this.driver.getState().position;
+		const foot = { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) };
+		if (this.isSheltered(foot) || this.solidAboveCount(foot) >= BURIED_THICKNESS) return;
+		// 掘り進み続けないための歯止め。ただし敵が目の前にいるときは待たない。
+		const threatened = this.driver
+			.nearbyEntities(HOME_THREAT_RADIUS)
+			.some((e) => isHostileMob(e.name));
+		if (!threatened && Date.now() - this.lastBurrowAt < BURROW_COOLDOWN_MS) return;
+		this.lastBurrowAt = Date.now();
+		await this.burrow(signal);
+	}
+
+	/** 落とし物を取りに行く。割に合わないと分かった時点で諦める。 */
+	private async recoverLootNow(signal: AbortSignal): Promise<void> {
+		const point = this.getDeathPoint();
+		if (!point) return;
+		if (this.isNearRecentDeath(point)) {
+			this.log("[生存] 落とし物はさっき殺された場所にある。近づかない");
+			this.clearDeathPoint();
+			return;
+		}
+		const depth = this.driver.getState().position.y - point.y;
+		if (!this.hasWeapon() && depth > UNARMED_RECOVERY_MAX_DEPTH) {
+			this.log(`[生存] 落とし物は ${Math.round(depth)} マス下。丸腰では取りに行かない`);
+			this.clearDeathPoint();
+			return;
+		}
+		const attempts = this.deathPoint?.attempts ?? 0;
+		if (attempts >= RECOVERY_ATTEMPT_LIMIT) {
+			this.log(`[生存] 落とし物の回収を ${attempts} 回試した。諦める`);
+			this.clearDeathPoint();
+			return;
+		}
+		const ok = await this.runSurvivalSkill(gotoDeathPointSkill, signal);
+		// 数えるのは「試した回数」。担当している間ずっと数えると数周で
+		// 上限に達してしまうので、失敗した回だけ数える。
+		if (!ok && this.deathPoint) this.deathPoint.attempts = attempts + 1;
+	}
+
+	/** 四方が塞がっていて歩いて出られないか。 */
+	private isBoxedIn(foot: Position): boolean {
+		const open = (dx: number, dz: number) => {
+			const f = this.driver.world.blockAt({ x: foot.x + dx, y: foot.y, z: foot.z + dz });
+			const h = this.driver.world.blockAt({ x: foot.x + dx, y: foot.y + 1, z: foot.z + dz });
+			if (f === null || h === null) return true;
+			return f.name === "air" && h.name === "air";
+		};
+		return !BOX_DIRECTIONS.some((d) => open(d.x, d.z));
+	}
+
+	/** 直近の窓で死んだ回数。 */
+	private countRecentDeaths(): number {
+		const cutoff = Date.now() - DEATH_STORM_WINDOW_MS;
+		this.recentDeaths = this.recentDeaths.filter((t) => t >= cutoff);
+		return this.recentDeaths.length;
+	}

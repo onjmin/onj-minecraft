@@ -2,7 +2,6 @@ import { MinecraftAgent } from "../core/agent";
 import { startUnjRelayPolling } from "../core/utils/unj-relay";
 import { profiles } from "../profiles";
 import { buildingBaseSkill } from "../skills/building/base";
-import { buildingRepairSkill } from "../skills/building/repair";
 import { collectDirtSkill } from "../skills/collecting/dirt";
 import { huntAnimalsSkill } from "../skills/collecting/hunting";
 import { mineOresSkill } from "../skills/collecting/mining";
@@ -41,8 +40,6 @@ const allSkills = [
 
 	// --- Building Domain ---
 	buildingBaseSkill,
-	// 掘った跡を埋め戻す。他人のワールドに穴を残さないための奉公。
-	buildingRepairSkill,
 
 	// --- Goto Domain ---
 	gotoCoordsSkill, // 座標へ移動

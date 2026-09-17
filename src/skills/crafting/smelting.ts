@@ -1,5 +1,11 @@
+import { describeGain, gainedSince, snapshotInventory, totalGain } from "../inventory-delta";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 import { ensureFurnace } from "./util";
+
+/** かまどが1つ焼くのにかかる時間。統合版は10秒。 */
+const SMELT_MS_PER_ITEM = 10_000;
+/** 焼き上がりを待つ上限。 */
+const SMELT_WAIT_MAX_MS = 70_000;
 
 /**
  * Smelting Domain: Processing raw materials.
@@ -54,6 +60,7 @@ export const craftSmeltingSkill = createSkill<void, { item: string; amount: numb
 
 		try {
 			// 4. かまどを開いて投入（燃料は最大スタック、素材は手持ちすべて）
+			const before = snapshotInventory(driver);
 			await driver.smelt(
 				furnaceBlock.position,
 				smeltable.name,
@@ -62,8 +69,35 @@ export const craftSmeltingSkill = createSkill<void, { item: string; amount: numb
 				fuel.count,
 			);
 
+			// 5. 焼き上がるまで待って、取り出すところまでやる。
+			//
+			// 投入した時点で成功を返していたので、焼けた物はかまどの中に
+			// 置き去りのまま「精錬した」と報告していた。持ち物は増えず、
+			// 次に通りかかっても中身は見ない。狩った肉が焼けないまま
+			// 腐っていく経路がここにあった。
+			const waitMs = Math.min(SMELT_MS_PER_ITEM * smeltable.count + 3_000, SMELT_WAIT_MAX_MS);
+			agent.log(
+				`[smelting] ${smeltable.name} x${smeltable.count} を焼く。${Math.round(waitMs / 1000)}秒待つ`,
+			);
+			const until = Date.now() + waitMs;
+			while (Date.now() < until) {
+				if (signal.aborted) break;
+				await new Promise((r) => setTimeout(r, 2_000));
+			}
+			await driver.takeAllFromContainer(signal, furnaceBlock.position);
+
+			const gained = gainedSince(driver, before);
+			if (totalGain(gained) === 0) {
+				agent.noteStall(
+					`Put ${smeltable.name} into a furnace but nothing could be taken back out.`,
+				);
+				return skillResult.fail(
+					`Put ${smeltable.name} into the furnace but nothing came back out.`,
+				);
+			}
+
 			return skillResult.ok(
-				`Started smelting ${smeltable.count}x ${smeltable.name} using ${fuel.name}.`,
+				`Smelted ${smeltable.count}x ${smeltable.name} and collected ${describeGain(gained)}.`,
 				{
 					item: smeltable.name,
 					amount: smeltable.count,

@@ -7,10 +7,12 @@ import { craftWeaponSkill } from "../skills/crafting/weapon";
 import { exploreLandSkill } from "../skills/exploring/land";
 import { gotoDeathPointSkill } from "../skills/goto/death";
 import { gotoSurfaceSkill } from "../skills/goto/surface";
+import { gainedSince, snapshotInventory, totalGain } from "../skills/inventory-delta";
 import { giveItemSkill } from "../skills/social/give";
+import { secureFoodSkill } from "../skills/survival/food";
 import type { SkillResponse } from "../skills/types";
 import { type ChatSituation, Conversation } from "./conversation";
-import { EAT_BELOW_FOOD, pickFood } from "./driver/food";
+import { EAT_BELOW_FOOD, pickCookable, pickFood } from "./driver/food";
 import { JavaDriver } from "./driver/java";
 import type { BotDriver, Position } from "./driver/types";
 import { fetchMinecraftKnowledge } from "./knowledge/wiki";
@@ -18,6 +20,17 @@ import { chatLlm, llm } from "./llm-client";
 import { parseLlmOutput } from "./llm-output-parser";
 import { createPerceptionSnapshot, type DamageInfo } from "./perception";
 import { buildThinkingPrompt } from "./prompt-builder";
+import { SurvivalArbiter } from "./survival/arbiter";
+import { SurvivalMetrics } from "./survival/metrics";
+import {
+	BURIED_THICKNESS,
+	DEATH_STORM_LIMIT,
+	DEEP_UNDERGROUND_GAP,
+	HUNT_RANGE,
+	SHELTER_HEALTH,
+	type SurvivalActions,
+} from "./survival/rules";
+import type { SurvivalSnapshot } from "./survival/snapshot";
 import type { SafeBot } from "./types";
 import { appendChatLog } from "./utils/chat-log";
 import { emitDiscordWebhook, translateWithRoleplay } from "./utils/discord-webhook";
@@ -110,8 +123,6 @@ function armorRank(itemName: string): number {
 function isNightTime(timeOfDay: number): boolean {
 	return timeOfDay >= 13000 && timeOfDay <= 23000;
 }
-/** この体力を下回ったら、昼でも潜って回復を待つ。 */
-const SHELTER_HEALTH = envNum("SHELTER_HEALTH", 8);
 /** 一度潜ったら、次に潜り直すまで置く間隔。掘り進み続けないための歯止め。 */
 const BURROW_COOLDOWN_MS = envNum("BURROW_COOLDOWN_MS", 60_000);
 /**
@@ -177,9 +188,6 @@ const SHELTER_HOLD_MS = envNum("SHELTER_HOLD_MS", 5_000);
 const SHELTER_YIELD_MS = envNum("SHELTER_YIELD_MS", 3 * 60_000);
 /** 埋まっているかを見る高さ。屋根はこの範囲に収まる前提。 */
 const BURIED_SCAN_HEIGHT = 32;
-/** 頭上にこれだけ固いものが積まっていたら「埋まっている」と見なす。
- *  木の葉や庇は1〜2枚なので、それでは発動しない厚さにする。 */
-const BURIED_THICKNESS = envNum("BURIED_THICKNESS", 4);
 /** これだけ続けて一瞬で終わったら、乗り換えの猶予を外す。 */
 const SPIN_LIMIT = envNum("SKILL_SPIN_LIMIT", 3);
 /**
@@ -190,7 +198,48 @@ const SPIN_LIMIT = envNum("SKILL_SPIN_LIMIT", 3);
  * 上がるのに毎回9秒で LLM が別の行動へ乗り換え、11時間そこに居続けた。
  * 登るには柱積みや階段掘りで分単位かかるので、その間は守る。
  */
-const BURIED_TASK_LOCK_MS = envNum("BURIED_TASK_LOCK_MS", 180_000);
+/**
+ * 掴んだまま高さが増えない回数の上限。超えたらロックを外す。
+ *
+ * ロックは「地上へ戻るのは判断ではなく前提」という理由で、LLM の乗り換えを
+ * 握りつぶす。実測 2026-09-16 の8時間で 232 回それをやっていた。LLM は
+ * goto.landmark 205回・goto.coords 75回と代替案を出し続けていたのに、
+ * すべて保留されている。
+ *
+ * この取引が成り立つのは、掴んでいるスキルが実際に効いているときだけ。
+ * 同日、goto.surface は内部が壊れていて1ブロックも上がらず、粘り強さが
+ * そのまま罠になっていた。成否ではなく「高さが増えたか」で見る。地表に
+ * 着くまで失敗を返す作りなので、成否で見ると登っている最中に外れる。
+ */
+/** 行き詰まりの覚え書きを何件・どれだけ持つか。思考プロンプトへ渡す。 */
+const STALL_NOTE_LIMIT = 4;
+const STALL_NOTE_TTL_MS = envNum("STALL_NOTE_TTL_MS", 3 * 60_000);
+/**
+ * 自分の列の地表がこれより上なら「地下深く」と見なす。
+ *
+ * goto.surface の SURFACE_GAP と同じ役目だが、あちらは「登る必要があるか」、
+ * こちらは「潜ってよいか・地上へ戻る行動を掴み続けるか」を決める。
+ * 1〜2マスのずれは地表の数え方の差で出るので、それを地下と呼ばない幅にする。
+ */
+/** 自分の列の地表を数えさせる半径。判定に要るのは自分の列だけ。 */
+const SURFACE_PROBE_RADIUS = 2;
+/** 地表の高さを数え直す間隔。反射は毎周回るので、そのたびには引かない。 */
+const SURFACE_PROBE_TTL_MS = 5_000;
+/**
+ * 計測を1行にまとめてログへ出す間隔。
+ *
+ * 数字が流れていれば、止まっていることに気づくのに4時間かからない。
+ */
+const METRICS_REPORT_MS = envNum("METRICS_REPORT_MS", 10 * 60_000);
+/** 狩りの対象。食料の鎖の入口。 */
+const PREY_NAMES = new Set(["cow", "pig", "sheep", "chicken", "rabbit"]);
+/** 四方を見るときの向き。 */
+const BOX_DIRECTIONS = [
+	{ x: 1, z: 0 },
+	{ x: -1, z: 0 },
+	{ x: 0, z: 1 },
+	{ x: 0, z: -1 },
+];
 
 /**
  * 人から受けた依頼を追いかける制限時間。
@@ -279,7 +328,13 @@ const MUTE_PATTERNS = [
 ];
 /** 死にすぎを数える窓と、その窓で「死にすぎ」と見なす回数。 */
 const DEATH_STORM_WINDOW_MS = envNum("DEATH_STORM_WINDOW_MS", 10 * 60_000);
-const DEATH_STORM_LIMIT = envNum("DEATH_STORM_LIMIT", 3);
+/**
+ * ここまで死んだら、そのワールドから一度抜ける。
+ *
+ * 潜る・寝床へ戻るで止まらない死に方(水没洞窟の溺死者など)があり、
+ * その場合どの反射も効かないまま死亡ログだけが流れ続ける。
+ */
+const DEATH_STORM_LEAVE_LIMIT = envNum("DEATH_STORM_LEAVE_LIMIT", 5);
 /** 誰かがベッドに入ったという知らせを、この間だけ有効とみなす。 */
 const SLEEP_REQUEST_TTL_MS = envNum("SLEEP_REQUEST_TTL_MS", 90_000);
 /**
@@ -411,54 +466,41 @@ const BURROW_FALL_SCAN = 8;
  * 「初期座標のまわりで死に続ける」主な運動になっていた。
  */
 const UNARMED_RECOVERY_MAX_DEPTH = envNum("UNARMED_RECOVERY_MAX_DEPTH", 12);
+/**
+ * 死んだ場所を「避ける場所」として覚える設定。
+ *
+ * これまで死亡は時刻(recentDeaths)しか残しておらず、場所は捨てていた。
+ * 覚えているのは goto.death_point の行き先としてだけで、つまり危険な場所へ
+ * 引き寄せる仕組みしか無かった。実測 2026-09-16、(4,52,68) で死に、15分
+ * かけて登り直し、2.2ブロック離れた (5,52,70) でまた死んでいる。
+ *
+ * 水辺・溶岩・湧き層・人に狩られる場所を個別に判定すると、地形や状況の
+ * 数を数える作業になる。「二度殺された場所へは近づかない」という1つの
+ * 規則にすれば、どれも同じ扱いで覆える。
+ */
+const DEATH_ZONE_RADIUS = envNum("DEATH_ZONE_RADIUS", 12);
+/** 避ける時間。mob は移動するので、永久に立ち入り禁止にはしない。 */
+const DEATH_ZONE_TTL_MS = envNum("DEATH_ZONE_TTL_MS", 15 * 60_000);
+/** ここまで死んだら避ける。1回は不運のこともあるので2回から。 */
+const DEATH_ZONE_STRIKES = envNum("DEATH_ZONE_STRIKES", 2);
+/** 覚えておく区域の数。 */
+const DEATH_ZONE_LIMIT = 8;
+
+/**
+ * 自分から言い出した申し出を抱えておく時間。人からの依頼より短くする。
+ *
+ * 相手が返事をしていない申し出は、約束というより思いつきに近い。実測
+ * 2026-09-17、返事の無い「stoneの剣を渡そうか」が方針の3項目目に残り続け、
+ * 地上に出て木を集めるという本来の連鎖より上に置かれていた。
+ */
+const SELF_OFFER_TTL_MS = envNum("SELF_OFFER_TTL_MS", 3 * 60_000);
+
 /** 同じ死亡地点へ取りに行く回数の上限。超えたら諦める。 */
 const RECOVERY_ATTEMPT_LIMIT = envNum("RECOVERY_ATTEMPT_LIMIT", 2);
 /** 明るさをログに書く最短間隔。値が細かく揺れても埋め尽くさないため。 */
 const LIGHT_LOG_INTERVAL_MS = envNum("LIGHT_LOG_INTERVAL_MS", 15_000);
 /** 抱えておく方針の数。プロンプトの "CURRENT STRATEGY (Max 3)" と揃える。 */
 const MAX_STRATEGIES = 3;
-/**
- * 埋め戻しのために覚えておく「掘った跡」の数。
- *
- * 他人のワールドに間借りしているのに、長いあいだ掘る側しか無かった。
- * 残っているログだけで破壊2300件以上・設置0件、初期リス周辺が穴だらけに
- * なり「管理人のbotのせいで荒れてる」と苦情が出た。多すぎても持ちきれない
- * ので上限を置き、古いものから捨てる。捨てた穴は埋まらないままになるが、
- * 覚えていられる範囲は埋める。
- */
-const DUG_LEDGER_LIMIT = envNum("DUG_LEDGER_LIMIT", 400);
-/** 手が届く範囲にある掘った跡は、ついでに埋める。その半径。 */
-const REFILL_REACH = envNum("REFILL_REACH", 4);
-/**
- * 掘ってからこれだけ経った跡だけを埋め戻す。
- *
- * 掘った直後に埋めてはいけない。地上へ登るための階段はまさに「今掘った跡」
- * なので、猶予が無いと踏んだ段を自分で塞ぎ、また掘り、を延々と繰り返して
- * 永久に上がれなくなる。実測で、階段を刻んだ granite が掘った瞬間に台帳へ
- * 載っていた。
- *
- * 目的は「穴を残さない」ことであって「即座に埋める」ことではない。
- * 使い終わった頃に埋めればよい。
- */
-const REFILL_GRACE_MS = envNum("REFILL_GRACE_MS", 10 * 60_000);
-/** 埋め戻しに使ってよいブロック。貴重な物を埋めに使わない。 */
-const FILLER_BLOCKS = [
-	"dirt",
-	"cobblestone",
-	"stone",
-	"deepslate",
-	"cobbled_deepslate",
-	"gravel",
-	"sand",
-	"andesite",
-	"diorite",
-	"granite",
-	"tuff",
-	"netherrack",
-	"grass_block",
-];
-/** 掘った跡を書き留めるファイル。再起動で「やった事」を忘れないために持つ。 */
-const DUG_LEDGER_FILE = "logs/dug-blocks.json";
 /**
  * 寝床(リスポーン地点として登録したベッド)の控え。
  *
@@ -474,7 +516,7 @@ const HOME_FILE = "logs/home.json";
  * 歯止めが無いと「横を掘る→また塞がっている→また掘る」で穴が広がり続ける。
  * 本当に閉じ込められているなら、間隔を空けても抜けられる。
  */
-const ESCAPE_COOLDOWN_MS = envNum("ESCAPE_COOLDOWN_MS", 30_000);
+const ESCAPE_DIG_MIN_GAP_MS = envNum("ESCAPE_DIG_MIN_GAP_MS", 3_000);
 
 /**
  * 一回成功したら依頼が消化される類のスキル。
@@ -655,15 +697,6 @@ export class MinecraftAgent {
 	private lastLandmarkScanAt = 0;
 	/** 思考が続けて落ちた回数。脳無しで動く判断に切り替えるために数える。 */
 	private thinkFailures = 0;
-	/**
-	 * 自分が壊したブロックの控え。埋め戻すために持つ。
-	 *
-	 * 掘る経路は driver.dig() 一本なので、そこから全部ここへ来る。
-	 * 再起動で忘れないよう、ファイルにも書き出す。
-	 */
-	private dugLedger: { position: Position; name: string; at: number }[] = [];
-	/** 台帳をディスクへ書くのを間引くための、最後に書いた時刻。 */
-	private dugLedgerSavedAt = 0;
 	/** 最後に「四方を塞がれて掘り抜けた」時刻。掘り広げ続けないために見る。 */
 	private lastEscapeDigAt = 0;
 	/**
@@ -672,6 +705,16 @@ export class MinecraftAgent {
 	 * 席を譲って抜けるしかない。呼び出し側(bedrock.ts)が設定する。
 	 */
 	public onNoBedForSleep?: () => void;
+	/**
+	 * 短い間に死に続けているときの知らせ。
+	 *
+	 * 死亡ログは死んだ本人ではなく、そのワールドにいる全員のチャット欄に
+	 * 流れる。実測 2026-09-17 01:08〜01:09、1分間に4回死んだ。同日の別の
+	 * 時間帯には1日141行を数えている。直す当てがないまま居座って流し続ける
+	 * より、一度抜けて出直す方が迷惑にならない。戻るのは run-bedrock.sh の
+	 * 仕事(終了コード3)。
+	 */
+	public onDeathStorm?: (count: number) => void;
 	/** 連続失敗回数。待機時間を伸ばして暴走を防ぐのに使う。 */
 	private consecutiveFailures = 0;
 	/** 直前に失敗したスキル名。別のスキルに切り替わったらカウンタを戻す。 */
@@ -693,6 +736,8 @@ export class MinecraftAgent {
 	private currentTaskSince = 0;
 	/** 一瞬で終わる行動が続いた回数。空回りの間隔を空けるのに使う。 */
 	private instantRepeats = 0;
+	/** スキルごとの、成功を返したのに何も変わらなかった連続回数。 */
+	private readonly emptyRuns = new Map<string, number>();
 	/**
 	 * 死んだ場所と時刻。持ち物はそこに落ちているので、取りに戻る手掛かり。
 	 * 落下物は5分ほどで消えるため、古くなったら捨てる。
@@ -706,19 +751,41 @@ export class MinecraftAgent {
 	} | null = null;
 	/** 最後にプレイヤーから殴られた時刻。人に近づいてよいかの判断に使う。 */
 	private attackedByPlayerAt = 0;
+	/** 二度以上死んだ場所。近づかないために持つ。 */
+	private deathZones: { pos: Position; at: number; count: number }[] = [];
 	/** 最後に潜った時刻。掘り進み続けるのを止めるために見る。 */
 	private lastBurrowAt = 0;
+	/** 自分の列の地表までの高さ。surfaceScan はサイドカーへの往復なので控えておく。 */
+	private surfaceProbe: { at: number; depth: number | null } | null = null;
+	/** 「地下では潜らない」と最後に言った時刻。毎周は言わない。 */
+	private lastDeepShelterLogAt = 0;
 	/**
-	 * 今わざと潜っているか。
+	 * 生存ルールの裁定者。
 	 *
-	 * shelterAtNight が立て、returnToSurfaceIfBuried が読む。自分で作った
-	 * 隠れ穴を「埋まっている」と誤読して掘り返すのを止めるためのもの。
+	 * 「誰が担当するか」と「いつまで掴んでよいか」はここだけが決める。
+	 * 以前は15個の反射がそれぞれ拒否権を持ち、共有フィールドで合図し合って
+	 * いた。組み合わせの数が増える一方で、確かめる手段が本番8時間・1標本
+	 * しか無く、5日間で死亡率が動かなかった。
 	 */
-	private sheltering = false;
-	/** この時刻まで、今の行動を別の行動に乗り換えない。0 は未設定。 */
-	private taskLockUntil = 0;
-	/** 乗り換えを止めている行動の名前。 */
-	private taskLockName = "";
+	private readonly arbiter = new SurvivalArbiter({ log: (m) => this.log(m) });
+	/** 成果の計測。死に方だけでなく、積み上がった量を残す。 */
+	private readonly metrics = new SurvivalMetrics({
+		savePath: path.join(
+			"logs",
+			`metrics-${new Date().toISOString().slice(0, 16).replace(/[:T-]/g, "")}.json`,
+		),
+		log: (m) => this.log(m),
+	});
+	/**
+	 * 行き詰まりの覚え書き。
+	 *
+	 * スキルの中で起きた空回りは、外からは1回の失敗にしか見えない。実測
+	 * 2026-09-17 00:15:28、collecting.wood の1回の呼び出しの中で「0ブロック
+	 * 移動」を6回繰り返して1秒で終わっていたが、LLM に届くのは「1回失敗」
+	 * だけだった。思考の周期(約30秒)より内側で起きることは、こうして
+	 * 明示的に外へ出さない限り judgement の材料にならない。
+	 */
+	private stallNotes: { at: number; text: string }[] = [];
 	/** 人から話しかけられて、次の判断を急ぎたいときに立てる。 */
 	private humanRequestPending = false;
 	/** 思考ループの待ちを途中で切り上げるための呼び出し口。 */
@@ -786,10 +853,6 @@ export class MinecraftAgent {
 		if (injectedDriver) {
 			this.isJava = false;
 			this.driver = injectedDriver;
-			// 壊したものを控える。埋め戻すのに要る。
-			// ここで繋がないと、掘る側だけがある元の状態に戻る。
-			this.driver.onDug = (position, name) => this.noteDug(position, name);
-			this.loadDugLedger();
 			this.loadHome();
 			// 他プレイヤーとの意思疎通のため、発言の受信だけは共通で購読する
 			this.driver.on("chat", (username: string, message: string) =>
@@ -821,6 +884,7 @@ export class MinecraftAgent {
 			// 死んだ場所を控える。持ち物は全部そこに落ちている。
 			this.driver.on("death", () => {
 				this.noteDeath();
+				this.noteDeathPlace(this.driver.getState().position);
 				// 回収に戻った先で殺されたなら、まだ敵がそこにいる。
 				// 諦めはしないが、すぐ戻ると同じことになる。間を置く。
 				// 実測で90秒に4回、ほぼ同じ座標で死に続けた。戻るたびに
@@ -846,10 +910,9 @@ export class MinecraftAgent {
 			// 実測で 01:13〜01:17 の4分間に15回、ほぼ同じ場所で死に続けている。
 			this.driver.on("respawn", () => {
 				if (!this.getDeathPoint()) return;
-				// 取りに行くかどうかの判断は反射側に揃える。ここで直に
-				// currentTaskName を書くと、丸腰・深さ・試行回数の歯止めを
-				// すべて素通りして、さっき殺された穴へまっすぐ戻ることになる。
-				void this.recoverDeathLootIfAlive();
+				// 取りに行くかどうかは裁定者の recover_loot が決める。ここで
+				// 直に動かすと、丸腰・深さ・試行回数の歯止めも、担当の期限も
+				// 素通りして、さっき殺された穴へまっすぐ戻ることになる。
 				this.requestImmediateThink();
 			});
 			// mineflayer 固有の初期化（プラグイン・経路探索設定・イベント配線）は行わない。
@@ -875,8 +938,6 @@ export class MinecraftAgent {
 		// エディション差を吸収する操作層。Java版なので JavaDriver を割り当てる。
 		this.driver = new JavaDriver(this);
 		// 統合版と同じく、壊したものを控える。
-		this.driver.onDug = (position, name) => this.noteDug(position, name);
-		this.loadDugLedger();
 		this.loadHome();
 
 		// インスタンス作成時に一度だけプラグインをロード
@@ -1415,6 +1476,20 @@ export class MinecraftAgent {
 	}
 
 	/** 返事を書くために渡す「今の状況」。嘘を言わせないための材料。 */
+	/**
+	 * いま人へ渡せる物。持ち物にある物だけを名前で返す。
+	 *
+	 * 「作れば渡せる」は数えない。実測 2026-09-17、持ち物が空のまま
+	 * 「石の剣を渡そうか」と申し出て、材料も道具も無いので当然果たせず、
+	 * その約束が方針に残り続けていた。
+	 */
+	private givableItems(): string[] {
+		return this.driver.inventory
+			.items()
+			.filter((i) => i.count > 0)
+			.map((i) => `${i.name} x${i.count}`);
+	}
+
 	private getChatSituation(minecraftKnowledge?: string): ChatSituation {
 		const state = this.driver.getState();
 		const ready = state.isReady;
@@ -1428,6 +1503,7 @@ export class MinecraftAgent {
 			health: ready ? state.health : undefined,
 			hunger: ready ? state.food : undefined,
 			inventorySummary: inventory,
+			givableItems: this.givableItems(),
 			currentTask: this.currentTaskName,
 			recentResults: this.observationHistory
 				.slice(-3)
@@ -1453,7 +1529,10 @@ export class MinecraftAgent {
 	/** 依頼が新しいうちだけ返す。古い依頼を延々と追わせない。 */
 	private getPendingRequest(): string | null {
 		if (!this.pendingRequest) return null;
-		if (Date.now() - this.pendingRequest.at > REQUEST_TTL_MS) {
+		// 自分から言い出したぶんは短く切る。相手が何も言っていない申し出を
+		// 人の依頼と同じだけ抱えると、その間ずっと自分の生存より優先される。
+		const ttl = this.pendingRequest.selfInitiated ? SELF_OFFER_TTL_MS : REQUEST_TTL_MS;
+		if (Date.now() - this.pendingRequest.at > ttl) {
 			this.pendingRequest = null;
 			return null;
 		}
@@ -1926,6 +2005,22 @@ export class MinecraftAgent {
 				const prey = ["cow", "pig", "sheep", "chicken", "rabbit"];
 				return this.driver.nearbyEntities(32).some((e) => prey.includes(e.name));
 			}
+			case "collecting.stone":
+			case "collecting.mining": {
+				// ツルハシが無いなら石も鉱石も落ちない。壊せはするので、
+				// スキルは動いて何も得ずに終わる。実測 2026-09-16、
+				// 「Broke 4 stone blocks but obtained nothing」を返しながら
+				// LLM はこれを選び続け、その間ずっと地下にいた。壊した跡だけが
+				// 残る。前提はこちらで判るので、こちらで落とす。
+				return this.driver.inventory.items().some((i) => i.name.endsWith("_pickaxe"));
+			}
+			case "collecting.wood": {
+				// 地下深くに木は生えていない。掘って出るのが先で、ここで
+				// 選ばせても空振りする。同日、Y=34 で選ばれていた。
+				// 深さが分からないときは出す(地上にいる可能性の方が高い)。
+				const depth = this.lastKnownDepth();
+				return !(depth !== null && depth > DEEP_UNDERGROUND_GAP);
+			}
 			case "crafting.tool":
 			case "crafting.weapon":
 			case "crafting.torch": {
@@ -1944,23 +2039,22 @@ export class MinecraftAgent {
 						i.name.endsWith("_stem"),
 				);
 			}
+			case "survival.secure_food": {
+				// 食べる物も、焼ける物も、狩れる相手もいないなら出さない。
+				//
+				// ローカルの採点で捕まえた。動物のいない場所で LLM がこれを選び、
+				// 「No animals found nearby」で30秒に9回即失敗していた。
+				// 出来ない行動を一覧に出しておくのは、選ばせて失敗させるのと同じ。
+				const names = this.driver.inventory.items().map((i) => i.name);
+				if (pickFood(names) !== null || pickCookable(names) !== null) return true;
+				return this.driver.nearbyEntities(HUNT_RANGE).some((e) => PREY_NAMES.has(e.name));
+			}
 			case "crafting.smelting": {
 				// かまどか、かまどになる丸石が要る。
 				const items = this.driver.inventory.items();
 				return items.some(
 					(i) => i.name === "furnace" || i.name === "cobblestone" || i.name === "blackstone",
 				);
-			}
-			case "building.repair": {
-				// 今すぐ埋められる跡が残っているなら、材料が無くても出す
-				// (「何も持っていない」と正直に返して、集めに行く判断に繋がる)。
-				// 掘りたては数えない。数えると、登るために刻んだ階段を理由に
-				// 「埋め戻し」を選び続け、上がる作業が進まなくなる。
-				if (this.getFillableHoles().length > 0) return true;
-				// 台帳が空でも、埋める物を持っているなら一帯を直しに行ける。
-				// 初期リスの既存の穴は台帳に載っていないので、ここを閉じると
-				// 「直す手段はあるのに選べない」状態になる。
-				return this.driver.inventory.items().some((i) => FILLER_BLOCKS.includes(i.name));
 			}
 			case "goto.landmark":
 				// 一度も人工物を見ていないなら行き先が無い。
@@ -2006,6 +2100,28 @@ export class MinecraftAgent {
 		return { tried, rate: st.ok / tried };
 	}
 
+	/**
+	 * 行き詰まりを控える。思考プロンプトへ渡して、判断の材料にさせる。
+	 *
+	 * スキルの中の空回りや、掴んだまま進まない状態は、外からは1回の失敗に
+	 * しか見えない。ここへ書いたものだけが LLM に届く。
+	 */
+	public noteStall(text: string): void {
+		const now = Date.now();
+		this.stallNotes = this.stallNotes.filter((n) => now - n.at < STALL_NOTE_TTL_MS);
+		// 同じ内容を並べても判断は変わらない。最後の1件だけ残す。
+		this.stallNotes = this.stallNotes.filter((n) => n.text !== text);
+		this.stallNotes.push({ at: now, text });
+		if (this.stallNotes.length > STALL_NOTE_LIMIT) this.stallNotes.shift();
+	}
+
+	/** 思考プロンプトへ渡す、行き詰まりの覚え書き。 */
+	private getStallNotes(): string[] {
+		const now = Date.now();
+		this.stallNotes = this.stallNotes.filter((n) => now - n.at < STALL_NOTE_TTL_MS);
+		return this.stallNotes.map((n) => n.text);
+	}
+
 	private pushHistory(record: ObservationRecord) {
 		this.observationHistory.push(record);
 		if (this.observationHistory.length > this.maxHistory) this.observationHistory.shift();
@@ -2048,16 +2164,16 @@ export class MinecraftAgent {
 					this.currentAbort = controller;
 
 					await this.ensureOnLand(controller.signal);
-					await this.reflexSurvival(controller.signal);
+					const survivalHolds = await this.reflexSurvival(controller.signal);
 
-					// 潜った/寝床に着いたなら、この周はスキルを動かさない。
+					// 生存側が担当を握っている間はスキルを動かさない。
 					//
-					// 反射で身を隠しても、直後にここでスキルが走っていたので
-					// 自分の穴から出ていっていた。実測 01:40:22 に潜り、
-					// 01:40:23 に exploring.explore_land が始まる。これを
-					// 一晩くり返し、10分で11回死んでいる。夜の反射の目的は
-					// 「留まる」ことなので、留まらせるところまでやる。
-					if (this.sheltering) {
+					// 潜った直後にスキルが走ると、自分の穴から出ていく。実測
+					// 01:40:22 に潜り、01:40:23 に exploring.explore_land が
+					// 始まっていた。これを一晩くり返して10分で11回死んでいる。
+					// 握りっぱなしにならないことは裁定者が保証する(保持には
+					// 必ず期限があり、切れれば取り上げられる)。
+					if (survivalHolds) {
 						await new Promise((r) => setTimeout(r, SHELTER_HOLD_MS));
 						continue;
 					}
@@ -2083,6 +2199,14 @@ export class MinecraftAgent {
 						continue;
 					}
 
+					// 事後条件を測るための、実行前の世界。
+					//
+					// 「やったか」ではなく「変わったか」で見る。スキルは自分の
+					// 中の都合で成功を返すので、それだけでは空振りが見えない。
+					// 実測 2026-09-15、crafting.weapon は sticks=0 planks=0
+					// logs=2 という同じ状態から792回動いて、何も作っていない。
+					const inventoryBefore = snapshotInventory(this.driver);
+					const positionBefore = { ...this.driver.getState().position };
 					let executionBeganAt = 0;
 					// 実行に入れた時点で暴走カウンタは戻す（結果の成否は下で扱う）
 					if (this.consecutiveFailures > 0 && this.currentTaskName !== this.lastFailedTask) {
@@ -2116,6 +2240,37 @@ export class MinecraftAgent {
 						this.currentExecutionStartedAt = 0;
 					}
 					this.log(`${skill.name} end`);
+					{
+						const gained = gainedSince(this.driver, inventoryBefore);
+						const to = this.driver.getState().position;
+						const moved = Math.hypot(
+							to.x - positionBefore.x,
+							to.y - positionBefore.y,
+							to.z - positionBefore.z,
+						);
+						const changed = totalGain(gained) > 0 || moved > 1;
+						const ranMs = executionBeganAt > 0 ? Date.now() - executionBeganAt : 0;
+						this.metrics.noteSkill(
+							skill.name,
+							result?.success === true,
+							changed,
+							totalGain(gained),
+							ranMs,
+						);
+						// 成功を返したのに世界が変わっていないなら、それは空振り。
+						// 停滞判定は失敗でしか発火しないので、明示的に外へ出す。
+						if (result?.success === true && !changed) {
+							this.emptyRuns.set(skill.name, (this.emptyRuns.get(skill.name) ?? 0) + 1);
+							const times = this.emptyRuns.get(skill.name) ?? 0;
+							if (times % SPIN_LIMIT === 0) {
+								this.noteStall(
+									`${skill.name} reports success but nothing changed ${times} times in a row (no items gained, no movement).`,
+								);
+							}
+						} else if (changed) {
+							this.emptyRuns.set(skill.name, 0);
+						}
+					}
 
 					if (!result) {
 						this.log("result of handler is undefined");
@@ -2154,6 +2309,13 @@ export class MinecraftAgent {
 					// 実際に5分で98回叩いていた。
 					const elapsed = executionBeganAt > 0 ? Date.now() - executionBeganAt : Infinity;
 					this.instantRepeats = elapsed < 1000 ? this.instantRepeats + 1 : 0;
+					// 一瞬で終わる呼び出しが続くのは、外から見えない空回り。
+					// 回数がまとまったところで1件だけ残す。
+					if (this.instantRepeats === SPIN_LIMIT) {
+						this.noteStall(
+							`${skill.name} returned instantly ${SPIN_LIMIT} times in a row: its preconditions hold but it makes no progress.`,
+						);
+					}
 				} catch (e) {
 					const errorMsg = e instanceof Error ? e.message : String(e);
 					// 中断は異常ではない。思考ループが別の行動へ乗り換えたときや、
@@ -2353,8 +2515,8 @@ export class MinecraftAgent {
 
 		const heldItem = this.driver.inventory.heldItem()?.name ?? "bare_hands";
 
-		// 自分の発言も含めた履歴を渡す。何を約束したかが行動側にも要る。
-		const chatLogContext = this.conversation.lines().join("\n") || "No recent conversations.";
+		// 会話の履歴は行動側へ渡さない。喋るのは別系統(conversation.ts)の
+		// 仕事で、そこから行動に変えるべきものだけが pendingRequest として来る。
 		const pendingRequest = this.getPendingRequest() ?? undefined;
 
 		// Use perception module
@@ -2368,7 +2530,6 @@ export class MinecraftAgent {
 				profile: {
 					name: this.profile.minecraftName,
 					personality: this.profile.personality,
-					roleplay: this.profile.roleplayPrompt,
 					chatLanguage: this.profile.chatLanguage,
 				},
 				environment: {
@@ -2389,7 +2550,6 @@ export class MinecraftAgent {
 				achievements: [],
 				bases: [],
 				skills: skillsContext,
-				chatHistory: [chatLogContext],
 				pendingRequest,
 				lastDamageCause: this.lastDamageCause,
 				memorySummary: historyText,
@@ -2420,7 +2580,6 @@ export class MinecraftAgent {
 			profile: {
 				name: this.profile.minecraftName,
 				personality: this.profile.personality,
-				roleplay: this.profile.roleplayPrompt,
 				chatLanguage: this.profile.chatLanguage,
 			},
 			environment: {
@@ -2465,12 +2624,9 @@ export class MinecraftAgent {
 			spawnBed: this.spawnBed
 				? `(${this.spawnBed.x}, ${this.spawnBed.y}, ${this.spawnBed.z})`
 				: undefined,
-			// 埋め戻していない跡の数を見せる。見えていないものは直せない。
-			// 他人のワールドで穴を掘りっぱなしにしていると苦情が来る、を
-			// 判断材料として持たせる。
-			dugHoles: this.getDugHoles().length,
 			skills: skillsContext,
-			chatHistory: [chatLogContext],
+			stallNotes: this.getStallNotes(),
+			allowSpontaneousChat: process.env.ENABLE_CHAT === "1",
 			pendingRequest,
 			lastDamageCause: this.lastDamageCause,
 			memorySummary: historyText,
@@ -2566,25 +2722,12 @@ export class MinecraftAgent {
 			// 行動を最後までやらせる」ためのもので、一瞬で失敗し続ける行動を
 			// 抱え込むためではない。実測で collecting.hunting が10分に149回
 			// 即失敗し、その間ほかの行動が一切選ばれなかった。
-			// 前提条件として掴んでいる行動は手放さない。
+			// ここにあった taskLock は無くした。
 			//
-			// 地下からの復帰は、判断で選ぶものではなく、他の何をするにも
-			// 先に済ませる必要があるもの。空振りが続いた直後は spinning が
-			// 立って猶予(MIN_UNINTERRUPTED_MS)が外れるので、そこを通り抜けて
-			// 乗り換えが通ってしまう。実測、登り始めて9秒で
-			// exploring.explore_land に切り替わり、以後ずっと地下にいた。
-			const taskLocked =
-				Date.now() < this.taskLockUntil &&
-				this.currentTaskName === this.taskLockName &&
-				!isSameTask &&
-				// 人に頼まれたことは通す。地下から出られなくても、返事はする。
-				!wasHumanRequest;
-			if (taskLocked) {
-				this.log(
-					`${this.currentTaskName} を続けます（前提条件のため ${foundSkillName} への切り替えは保留）`,
-				);
-				return;
-			}
+			// 「地上へ戻る」のような前提条件は、LLM の乗り換えを握りつぶして
+			// 守るのではなく、生存側が自分で回すようになった(surface ルール)。
+			// 握りつぶす形は実測で1セッション232〜897回に達し、掴んでいる
+			// goto.surface が壊れていても3分守り続ける罠になっていた。
 
 			const spinning = this.instantRepeats >= SPIN_LIMIT;
 			const tooEarlyToSwitch =
@@ -3092,6 +3235,8 @@ export class MinecraftAgent {
 	 */
 	/** 直前に書いた明るさ。値が動いたときだけ書く。 */
 	private lastLoggedLight: number | null | undefined = undefined;
+	/** 最後にログへ出した持ち物。変わったときだけ出す。 */
+	private lastLoggedInventory = "";
 	/** 直前に書いた時刻。値が細かく揺れても書き続けないようにする。 */
 	private lastLightLogAt = 0;
 
@@ -3123,39 +3268,273 @@ export class MinecraftAgent {
 		this.log(`[明るさ] ${light} — ${meaning} Y=${y} 時刻=${state.timeOfDay}`);
 	}
 
-	private async reflexSurvival(signal: AbortSignal): Promise<void> {
+	/**
+	 * 持ち物が変わったらログに出す。
+	 *
+	 * 「剣を持っているのか、材料が無いだけなのか」を後から切り分けられない
+	 * ログが続いた。crafting.weapon の「All combat equipment is already at
+	 * the highest possible quality」は、最良の装備を持っているときと、
+	 * 素材が無くて作れないときの両方で出る。実測 2026-09-17 00:48、
+	 * どちらなのかログからは判別できなかった。持ち物は判断の根拠そのものなので、
+	 * 変化だけでも残す。
+	 */
+	private noteInventory(): void {
+		const state = this.driver.getState();
+		if (!state.isReady) return;
+		const items = this.driver.inventory.items();
+		const worn = this.driver.inventory
+			.armor()
+			.filter((a) => a !== null)
+			.map((a) => a?.name)
+			.join(", ");
+		const summary = items.map((i) => `${i.name} x${i.count}`).join(", ") || "空";
+		const line = worn ? `${summary}（着用: ${worn}）` : summary;
+		if (line === this.lastLoggedInventory) return;
+		this.lastLoggedInventory = line;
+		this.log(`[持ち物] ${line}`);
+	}
+
+	/**
+	 * 生存のための手入れと判断。戻り値が true の間はスキル層を動かさない。
+	 *
+	 * 上半分は手入れで、拒否権も共有フラグも持たないので順不同でよい。
+	 * 下半分の判断は裁定者が1つだけ選ぶ。以前はここに15個の反射が並び、
+	 * それぞれが true を返して他を黙らせ、`sheltering` や `currentTaskName`
+	 * を書き換えて隣に合図していた。その噛み合わせが実測で4時間26分の
+	 * 停止を生んでいる(2026-09-17 07:10〜11:36)。
+	 */
+	private async reflexSurvival(signal: AbortSignal): Promise<boolean> {
 		try {
 			this.noteDarkness();
-			await this.recoverDeathLootIfAlive();
-			this.returnToSurfaceIfBuried();
+			this.noteInventory();
 			await this.wearBestArmor();
 			await this.equipBestWeapon();
-			// 食事は籠るより先。籠っても満腹度が足りなければ体力は戻らないので、
-			// 先に食べておかないと「隠れたのに回復しない」まま夜を越すことになる。
-			await this.eatIfHungry(signal);
-			// 丸腰で木があるなら、まず剣。籠るより前に置くのは、
-			// 剣さえあれば籠らずに済む場面が多いため。
-			this.craftSwordIfUnarmed();
-			// 通りすがりに、自分が掘った跡を1つ埋める。
-			// 出向いて直す building.repair だけでは追いつかない。
-			await this.refillDugHoles(signal);
 			// 見かけた建物を控える。地上に出たとき、向かう先として使う。
 			await this.noteLandmarksNearby();
 			// 昼のうちにベッドを叩いてリスポーン地点を移しておく。
-			// 死んでからでは間に合わない。
 			await this.registerSpawnAtBed(signal);
 			// 待たせず自分から動く。await しない: LLM 呼び出しを含むので、
-			// ここで待つと反射ループそのものが詰まる。結果は後続の反射に
-			// 依存しないので、投げっぱなしで構わない。
+			// ここで待つと反射ループそのものが詰まる。
 			this.maybeGreetNearbyPlayer();
-			// 寝るのが先。潜って夜をやり過ごすと、他の人は朝を迎えられない。
-			if (await this.sleepIfOthersSleeping(signal)) return;
-			if (await this.shelterAtNight(signal)) return;
-			await this.escapeIfBoxedIn(signal);
+
+			const snapshot = await this.buildSurvivalSnapshot();
+			const decision = await this.arbiter.tick(snapshot, this.survivalActions, signal);
+			this.metrics.noteTick(snapshot, decision.rule?.name ?? null);
+			this.metrics.reportIfDue(METRICS_REPORT_MS);
+			return decision.rule !== null;
 		} catch (e) {
 			// 反射行動で本来の行動を止めない。
 			if (!signal.aborted) this.log(`反射行動でつまずいた: ${e}`);
+			return false;
 		}
+	}
+
+	/**
+	 * 生存判断が見る世界の姿を撮る。
+	 *
+	 * driver を触るのはここだけ。以降の判断はこのコピーだけを見るので、
+	 * サーバーもボットも無しで試せる。
+	 */
+	private async buildSurvivalSnapshot(): Promise<SurvivalSnapshot> {
+		const state = this.driver.getState();
+		const pos = state.position;
+		const foot = { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) };
+		const distanceTo = (p: Position) => Math.hypot(p.x - pos.x, p.y - pos.y, p.z - pos.z);
+		const hostilesNear = this.driver.nearbyEntities(12).filter((e) => isHostileMob(e.name)).length;
+		const hostilesClose = this.driver.nearbyEntities(6).filter((e) => isHostileMob(e.name)).length;
+		const preyDistances = this.driver
+			.nearbyEntities(HUNT_RANGE)
+			.filter((e) => PREY_NAMES.has(e.name))
+			.map((e) => distanceTo(e.position))
+			.sort((a, b) => a - b);
+		const items = this.driver.inventory.items();
+		const names = items.map((i) => i.name);
+		const planks = items
+			.filter((i) => i.name.endsWith("_planks"))
+			.reduce((sum, i) => sum + i.count, 0);
+		const logs = items
+			.filter(
+				(i) => i.name.endsWith("_log") || i.name.endsWith("_stem") || i.name.endsWith("_wood"),
+			)
+			.reduce((sum, i) => sum + i.count, 0);
+		// 着ている防具は items() に出てこない。持ち物だけを見ると、
+		// フル装備でも「丸腰」と判定されて毎晩潜ることになる。
+		const armored =
+			this.driver.inventory.armor().some((i) => i !== null) ||
+			names.some((n) => ARMOR_SUFFIXES.some((suf) => n.endsWith(suf)));
+		const point = this.getDeathPoint();
+		return {
+			at: Date.now(),
+			ready: state.isReady,
+			health: state.health,
+			food: state.food,
+			foot,
+			timeOfDay: state.timeOfDay,
+			night: isNightTime(state.timeOfDay),
+			hostilesNear,
+			hostilesClose,
+			preyDistance: preyDistances.length > 0 ? preyDistances[0] : null,
+			depthBelowSurface: await this.depthBelowSurface(),
+			solidAbove: this.solidAboveCount(foot),
+			boxedIn: this.isBoxedIn(foot),
+			sheltered: this.isSheltered(foot),
+			armed: this.hasWeapon(),
+			armored,
+			craftableWeapon: planks + logs * 4 >= 6,
+			edible: pickFood(names),
+			cookable: pickCookable(names),
+			inventoryCount: items.length,
+			recentDeaths: this.countRecentDeaths(),
+			deathPoint: point ? { ...point } : null,
+			homeDistance: this.spawnBed ? distanceTo(this.spawnBed) : null,
+			sleepRequested: Date.now() - this.othersSleepingAt <= SLEEP_REQUEST_TTL_MS,
+			humanRequestFresh: this.hasFreshHumanRequest(),
+		};
+	}
+
+	/**
+	 * ルールが使える操作。ここから先は世界を触ってよい。
+	 *
+	 * ルールは互いを黙らせる手段を持たないので、この一覧に「他をやめさせる」
+	 * 類の操作は置かない。
+	 */
+	private readonly survivalActions: SurvivalActions = {
+		log: (message: string) => this.log(message),
+		eat: (signal: AbortSignal) => this.eatNow(signal),
+		secureFood: (signal: AbortSignal) => this.runSurvivalSkill(secureFoodSkill, signal),
+		shelter: (signal: AbortSignal) => this.shelterNow(signal),
+		goToSurface: async (signal: AbortSignal) => {
+			await this.runSurvivalSkill(gotoSurfaceSkill, signal);
+		},
+		escapeBoxedIn: (signal: AbortSignal) => this.escapeIfBoxedIn(signal),
+		recoverLoot: (signal: AbortSignal) => this.recoverLootNow(signal),
+		sleep: (signal: AbortSignal) => this.sleepIfOthersSleeping(signal),
+		armSelf: async (signal: AbortSignal) => {
+			await this.runSurvivalSkill(craftWeaponSkill, signal);
+		},
+	};
+
+	/**
+	 * 生存側がスキルを1回動かす。
+	 *
+	 * 成否だけでなく「世界が変わったか」を見る。成功を返しても持ち物も位置も
+	 * 変わっていないなら空振りで、実測 2026-09-15 の crafting.weapon は
+	 * 材料が同じまま792回それを繰り返していた。空振りは計測に残し、
+	 * 思考にも覚え書きとして渡す。
+	 */
+	private async runSurvivalSkill(
+		skill: { name: string; handler: (a: any) => Promise<SkillResponse<any>> },
+		signal: AbortSignal,
+	): Promise<boolean> {
+		const before = snapshotInventory(this.driver);
+		const from = this.driver.getState().position;
+		const startedAt = Date.now();
+		let ok = false;
+		try {
+			const result = await skill.handler({ agent: this, signal, args: {} });
+			ok = result.success;
+			if (!ok) this.log(`[生存] ${skill.name} 失敗: ${result.summary}`);
+		} catch (e) {
+			if (!signal.aborted) this.log(`[生存] ${skill.name} 失敗: ${e}`);
+		}
+		const gained = gainedSince(this.driver, before);
+		const to = this.driver.getState().position;
+		const moved = Math.hypot(to.x - from.x, to.y - from.y, to.z - from.z);
+		const changed = totalGain(gained) > 0 || moved > 1;
+		this.metrics.noteSkill(skill.name, ok, changed, totalGain(gained), Date.now() - startedAt);
+		if (ok && !changed) {
+			this.noteStall(
+				`${skill.name} reported success but nothing changed (no items gained, no movement).`,
+			);
+		}
+		return ok;
+	}
+
+	/** 食べる。満腹度が実際に増えたときだけ true。 */
+	private async eatNow(signal: AbortSignal): Promise<boolean> {
+		const before = this.driver.getState().food;
+		const ate = await this.driver.eat(signal);
+		const after = this.driver.getState().food;
+		if (!ate || after <= before) return false;
+		this.noteMeal(before, after);
+		this.log(`[生存] 食事をとった (満腹度 ${before} → ${after})`);
+		return true;
+	}
+
+	/** いまの計測をまとめて返す。採点(scenario.ts)が読む。 */
+	public metricsSummary() {
+		return this.metrics.summary();
+	}
+
+	/** 食事を計測に残す。スキル側からも呼ぶ。 */
+	public noteMeal(before: number, after: number): void {
+		this.metrics.noteMeal(before, after);
+	}
+
+	/**
+	 * 退く。寝床があれば戻り、無ければその場に潜る。
+	 *
+	 * 「いつ退くか」はルール表が決めるので、ここは行動だけを持つ。
+	 * 既に潜れているなら何もしない。ここで掘ると毎晩1マスずつ沈み、
+	 * 実測では Y=66 から Y=39 まで下がっていた。
+	 */
+	private async shelterNow(signal: AbortSignal): Promise<void> {
+		if (await this.retreatToHome(signal)) return;
+		const pos = this.driver.getState().position;
+		const foot = { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) };
+		if (this.isSheltered(foot) || this.solidAboveCount(foot) >= BURIED_THICKNESS) return;
+		// 掘り進み続けないための歯止め。ただし敵が目の前にいるときは待たない。
+		const threatened = this.driver
+			.nearbyEntities(HOME_THREAT_RADIUS)
+			.some((e) => isHostileMob(e.name));
+		if (!threatened && Date.now() - this.lastBurrowAt < BURROW_COOLDOWN_MS) return;
+		this.lastBurrowAt = Date.now();
+		await this.burrow(signal);
+	}
+
+	/** 落とし物を取りに行く。割に合わないと分かった時点で諦める。 */
+	private async recoverLootNow(signal: AbortSignal): Promise<void> {
+		const point = this.getDeathPoint();
+		if (!point) return;
+		if (this.isNearRecentDeath(point)) {
+			this.log("[生存] 落とし物はさっき殺された場所にある。近づかない");
+			this.clearDeathPoint();
+			return;
+		}
+		const depth = this.driver.getState().position.y - point.y;
+		if (!this.hasWeapon() && depth > UNARMED_RECOVERY_MAX_DEPTH) {
+			this.log(`[生存] 落とし物は ${Math.round(depth)} マス下。丸腰では取りに行かない`);
+			this.clearDeathPoint();
+			return;
+		}
+		const attempts = this.deathPoint?.attempts ?? 0;
+		if (attempts >= RECOVERY_ATTEMPT_LIMIT) {
+			this.log(`[生存] 落とし物の回収を ${attempts} 回試した。諦める`);
+			this.clearDeathPoint();
+			return;
+		}
+		const ok = await this.runSurvivalSkill(gotoDeathPointSkill, signal);
+		// 数えるのは「試した回数」。担当している間ずっと数えると数周で
+		// 上限に達してしまうので、失敗した回だけ数える。
+		if (!ok && this.deathPoint) this.deathPoint.attempts = attempts + 1;
+	}
+
+	/** 四方が塞がっていて歩いて出られないか。 */
+	private isBoxedIn(foot: Position): boolean {
+		const open = (dx: number, dz: number) => {
+			const f = this.driver.world.blockAt({ x: foot.x + dx, y: foot.y, z: foot.z + dz });
+			const h = this.driver.world.blockAt({ x: foot.x + dx, y: foot.y + 1, z: foot.z + dz });
+			if (f === null || h === null) return true;
+			return f.name === "air" && h.name === "air";
+		};
+		return !BOX_DIRECTIONS.some((d) => open(d.x, d.z));
+	}
+
+	/** 直近の窓で死んだ回数。 */
+	private countRecentDeaths(): number {
+		const cutoff = Date.now() - DEATH_STORM_WINDOW_MS;
+		this.recentDeaths = this.recentDeaths.filter((t) => t >= cutoff);
+		return this.recentDeaths.length;
 	}
 
 	/**
@@ -3223,6 +3602,12 @@ export class MinecraftAgent {
 				return;
 			}
 
+			// 渡す約束をしたのに渡す物が無いなら、依頼として積まない。
+			// プロンプト側でも止めているが、言い回しは色々あるのでここでも見る。
+			if (result.request && result.request.includes("渡") && this.givableItems().length === 0) {
+				this.log(`[取り下げ] 渡す物が無いので約束にしない: ${result.request}`);
+				return;
+			}
 			if (result.request) {
 				this.pendingRequest = {
 					text: result.request,
@@ -3244,183 +3629,54 @@ export class MinecraftAgent {
 	}
 
 	/**
-	 * 生き返っていて落とし物が残っているなら、取りに行く手配をする。
+	 * 自分の列の地表まで、あと何マス上か。分からなければ null。
 	 *
-	 * サーバーが復帰の通知を返さないことがあるので、イベントに頼らず
-	 * 「死亡地点を控えている・体力がある」で判断する。
+	 * 頭上のブロック数(solidAboveCount)では、天井の高い洞窟と地上を区別
+	 * できない。BlockView は半径16の立方体しか持たないので、天井がその外に
+	 * 出ると「空が見えている」と読めてしまう。列を辿る計算はチャンクを持って
+	 * いるサイドカーにやらせる（goto.surface と同じ surfaceScan）。
+	 *
+	 * 反射は毎周回るのに対しこれはサイドカーへの往復なので、短い間だけ控える。
 	 */
 	/**
-	 * 腹が減っていて食べ物があるなら食べる。
+	 * 直近に測った地表までの高さ。測っていない・古いなら null。
 	 *
-	 * 長いあいだ、食べる手段そのものが無かった。満腹度は知覚まで通っていて
-	 * 思考プロンプトに「Hunger: n」と出るのに、減ったものを戻す口がどこにも
-	 * 無い。満腹度が18を切ると体力が自然回復しなくなるため、狩って焼いた肉を
-	 * 持ったまま回復できず、削られては死ぬ、を繰り返していた。
-	 *
-	 * LLM に選ばせない。腹が減ったら食べるのは判断ではなく前提で、
-	 * 30秒に1回の思考を待つ類のものでもない。
+	 * skillIsWorthOffering のような同期の判断から使う。測り直しはしない。
+	 * 反射ループが毎周 depthBelowSurface() を呼ぶので、値は数秒以内に保たれる。
 	 */
-	private async eatIfHungry(signal: AbortSignal): Promise<void> {
-		const state = this.driver.getState();
-		if (!state.isReady || state.health <= 0) return;
-		if (state.food >= EAT_BELOW_FOOD) return;
-		// 食べている間は動けない。敵が目の前にいるなら、まず逃げる方が先。
-		if (this.driver.nearbyEntities(6).some((e) => isHostileMob(e.name))) return;
-		if (!pickFood(this.driver.inventory.items().map((i) => i.name))) return;
-
-		const ate = await this.driver.eat(signal);
-		if (ate) {
-			this.log(`[反射] 食事をとった (満腹度 ${state.food} → ${this.driver.getState().food})`);
-		}
+	private lastKnownDepth(): number | null {
+		const probe = this.surfaceProbe;
+		if (!probe) return null;
+		if (Date.now() - probe.at > SURFACE_PROBE_TTL_MS * 4) return null;
+		return probe.depth;
 	}
 
-	/**
-	 * 丸腰で、木が手元にあるなら、剣を作ることを最優先にする。
-	 *
-	 * 「木が手に入ったら剣を最優先」はプロンプトの AGENT RULES に文章として
-	 * 書いてあるだけで、実際には守られていなかった。本番で spruce_log を5本
-	 * 持ち、素手のまま exploring.explore_land を3回続けて選び、その間に
-	 * ゾンビに繰り返し殺されている。板材6枚あれば剣は作れるので、材料は
-	 * 足りていた。
-	 *
-	 * しかも explore_land は「目的地に着いた」ので毎回 Success を返す。
-	 * 失敗が続いたときの停滞判定は成功では発火しないため、何も得ない行動を
-	 * 成功として無限に繰り返せてしまう。だからここは判断に任せず前提として置く。
-	 *
-	 * 敵が近いときはやらない。クラフトの最中は無防備で、作りかけで殺されると
-	 * 材料ごと落とすことになる。その場合は籠る側の反射に任せる。
-	 */
-	private craftSwordIfUnarmed(): void {
-		if (!this.skills.has(craftWeaponSkill.name)) return;
-		if (this.currentTaskName === craftWeaponSkill.name) return;
-		// 既に何か作っている最中なら邪魔しない。
-		if (this.currentTaskName.startsWith("crafting.")) return;
-		if (this.hasWeapon()) return;
-
+	private async depthBelowSurface(): Promise<number | null> {
+		const now = Date.now();
+		if (this.surfaceProbe && now - this.surfaceProbe.at < SURFACE_PROBE_TTL_MS) {
+			return this.surfaceProbe.depth;
+		}
 		const state = this.driver.getState();
-		if (!state.isReady || state.health <= 0) return;
-		if (this.driver.nearbyEntities(10).some((e) => isHostileMob(e.name))) return;
-
-		// 剣2枚＋作業台4枚で板材6枚。原木1本が板材4枚になる。
-		const items = this.driver.inventory.items();
-		const planks = items
-			.filter((i) => i.name.endsWith("_planks"))
-			.reduce((sum, i) => sum + i.count, 0);
-		const logs = items
-			.filter(
-				(i) => i.name.endsWith("_log") || i.name.endsWith("_stem") || i.name.endsWith("_wood"),
-			)
-			.reduce((sum, i) => sum + i.count, 0);
-		if (planks + logs * 4 < 6) return;
-
-		this.log("[反射] 丸腰で木がある。剣を作る");
-		this.currentTaskName = craftWeaponSkill.name;
-		this.currentTaskSince = Date.now();
-		this.instantRepeats = 0;
-	}
-
-	private async recoverDeathLootIfAlive(): Promise<void> {
-		const point = this.getDeathPoint();
-		if (!point) return;
-		const state = this.driver.getState();
-		if (state.health <= 0) return;
-		// 夜は取りに行かない。落とし物があるのは、たった今殺された場所で、
-		// 殺した相手はまだそこにいる。実測 01:37〜01:40 の死亡はほとんどが
-		// この往復の最中で、拾っては落とすを繰り返していた。
-		if (isNightTime(state.timeOfDay)) return;
-		// 死に続けているなら、回収より止まる方が先。
-		if (this.isDyingRepeatedly()) return;
-		if (this.currentTaskName === gotoDeathPointSkill.name) return;
-		if (!this.skills.has(gotoDeathPointSkill.name)) return;
-
-		// 危険判定は「自分の周り」で見る。
-		//
-		// 元は nearbyEntities(24) の中から「死亡地点の8m以内にいるもの」を
-		// 探していた。復帰地点は死亡地点から離れているので、自分の24m以内に
-		// 死亡地点の近くの敵が入ることはまず無く、この歯止めは事実上一度も
-		// 発火していなかった。丸腰のまま、さっき殺された穴へまっすぐ戻る。
-		if (this.driver.nearbyEntities(16).some((e) => isHostileMob(e.name))) return;
-
-		// 丸腰で深いところへは取りに行かない。
-		//
-		// 落とし物は洞窟の底にあることが多い。暗くて mob が湧くので、素手で
-		// 降りれば同じ死に方をして、拾った物ごとまた落とす。往復するほど損を
-		// 広げる。装備があるなら行ってよい。
-		const depth = state.position.y - point.y;
-		if (!this.hasWeapon() && depth > UNARMED_RECOVERY_MAX_DEPTH) {
-			this.log(`[反射] 落とし物は ${Math.round(depth)} マス下。丸腰では取りに行かない`);
-			this.clearDeathPoint();
-			return;
+		if (!state.isReady) return null;
+		const myX = Math.floor(state.position.x);
+		const myY = Math.floor(state.position.y);
+		const myZ = Math.floor(state.position.z);
+		let depth: number | null = null;
+		try {
+			const columns = await this.driver.world.surfaceScan(SURFACE_PROBE_RADIUS);
+			// 自分の列が返るとは限らない。読めていない列は返らないので、
+			// 見つからなければ一番近い列で代用する。
+			const mine =
+				columns.find((c) => c.x === myX && c.z === myZ) ??
+				columns
+					.slice()
+					.sort((a, b) => Math.hypot(a.x - myX, a.z - myZ) - Math.hypot(b.x - myX, b.z - myZ))[0];
+			if (mine) depth = mine.y - myY;
+		} catch {
+			// 数えられないなら「分からない」を返す。地上と決めつけない。
 		}
-
-		// 同じ場所へ何度も通わない。
-		//
-		// 1回で拾えなかったものは、たいてい経路が無いか、殺された相手がまだ
-		// そこにいる。落とし物は5分で消えるので、通い続けても取り返せない。
-		const attempts = (this.deathPoint?.attempts ?? 0) + 1;
-		if (attempts > RECOVERY_ATTEMPT_LIMIT) {
-			this.log(`[反射] 落とし物の回収を ${attempts - 1} 回試した。諦める`);
-			this.clearDeathPoint();
-			return;
-		}
-		if (this.deathPoint) this.deathPoint.attempts = attempts;
-
-		this.log(`[反射] 落とし物を取りに戻る（${attempts}回目）`);
-		this.currentTaskName = gotoDeathPointSkill.name;
-		this.currentTaskSince = Date.now();
-		this.instantRepeats = 0;
-	}
-
-	/**
-	 * 地下に埋まっているなら、地上へ戻ることを最優先にする。
-	 *
-	 * 木も動物も地上にある。地下で探索や狩りを繰り返しても永久に何も得られ
-	 * ない。実測で Y=34 に落ちたまま10分間、exploring.explore_land 63回と
-	 * collecting.hunting 23回を空振りし続けた。どちらもその場では成立しない。
-	 *
-	 * これは判断ではなく前提条件なので、LLM に選ばせない。ただし採集中は
-	 * 邪魔しない。地下を掘っているのは正しい行動でありうる。
-	 */
-	private returnToSurfaceIfBuried(): void {
-		if (!this.skills.has(gotoSurfaceSkill.name)) return;
-		if (this.currentTaskName === gotoSurfaceSkill.name) return;
-		// 自分で潜ったのなら、それは「埋まっている」ではない。掘り返さない。
-		// この反射は shelterAtNight より前に回るので、これが無いと
-		// 「潜る→掘り返す」を毎周くり返し、夜の地上に出っぱなしになる。
-		if (this.sheltering) return;
-		// 採集や設置の最中は割り込まない。地下にいるのが目的のことがある。
-		if (this.currentTaskName.startsWith("collecting.")) return;
-		if (this.currentTaskName.startsWith("building.")) return;
-
-		const state = this.driver.getState();
-		const foot = {
-			x: Math.floor(state.position.x),
-			y: Math.floor(state.position.y),
-			z: Math.floor(state.position.z),
-		};
-		// 頭上に固いものが「何枚あるか」で見る。1枚あるだけで埋まっている
-		// ことにすると、木の下や庇の下でも発動する。実測で goto.surface が
-		// 「もう地上にいる」と即答するのに、この判定だけ埋まっていると言い、
-		// 10分に54回そのスキルを掴まされていた。
-		if (this.solidAboveCount(foot) < BURIED_THICKNESS) {
-			// 出られた。掴んでいた行動を手放してよい。
-			if (this.taskLockName === gotoSurfaceSkill.name) {
-				this.taskLockUntil = 0;
-				this.taskLockName = "";
-			}
-			return;
-		}
-
-		// 既に地上へ戻る行動を掴んでいるなら、言い直さない。
-		if (this.currentTaskName !== gotoSurfaceSkill.name) {
-			this.log("[反射] 地下に埋まっている。地上へ戻る");
-			this.currentTaskName = gotoSurfaceSkill.name;
-			this.currentTaskSince = Date.now();
-			this.instantRepeats = 0;
-		}
-		// 登り切るまで手放さない。
-		this.taskLockUntil = Date.now() + BURIED_TASK_LOCK_MS;
-		this.taskLockName = gotoSurfaceSkill.name;
+		this.surfaceProbe = { at: now, depth };
+		return depth;
 	}
 
 	/**
@@ -3437,30 +3693,6 @@ export class MinecraftAgent {
 			if (above.name !== "air") solidAbove++;
 		}
 		return solidAbove;
-	}
-
-	/**
-	 * 夜、丸腰なら潜ってやり過ごす。
-	 *
-	 * 8分で13回死に、大半が death.attack.mob だった。復帰しては即座に殺され、
-	 * 集めた物も作った道具もその都度消える。武器も防具も無いうちに夜の地上を
-	 * 歩き回るのは、進むどころか積み上げたものを失う行為でしかない。
-	 *
-	 * 逃走と反撃はサイドカーが毎tick行うが、あれは目の前の敵をしのぐだけで、
-	 * 夜通し追われ続ける状況は変えられない。こちらは「そもそも出歩かない」
-	 * 判断で、頻度も低いのでこの層でよい。
-	 *
-	 * 戻り値が true なら、この周の他の反射は行わない。
-	 */
-	private async shelterAtNight(signal: AbortSignal): Promise<boolean> {
-		// 「今わざと潜っている」ことを覚えておく。これが無いと
-		// returnToSurfaceIfBuried が、潜ったばかりの穴を「埋まっている」と
-		// 読んで掘り返す。実測で 05:00:16 に潜り、30秒後に地上へ戻され、
-		// 05:05:47 には同じ秒に両方が発火していた。夜通しこれを往復して
-		// 地上に出続け、mob に86回殺されている。
-		const sheltering = await this.decideShelter(signal);
-		this.sheltering = sheltering;
-		return sheltering;
 	}
 
 	/**
@@ -3489,7 +3721,11 @@ export class MinecraftAgent {
 		// BlockView(半径16)ではなくサイドカーのチャンクを引く。同期版は
 		// maxDistance を黙って16に切り詰めるので、BED_SEARCH_RADIUS=48 と
 		// 書いてあっても16しか見ていなかった。
-		const beds = await this.driver.world.findBlocksFar(BED_NAMES, BED_SEARCH_RADIUS, BED_CANDIDATES);
+		const beds = await this.driver.world.findBlocksFar(
+			BED_NAMES,
+			BED_SEARCH_RADIUS,
+			BED_CANDIDATES,
+		);
 		const bed = this.pickReachableBed(beds);
 		if (!bed) {
 			// 無いものは探し直しても無い。毎周探して報告し続けないよう、
@@ -3554,7 +3790,11 @@ export class MinecraftAgent {
 		// 見つかった場合も、届かなかった場合も、同じだけ間を置けばよい。
 		this.lastSpawnBedAt = Date.now();
 
-		const beds = await this.driver.world.findBlocksFar(BED_NAMES, BED_SEARCH_RADIUS, BED_CANDIDATES);
+		const beds = await this.driver.world.findBlocksFar(
+			BED_NAMES,
+			BED_SEARCH_RADIUS,
+			BED_CANDIDATES,
+		);
 		const bed = this.pickReachableBed(beds);
 		if (!bed) return;
 
@@ -3644,106 +3884,18 @@ export class MinecraftAgent {
 	 */
 	public getKnownLandmarks(): { position: Position; name: string }[] {
 		const here = this.driver.getState().position;
-		return this.knownLandmarks
-			.slice()
-			.sort(
-				(a, b) =>
-					Math.hypot(a.position.x - here.x, a.position.z - here.z) -
-					Math.hypot(b.position.x - here.x, b.position.z - here.z),
-			)
-			.map((l) => ({ position: l.position, name: l.name }));
-	}
-
-	/**
-	 * 壊したブロックを控える。driver.dig() から呼ばれる。
-	 *
-	 * 覚えていないものは埋められない。掘る経路は1本なので、ここに集めれば
-	 * 取りこぼさない。同じマスを何度も掘ったときは最初の1件だけ残す
-	 * （最初に壊したものが「元の姿」なので、上書きすると戻す先が変わる）。
-	 */
-	public noteDug(position: Position, name: string): void {
-		const key = (p: Position) => `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}`;
-		const k = key(position);
-		if (this.dugLedger.some((d) => key(d.position) === k)) return;
-		// 木や葉は「荒らし」の範囲外。伐採は普通の営みで、苗も植えている。
-		// 地形(石・土・砂利など)を抜いた跡だけを埋め戻しの対象にする。
-		if (name.endsWith("_log") || name.endsWith("_leaves") || name.endsWith("_wood")) return;
-
-		this.dugLedger.push({
-			position: {
-				x: Math.floor(position.x),
-				y: Math.floor(position.y),
-				z: Math.floor(position.z),
-			},
-			name,
-			at: Date.now(),
-		});
-		if (this.dugLedger.length > DUG_LEDGER_LIMIT) {
-			this.dugLedger.splice(0, this.dugLedger.length - DUG_LEDGER_LIMIT);
-		}
-		this.saveDugLedger();
-	}
-
-	/** 埋まった(あるいは誰かが埋めた)ので台帳から落とす。 */
-	public clearDugHole(position: Position): void {
-		const k = `${Math.floor(position.x)},${Math.floor(position.y)},${Math.floor(position.z)}`;
-		this.dugLedger = this.dugLedger.filter(
-			(d) => `${d.position.x},${d.position.y},${d.position.z}` !== k,
+		return (
+			this.knownLandmarks
+				.slice()
+				// 二度殺された区域にある建物は行き先にしない。
+				.filter((l) => !this.isNearRecentDeath(l.position))
+				.sort(
+					(a, b) =>
+						Math.hypot(a.position.x - here.x, a.position.z - here.z) -
+						Math.hypot(b.position.x - here.x, b.position.z - here.z),
+				)
+				.map((l) => ({ position: l.position, name: l.name }))
 		);
-		this.saveDugLedger();
-	}
-
-	/**
-	 * まだ埋めていない跡を、近い順に返す。
-	 *
-	 * 借金の総額なので、掘ったばかりのものも含める。思考プロンプトの
-	 * 件数表示はこちらを使う。実際に埋めてよいものは getFillableHoles()。
-	 */
-	public getDugHoles(): { position: Position; name: string }[] {
-		const here = this.driver.getState().position;
-		return this.dugLedger
-			.slice()
-			.sort(
-				(a, b) =>
-					Math.hypot(a.position.x - here.x, a.position.y - here.y, a.position.z - here.z) -
-					Math.hypot(b.position.x - here.x, b.position.y - here.y, b.position.z - here.z),
-			)
-			.map((d) => ({ position: d.position, name: d.name }));
-	}
-
-	/**
-	 * 今埋めてよい跡だけを返す。
-	 *
-	 * 掘りたてを除く。登るために刻んだ階段は「今掘った跡」なので、これが
-	 * 無いと踏んだ段を自分で塞ぎ、また掘り、を繰り返して永久に上がれない。
-	 */
-	public getFillableHoles(): { position: Position; name: string }[] {
-		const fresh = new Set(
-			this.dugLedger
-				.filter((d) => Date.now() - d.at < REFILL_GRACE_MS)
-				.map((d) => `${d.position.x},${d.position.y},${d.position.z}`),
-		);
-		return this.getDugHoles().filter(
-			(h) => !fresh.has(`${h.position.x},${h.position.y},${h.position.z}`),
-		);
-	}
-
-	/**
-	 * 台帳をディスクへ書く。
-	 *
-	 * 再起動で忘れてよいものではない。忘れれば穴は残ったままで、
-	 * こちらは「やっていない」ことになる。書き込みは間引く。
-	 */
-	private saveDugLedger(): void {
-		if (Date.now() - this.dugLedgerSavedAt < 10_000) return;
-		this.dugLedgerSavedAt = Date.now();
-		try {
-			const file = path.join(process.cwd(), DUG_LEDGER_FILE);
-			fs.mkdirSync(path.dirname(file), { recursive: true });
-			fs.writeFileSync(file, JSON.stringify(this.dugLedger));
-		} catch {
-			// 書けなくても行動は続ける。控えが消えるだけ。
-		}
 	}
 
 	/** 寝床の位置をディスクへ書く。再起動しても帰る場所を忘れないため。 */
@@ -3765,7 +3917,15 @@ export class MinecraftAgent {
 		const configured = this.configuredHome();
 		if (configured) {
 			this.spawnBed = configured;
-			this.log("[記録] 寝床は指定された (" + configured.x + ", " + configured.y + ", " + configured.z + ")");
+			this.log(
+				"[記録] 寝床は指定された (" +
+					configured.x +
+					", " +
+					configured.y +
+					", " +
+					configured.z +
+					")",
+			);
 			return;
 		}
 		try {
@@ -3782,133 +3942,60 @@ export class MinecraftAgent {
 		}
 	}
 
-	/** 起動時に台帳を読み戻す。前回までに掘った跡を引き継ぐ。 */
-	private loadDugLedger(): void {
-		try {
-			const file = path.join(process.cwd(), DUG_LEDGER_FILE);
-			if (!fs.existsSync(file)) return;
-			const raw = JSON.parse(fs.readFileSync(file, "utf8"));
-			if (!Array.isArray(raw)) return;
-			this.dugLedger = raw
-				.filter((d: any) => d?.position && typeof d.name === "string")
-				.slice(-DUG_LEDGER_LIMIT);
-			if (this.dugLedger.length > 0) {
-				this.log(`[記録] 埋め戻していない跡が ${this.dugLedger.length} 件ある`);
+	/**
+	 * 死んだ場所を控える。近い場所で死んだら同じ区域として数える。
+	 */
+	private noteDeathPlace(pos: Position): void {
+		const now = Date.now();
+		this.deathZones = this.deathZones.filter((z) => now - z.at < DEATH_ZONE_TTL_MS);
+		const near = this.deathZones.find(
+			(z) => Math.hypot(z.pos.x - pos.x, z.pos.y - pos.y, z.pos.z - pos.z) <= DEATH_ZONE_RADIUS,
+		);
+		if (near) {
+			near.count++;
+			near.at = now;
+			if (near.count === DEATH_ZONE_STRIKES) {
+				this.log(
+					`[記録] (${near.pos.x.toFixed(0)}, ${near.pos.y.toFixed(0)}, ${near.pos.z.toFixed(0)}) 付近で ${near.count} 回死んだ。しばらく近づかない`,
+				);
 			}
-		} catch {
-			// 壊れていたら無かったことにする。
+			return;
 		}
+		this.deathZones.push({ pos: { ...pos }, at: now, count: 1 });
+		if (this.deathZones.length > DEATH_ZONE_LIMIT) this.deathZones.shift();
 	}
 
 	/**
-	 * 手の届く範囲にある掘った跡を、ついでに埋める。
+	 * そこは短い間に二度以上死んだ場所の近くか。
 	 *
-	 * 専用のスキル(building.repair)で出向いて埋めるだけでは追いつかない。
-	 * 通りすがりに1つずつでも戻していれば、荒れ方は目に見えて変わる。
-	 * 持っている物で埋める。無ければ何もしない（埋めるために別の場所を
-	 * 掘ったら本末転倒）。
+	 * 行き先を選ぶ側(人工物・落とし物)から見る。近づかなければ、そこにいる
+	 * 相手が何であっても巻き込まれない。
 	 */
-	private async refillDugHoles(signal: AbortSignal): Promise<void> {
-		if (this.dugLedger.length === 0) return;
-		const state = this.driver.getState();
-		if (!state.isReady || state.health <= 0) return;
-		// 敵が近いときに穴埋めを始めない。殴られながら置いても死ぬだけ。
-		if (this.driver.nearbyEntities(10).some((e) => isHostileMob(e.name))) return;
-
-		const here = state.position;
-		for (const hole of this.getFillableHoles()) {
-			const d = Math.hypot(
-				hole.position.x - here.x,
-				hole.position.y - here.y,
-				hole.position.z - here.z,
-			);
-			if (d > REFILL_REACH) break; // 近い順なので、遠くなったら終わり
-			// 自分が今いるマスは埋めない。埋まると窒息する。
-			const foot = {
-				x: Math.floor(here.x),
-				y: Math.floor(here.y),
-				z: Math.floor(here.z),
-			};
-			if (
-				hole.position.x === foot.x &&
-				hole.position.z === foot.z &&
-				(hole.position.y === foot.y || hole.position.y === foot.y + 1)
-			) {
-				continue;
-			}
-			const now = this.driver.world.blockAt(hole.position);
-			if (now === null) continue;
-			if (now.name !== "air") {
-				// もう埋まっている。誰かが直したか、水が流れ込んだ。
-				this.clearDugHole(hole.position);
-				continue;
-			}
-			if (await this.fillHoleAt(signal, hole.position, hole.name)) return;
-		}
-	}
-
-	/**
-	 * 1マス埋める。埋められたら true。
-	 *
-	 * 元と同じブロックを優先し、無ければありふれた物で代える。
-	 * 穴を残すより、違う物でも塞がっている方がましだと判断している。
-	 */
-	public async fillHoleAt(
-		signal: AbortSignal,
-		target: Position,
-		originalName: string,
-	): Promise<boolean> {
-		// 自分がいるマスは埋めない。埋めれば窒息する。
-		//
-		// 通りすがりの埋め戻し(refillDugHoles)側にも同じ判定があるが、
-		// スキル(building.repair)からも直接呼ぶので、ここにも置く。
-		// 片方にしか無いと、呼び口が増えたときに静かに抜ける。
-		const here = this.driver.getState().position;
-		const foot = { x: Math.floor(here.x), y: Math.floor(here.y), z: Math.floor(here.z) };
-		if (
-			target.x === foot.x &&
-			target.z === foot.z &&
-			(target.y === foot.y || target.y === foot.y + 1)
-		) {
-			return false;
-		}
-
-		const items = this.driver.inventory.items();
-		const pick =
-			items.find((i) => i.name === originalName) ??
-			items.find((i) => FILLER_BLOCKS.includes(i.name));
-		if (!pick) return false;
-
-		// 置くには足場になる隣接ブロックが要る。面は隣から穴へ向く向き。
-		const sides: Position[] = [
-			{ x: 1, y: 0, z: 0 },
-			{ x: -1, y: 0, z: 0 },
-			{ x: 0, y: 0, z: 1 },
-			{ x: 0, y: 0, z: -1 },
-			{ x: 0, y: -1, z: 0 },
-			{ x: 0, y: 1, z: 0 },
-		];
-		for (const s of sides) {
-			const ref = { x: target.x + s.x, y: target.y + s.y, z: target.z + s.z };
-			const refBlock = this.driver.world.blockAt(ref);
-			if (!refBlock?.solid) continue;
-			try {
-				await this.driver.equip(pick.name, "hand");
-				// face は ref から見て target のある向き。
-				await this.driver.placeBlock(signal, ref, { x: -s.x, y: -s.y, z: -s.z });
-				this.log(`[奉公] 掘った跡を埋めた (${target.x}, ${target.y}, ${target.z}) ${pick.name}`);
-				this.clearDugHole(target);
-				return true;
-			} catch {
-				// この面は駄目だった。次を試す。
-			}
-		}
-		return false;
+	public isNearRecentDeath(pos: Position): boolean {
+		const now = Date.now();
+		return this.deathZones.some(
+			(z) =>
+				z.count >= DEATH_ZONE_STRIKES &&
+				now - z.at < DEATH_ZONE_TTL_MS &&
+				Math.hypot(z.pos.x - pos.x, z.pos.y - pos.y, z.pos.z - pos.z) <= DEATH_ZONE_RADIUS,
+		);
 	}
 
 	/** 死んだ時刻を控える。死にすぎていないかを見るために持つ。 */
 	private noteDeath(): void {
 		this.recentDeaths.push(Date.now());
+		this.metrics.noteDeath();
+		// 死んだら状況は作り直される。担当も持ち越さない。
+		this.arbiter.reset();
+		// 抜ける判断はここでする。潜る・寝床へ戻るといった手が全部
+		// 通らない場所で死に続けることがあり、その間ずっと死亡ログを
+		// 撒き続けることになる。
+		const cutoff = Date.now() - DEATH_STORM_WINDOW_MS;
+		const recent = this.recentDeaths.filter((t) => t >= cutoff).length;
+		if (recent >= DEATH_STORM_LEAVE_LIMIT) {
+			this.log(`[判断] ${DEATH_STORM_WINDOW_MS / 60_000}分で${recent}回死んだ。一度抜ける`);
+			this.onDeathStorm?.(recent);
+		}
 		if (this.recentDeaths.length > 32) this.recentDeaths.splice(0, this.recentDeaths.length - 32);
 	}
 
@@ -3920,84 +4007,7 @@ export class MinecraftAgent {
 	 * 死に続けているなら夜歩きをやめさせる根拠になる。
 	 */
 	private isDyingRepeatedly(): boolean {
-		const cutoff = Date.now() - DEATH_STORM_WINDOW_MS;
-		this.recentDeaths = this.recentDeaths.filter((t) => t >= cutoff);
-		return this.recentDeaths.length >= DEATH_STORM_LIMIT;
-	}
-
-	/** 潜るべきか判断し、必要なら実際に潜る。戻り値は「今潜っている扱いか」。 */
-	private async decideShelter(signal: AbortSignal): Promise<boolean> {
-		const state = this.driver.getState();
-		// 死んでいる間は何もしない。復帰の要求はサイドカーが出している。
-		if (state.health <= 0) return false;
-
-		const night = isNightTime(state.timeOfDay);
-		// 傷ついていて、しかも敵が近いときだけ退く。体力だけで判断すると、
-		// 回復しないまま延々と潜り直して何も進まなくなる。実測で HP1 のまま
-		// 18回潜っていた。潜っても満腹度が足りなければ回復しない。
-		// 満腹度が0では体力は戻らない。「回復を待つ」ための待機が、
-		// 食べ物を探しに行く手を塞ぐだけになる。実測 2026-09-13、
-		// 体力1・満腹度0のまま地下で11時間動けずにいた。
-		const hurt =
-			state.food > 0 &&
-			state.health <= SHELTER_HEALTH &&
-			this.driver.nearbyEntities(12).some((e) => isHostileMob(e.name));
-		// 装備が揃っていても、死に続けているなら出歩かせない。死亡ログは
-		// 死んだ本人ではなく、周りの全員のチャット欄を潰す。
-		const dying = this.isDyingRepeatedly();
-		if (!night && !hurt && !dying) return false;
-
-		// 頼まれた直後は出る。瀕死(hurt)のときだけは、頼まれごとより先に
-		// 死んでしまうので譲らない。
-		if (!hurt && this.hasFreshHumanRequest()) return false;
-
-		// 寝床があるなら、穴を掘るより先にそこへ戻る。
-		//
-		// 湧きつぶした安全な場所にベッドまで置いてもらっているのに、
-		// こちらはそれをリスポーン地点としか見ておらず、夜は外で
-		// その場を掘っていた。屋根のある寝床の方が、掘った穴より安全で、
-		// 掘った跡も残らない。傷の手当てだけなら近場で潜る方が早いので、
-		// 夜と「死に続けている」ときに限る。
-		if ((night || dying) && (await this.retreatToHome(signal))) return true;
-
-		const armed = this.hasWeapon();
-		// 着ている防具は items() に出てこない。持ち物だけを見ると、
-		// 直前の wearBestArmor() が着せたぶんが丸ごと消えて、
-		// フル装備でも「丸腰」と判定され毎晩潜ることになる。
-		const armored =
-			this.driver.inventory.armor().some((i) => i !== null) ||
-			this.driver.inventory.items().some((i) => ARMOR_SUFFIXES.some((suf) => i.name.endsWith(suf)));
-		// 傷ついているとき、死に続けているときは、装備の有無に関わらず退く。
-		if (!hurt && !dying && (armed || armored)) return false;
-
-		// 既に潜れているなら、そのまま待つ。
-		const pos = state.position;
-		const foot = { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) };
-		if (this.isSheltered(foot)) return true;
-		// 厚い岩の下にいるなら、それはもう隠れている。ここで掘ると
-		// 毎晩1マスずつ下へ沈むだけになる。実測、Y=66 から Y=39 まで
-		// 27ブロック下がっていた。
-		if (this.solidAboveCount(foot) >= BURIED_THICKNESS) return true;
-
-		// 掘り進み続けないための最後の歯止め。判定を読み違えても、
-		// 最悪この間隔で1マスしか掘れない。
-		//
-		// ただし敵が目の前にいるときは待たない。1分待つ間に殺される。
-		const threatened = this.driver
-			.nearbyEntities(HOME_THREAT_RADIUS)
-			.some((e) => isHostileMob(e.name));
-		if (!threatened && Date.now() - this.lastBurrowAt < BURROW_COOLDOWN_MS) return true;
-
-		this.log(
-			dying
-				? `[反射] ${DEATH_STORM_WINDOW_MS / 60_000}分で${this.recentDeaths.length}回死んだ。潜って止める`
-				: hurt
-					? `[反射] 体力 ${state.health}。潜って回復を待つ`
-					: "[反射] 夜で丸腰。潜ってやり過ごす",
-		);
-		this.lastBurrowAt = Date.now();
-		await this.burrow(signal);
-		return true;
+		return this.countRecentDeaths() >= DEATH_STORM_LIMIT;
 	}
 
 	/** 人から頼まれた直後か。自分から申し出たぶんは数えない。 */
@@ -4071,9 +4081,7 @@ export class MinecraftAgent {
 		if (Date.now() - this.lastHomeRetreatAt < HOME_RETREAT_COOLDOWN_MS) return true;
 		this.lastHomeRetreatAt = Date.now();
 
-		this.log(
-			`[反射] 寝床へ戻る (${home.x}, ${home.y}, ${home.z}) — ${Math.round(dist)}ブロック`,
-		);
+		this.log(`[反射] 寝床へ戻る (${home.x}, ${home.y}, ${home.z}) — ${Math.round(dist)}ブロック`);
 		try {
 			await this.driver.goto(signal, { kind: "near", position: home, distance: 2 });
 		} catch (e) {
@@ -4164,9 +4172,22 @@ export class MinecraftAgent {
 			}
 		}
 		this.log(
-			"[診断] 寝床(" + bed.x + "," + bed.y + "," + bed.z + ") の囲い: 壁" + wall +
-				" 隙間" + gap + " 未取得" + unknown + " / 屋根 " + (roof ? roof.name : "不明") +
-				" / 扉 " + (doors.length > 0 ? doors.slice(0, 4).join(" ") : "無し"),
+			"[診断] 寝床(" +
+				bed.x +
+				"," +
+				bed.y +
+				"," +
+				bed.z +
+				") の囲い: 壁" +
+				wall +
+				" 隙間" +
+				gap +
+				" 未取得" +
+				unknown +
+				" / 屋根 " +
+				(roof ? roof.name : "不明") +
+				" / 扉 " +
+				(doors.length > 0 ? doors.slice(0, 4).join(" ") : "無し"),
 		);
 	}
 
@@ -4190,7 +4211,11 @@ export class MinecraftAgent {
 
 	/** そのベッドに屋根があるか。読めない位置なら false（根拠にしない）。 */
 	private hasRoof(p: Position): boolean {
-		const above = this.driver.world.blockAt({ x: Math.floor(p.x), y: Math.floor(p.y) + 2, z: Math.floor(p.z) });
+		const above = this.driver.world.blockAt({
+			x: Math.floor(p.x),
+			y: Math.floor(p.y) + 2,
+			z: Math.floor(p.z),
+		});
 		return !!above && above.solid;
 	}
 
@@ -4463,7 +4488,10 @@ export class MinecraftAgent {
 		// 自分が掘った縦穴の中では四方が塞がった判定が常に成立するので、
 		// 歯止めが無いと横へ掘り続けて穴が広がる。実測で579回発火しており、
 		// 初期リス周辺が荒れた最大の出どころがこれだった。
-		if (Date.now() - this.lastEscapeDigAt < ESCAPE_COOLDOWN_MS) return;
+		// 掘る間隔は裁定者が持つ(保持とクールダウン)。ここで二重に止めると、
+		// 担当を握ったまま1マスも掘らない時間ができる。実測 2026-09-17 12:45、
+		// 30秒の保持を2回取って、その間ずっと何もしていなかった。
+		if (Date.now() - this.lastEscapeDigAt < ESCAPE_DIG_MIN_GAP_MS) return;
 
 		// 全方向が塞がっている。壊せるものを1つ選んで抜ける。
 		for (const d of dirs) {

@@ -14,58 +14,8 @@ import { MinecraftAgent } from "../core/agent";
 import { BedrockDriver } from "../core/driver/bedrock";
 import { envNum } from "../core/utils/env";
 import { kusabot } from "../profiles/kusabot";
-import { buildingBaseSkill } from "../skills/building/base";
-import { buildingRepairSkill } from "../skills/building/repair";
-import { collectDirtSkill } from "../skills/collecting/dirt";
-import { huntAnimalsSkill } from "../skills/collecting/hunting";
-import { mineOresSkill } from "../skills/collecting/mining";
-import { collectStoneSkill } from "../skills/collecting/stone";
-import { collectWoodSkill } from "../skills/collecting/wood";
-import { craftSmeltingSkill } from "../skills/crafting/smelting";
-import { craftToolSkill } from "../skills/crafting/tool";
-import { craftTorchSkill } from "../skills/crafting/torch";
-import { craftWeaponSkill } from "../skills/crafting/weapon";
-import { exploreLandSkill } from "../skills/exploring/land";
-import { gotoBaseSkill } from "../skills/goto/base";
-import { gotoCoordsSkill } from "../skills/goto/coords";
-import { gotoDeathPointSkill } from "../skills/goto/death";
-import { gotoLandmarkSkill } from "../skills/goto/landmark";
-import { gotoPlayerSkill } from "../skills/goto/player";
-import { gotoSurfaceSkill } from "../skills/goto/surface";
-import { giveItemSkill } from "../skills/social/give";
 import { isLeaveRequest, shouldYieldSeat } from "./bedrock-session";
-
-// 統合版でもスキルは一通り動く。Driver 層が Java 版との差を吸収しているので
-// skills/ 側は共通のものをそのまま使う。
-//
-// collecting.stealing だけ外している。中身を漁るのは他プレイヤーのチェストで、
-// 本番の Realm では壊してよいものの範囲外だから。破壊や設置は許可されている。
-const bedrockSkills = [
-	// 死んだあとの回収を最優先で選べるようにしておく。持ち物は全部その場に
-	// 落ち、5分ほどで消える。取りに戻らないと何を積んでも残らない。
-	gotoDeathPointSkill,
-	exploreLandSkill,
-	gotoSurfaceSkill,
-	gotoCoordsSkill,
-	gotoPlayerSkill,
-	gotoBaseSkill,
-	// 地上に出ても行き先が無いと、その場をランダムに歩くだけで拠点へ着かない。
-	// 見かけた人工物へ向かう手を持たせる。
-	gotoLandmarkSkill,
-	collectWoodSkill,
-	collectStoneSkill,
-	collectDirtSkill,
-	mineOresSkill,
-	huntAnimalsSkill,
-	craftToolSkill,
-	craftWeaponSkill,
-	craftTorchSkill,
-	craftSmeltingSkill,
-	buildingBaseSkill,
-	// 掘った跡を埋め戻す。他人のワールドに穴を残さないための奉公。
-	buildingRepairSkill,
-	giveItemSkill,
-];
+import { bedrockSkills } from "./bedrock-skills";
 
 /** 席を譲って抜けたときの終了コード。呼び出し側が再入場の判断に使う。 */
 const EXIT_YIELDED = 3;
@@ -100,12 +50,13 @@ async function main() {
 	// Realms は10人まで。ボットが1枠を占め続けると人が入れなくなるので、
 	// 混んできたら自分から抜けて、空いたころに戻る。
 	let yielding = false;
-	const yieldSeat = async (why: string) => {
+	// say は抜ける前の一言。理由が違うのに「混んできた」と言うと嘘になる。
+	const yieldSeat = async (why: string, say = "混んできたので抜けるね。また来る") => {
 		if (yielding) return;
 		yielding = true;
 		console.log(`[bedrock] ${why}。席を譲って抜けます`);
 		try {
-			await driver.chat("混んできたので抜けるね。また来る");
+			await driver.chat(say);
 		} catch {
 			// 言えなくても抜ける方が大事。
 		}
@@ -135,6 +86,13 @@ async function main() {
 	// sleepIfOthersSleeping)。その通知をここで受けて実際に抜ける。
 	agent.onNoBedForSleep = () => {
 		void yieldSeat("寝られる場所が無い");
+	};
+
+	// 死に続けているなら一度抜ける。死亡ログは周りの全員のチャット欄に
+	// 流れるので、直せないまま居座ると迷惑をかけ続けることになる。
+	// 戻るのは run-bedrock.sh(終了コード3)が時間を置いてやる。
+	agent.onDeathStorm = (count: number) => {
+		void yieldSeat(`短時間に${count}回死んだ`, "何度も死んで邪魔になってるから一旦抜ける");
 	};
 
 	// 切断に気づかず空回りし続けるのを防ぐ。

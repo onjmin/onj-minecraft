@@ -247,7 +247,16 @@ type session struct {
 	// 設置に使うため、スロットの生データも持つ。手に持つアイテムは
 	// UseItemTransactionData にそのまま載せる必要がある。
 	rawSlots map[int]protocol.ItemInstance
-	heldSlot int32
+	// slotsPredicted は、拾った物をこちらで足して持ち物を書いたことを示す。
+	//
+	// 統合版は拾っても持ち物の更新を送ってこないので、TakeItemActor を見て
+	// 自分で足している。個数は合うが、スタックの識別子(StackNetworkID)は
+	// サーバー側の値と違う。その識別子のままクラフトの素材に指すと
+	// FailedToValidateSrcSlot(49) で拒否される。実測 2026-09-17 00:36、
+	// 地面から拾った spruce_log 4本で spruce_planks を作ろうとして、
+	// 毎回これで弾かれていた。ItemStackRequest を組む前に取り直す。
+	slotsPredicted bool
+	heldSlot       int32
 
 	// チャンクの中身は最初の1回だけ報告する。毎チャンク出すと読めない。
 	chunkReported bool
@@ -781,6 +790,8 @@ func (s *session) handle(pk packet.Packet) {
 				s.rawSlots[i] = item
 			}
 		}
+		// サーバーが全スロットを正しい識別子で送り直した。予測は解消。
+		s.slotsPredicted = false
 		s.mu.Unlock()
 
 	case *packet.InventorySlot:
@@ -900,6 +911,23 @@ func (s *session) handle(pk packet.Packet) {
 				// ことがあり(49 を DstContainerAndSlotEqualToSrcContainerAndSlot
 				// だと思い込んでいたが、実際は 48。49 は FailedToValidateSrcSlot)、
 				// 起きている現象と原因の対応を取り違えたまま放置していた。
+				// 識別子のずれが原因なら、黙って諦めない。
+				//
+				// FailedToValidateSrcSlot(49) は「送ってきた StackNetworkID が
+				// 今の中身と合わない」という意味で、こちらの持ち物の写しが
+				// 古いときに出る。拾った物は TakeItemActor を見て手元で
+				// 予測して足しているので、サーバーが振り直した識別子を
+				// こちらは知らないまま使うことになる。
+				//
+				// 成功時と同じように一覧を送り直させれば、次の要求は正しい
+				// 識別子で送れる。これが無いと、一度ずれたあとは何度やっても
+				// 同じ理由で弾かれ続ける。実測 2026-09-15 の crafting.weapon は
+				// spruce_log を4本持ったまま792回これを繰り返し、
+				// 2026-09-17 12:37 にも1分で11回繰り返していた。板材が作れない
+				// ので棒も剣も作れず、生存の鎖がここで切れていた。
+				if r.Status == protocol.ItemStackResponseStatusFailedToValidateSrcSlot {
+					_ = s.conn.WritePacket(&packet.ContainerClose{WindowID: 0})
+				}
 				s.reply(id, false, fmt.Sprintf("操作が拒否されました(status=%d)", r.Status), nil)
 			}
 		}
@@ -1180,15 +1208,20 @@ func (s *session) steerLocked(n uint64) {
 		}
 		to := blockPos{int32(math.Floor(float64(gx))), goalY, int32(math.Floor(float64(gz)))}
 		tol := float64(g.tolerance)
+		// 高さも合わせるのは、最終目標をそのまま狙えるときだけ。
+		// 遠くて中間地点に切り詰めたときは、その手前の地点で最終的な高さに
+		// 合わせる意味が無い(たいてい届かず、経路が引けなくなる)。
+		matchY := g.hasY
 		if dist > planReach {
 			// 中間地点なので、そこにぴったり着く必要はない。
 			tol = 1
+			matchY = false
 		}
 		caps := s.capsLocked()
 		if g.noDig {
 			caps.CanDig = false
 		}
-		g.path = s.world.findPath(from, to, tol, planMaxNodes, caps)
+		g.path = s.world.findPath(from, to, tol, matchY, planMaxNodes, caps)
 
 		// 水を使った経路は珍しいので記録する。掘る・積むに次ぐ3本目の
 		// 上がり方として、実際に使えているかを後から確かめられるように。
@@ -1238,6 +1271,20 @@ func (s *session) steerLocked(n uint64) {
 	dx, dz := tx-s.pos[0], tz-s.pos[2]
 	s.yaw = float32(math.Atan2(float64(-dx), float64(dz)) * 180 / math.Pi)
 
+	// 経路が引けていないときは、深い落差にも踏み込まない。
+	//
+	// 経路があるときの落下は stepFall(maxDrop)までに限られる。無いときは
+	// 目標へ真っ直ぐ歩くので、線上に崖や洞窟の口があっても止まらない。
+	// 実測 2026-09-16、Y=38 まで登った直後に goto.coords が経路無しで歩き、
+	// 1分で Y=17 まで落ちた。別の場面でも Y=54→38。階段掘りで登るのは
+	// 1分3マス、落ちるのは1分12マス。登る側を速くするより、落ちる側を
+	// 止める方が効く。
+	if len(g.path) == 0 && s.bigDropAheadLocked() {
+		s.controls["forward"] = false
+		s.controls["jump"] = false
+		return
+	}
+
 	// 踏み出す先が火や溶岩なら踏み込まない。
 	//
 	// 経路が引けなかったとき、ここは目標へ真っ直ぐ歩く。その線上に何が
@@ -1266,6 +1313,46 @@ func (s *session) steerLocked(n uint64) {
 		g.lastPos = s.pos
 	}
 	s.controls["jump"] = stepUp || g.stalledTicks >= 2
+}
+
+// bigDropAheadLocked は、今向いている方向のすぐ先が深い落差か。
+//
+// 経路探索が落ちてよいと認める段差(maxDrop)を超えて、着地点が見つからない
+// ときだけ真を返す。水は落ちても死なないので通す。未取得のマスは「分からない」
+// として通す。分からないものを全部塞ぐと、チャンクの境目で足が止まる。
+// この関数は経路が引けていないときにしか呼ばない(計画された落下は妨げない)。
+func (s *session) bigDropAheadLocked() bool {
+	feet := s.feetLocked()
+	fy := int32(math.Floor(float64(feet[1])))
+
+	rad := float64(s.yaw) * math.Pi / 180
+	dx := float32(-math.Sin(rad))
+	dz := float32(math.Cos(rad))
+	for _, reach := range []float32{0.6, 1.2} {
+		x := int32(math.Floor(float64(feet[0] + dx*reach)))
+		z := int32(math.Floor(float64(feet[2] + dz*reach)))
+		// 踏み出す先に床があるなら崖ではない。
+		if s.world.solidFloor(blockPos{x, fy - 1, z}) {
+			continue
+		}
+		landed := false
+		for dy := int32(1); dy <= maxDrop+1; dy++ {
+			p := blockPos{x, fy - dy, z}
+			if _, ok := s.world.blockAt(p.X, p.Y, p.Z); !ok {
+				// 読めていない。決めつけない。
+				landed = true
+				break
+			}
+			if s.world.inWater(p) || s.world.solidFloor(p) {
+				landed = true
+				break
+			}
+		}
+		if !landed {
+			return true
+		}
+	}
+	return false
 }
 
 // hazardAheadLocked は、今向いている方向のすぐ先が踏んではいけない場所か。
@@ -1299,6 +1386,31 @@ func (s *session) hazardAheadLocked() bool {
 		}
 	}
 	return false
+}
+
+// enclosedLocked は、その場が本当に囲まれた隠れ場所か。
+//
+// 頭上だけを見ると、洞窟の天井や木の下でも「隠れている」ことになる。
+// 自分で掘って蓋をした穴は、四方と頭上が塞がっている。そこまで求める。
+// 未取得のマスは塞がっていないものとして扱う(分からないなら逃げる側に倒す)。
+// 呼び出し側が mu を持つこと。
+func (s *session) enclosedLocked(feet mgl32.Vec3) bool {
+	fx := int32(math.Floor(float64(feet[0])))
+	fy := int32(math.Floor(float64(feet[1])))
+	fz := int32(math.Floor(float64(feet[2])))
+	if name, ok := s.world.blockAt(fx, fy+2, fz); !ok || name == "air" {
+		return false
+	}
+	for _, d := range [4][2]int32{{1, 0}, {-1, 0}, {0, 1}, {0, -1}} {
+		// 足の高さと頭の高さ、どちらかが開いていれば出入りできる。
+		for _, dy := range []int32{0, 1} {
+			name, ok := s.world.blockAt(fx+d[0], fy+dy, fz+d[1])
+			if !ok || passableBlocks[name] {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // defendLocked は敵が近いときの反応。処理したなら true を返し、
@@ -1406,13 +1518,21 @@ func (s *session) defendLocked(n uint64) bool {
 
 	dx := target.Pos[0] - s.pos[0]
 	dz := target.Pos[2] - s.pos[2]
+	isHurtNow := time.Since(s.lastHurt) < hurtMemory
 	if flee {
 		// 既に潜って蓋をしているなら、走り出さない。せっかくの隠れ場所から
 		// 出ていくことになる。
-		fx := int32(math.Floor(float64(feet[0])))
-		fy := int32(math.Floor(float64(feet[1])))
-		fz := int32(math.Floor(float64(feet[2])))
-		if name, ok := s.world.blockAt(fx, fy+2, fz); ok && name != "air" {
+		//
+		// ただし「頭上が空気でない」だけで隠れ場所と見なしてはいけない。
+		// 洞窟の天井・木の下・建物の中・岩の張り出し、どれもこの条件を
+		// 満たす。ボットは大半の時間を地下で過ごすので、事実上いつでも
+		// 「隠れている」ことになり、殴られている最中でも逃げずに突っ立つ。
+		// 実測 2026-09-17 00:53〜00:57、ゾンビに3回殺される間ずっと
+		// その場に立っていた。四方が塞がっているかまで見る。
+		//
+		// さらに、今まさに殴られているなら隠れ場所として機能していない。
+		// 囲まれていようと、そこに留まる理由にはならない。
+		if !isHurtNow && s.enclosedLocked(feet) {
 			s.fighting = 0
 			return false
 		}
@@ -1443,8 +1563,9 @@ func (s *session) defendLocked(n uint64) bool {
 		if sp, ok := s.nearestSafeSpotLocked(feet, safeSpotSeekRange); ok &&
 			safeSpotDirectionHelps(feet, sp.Pos, away) {
 			d := sp.Pos.Sub(feet).Len()
-			if d <= safeSpotArriveRange {
+			if d <= safeSpotArriveRange && !isHurtNow {
 				// もう着いている。ここでじっとして様子を見た方がよい。
+				// 殴られている間は別で、じっとしていると削り殺される。
 				s.controls["forward"] = false
 				s.controls["sprint"] = false
 				s.fighting = 0
@@ -2692,6 +2813,10 @@ func (s *session) dispatch(c command) {
 			s.reply(c.ID, false, "作る物を指定してください", nil)
 			return
 		}
+		// 拾った直後の持ち物は識別子が予測のままなので、先に取り直す。
+		// これをしないと、掘って拾った木で板を作ろうとした瞬間に
+		// FailedToValidateSrcSlot(49) で拒否される。
+		s.resyncSlotsIfPredicted()
 		s.mu.Lock()
 		list := s.recipes[want]
 		if len(list) == 0 {
@@ -2932,7 +3057,12 @@ func (s *session) requestLoop() {
 // 広げてよいのは、探索側をパレット先読み(world.findWide)に替えて走査量が
 // 桁で下がったのと、遠い列を捨てる(world.forget)ようにして保持が青天井に
 // ならなくなったため。この2つが無い状態で半径だけ上げると tick が止まる。
-const requestRadius = 8
+// 8 から 12 へ(128 → 192ブロック)。8 のままだと、人が地平線に見つける
+// ような離れた拠点はデータとして届かない。300ブロック先は 19 チャンクで、
+// サーバーの view distance の上限を超えることが多いので狙わない。
+// 列数は半径の2乗で増える(17×17=289 → 25×25=625)。走査はパレット先読みで
+// 落ちるので、増えるのは主に保持と解析の分。
+const requestRadius = 12
 
 // keepRadius は保持しておく列の広さ(チャンク単位)。
 // 要求範囲より少し広く取り、行ったり来たりで取り直しが続くのを避ける。
@@ -3366,6 +3496,38 @@ func firstFreeSlotLocked(s *session, used map[int]bool) int {
 // 一致しないが、こちらが見たいのは「何をどれだけ持っているか」なので足りる。
 // 実際の配置は次の InventoryContent で上書きされる。
 // 呼び出し側が mu を持つこと。
+// slotResyncWait は、持ち物の送り直しを待つ上限。
+//
+// 待たずに進むと結局古い識別子で送ることになる。届かなければ諦めて進む
+// (待ち続けるより、拒否されて次の手に移る方がまだ動く)。
+const slotResyncWait = 800 * time.Millisecond
+
+// resyncSlotsIfPredicted は、予測で書いた持ち物があるならサーバーに
+// 一覧を送り直させ、正しい識別子を取り直す。
+//
+// 持ち物の画面を閉じる(ContainerClose{WindowID: 0})と、サーバーは
+// InventoryContent で全スロットを送り直す。クラフトの応答から識別子を
+// 取り込むのと同じ手で、あちらは「作った物の識別子が分からない」ときに使う。
+func (s *session) resyncSlotsIfPredicted() {
+	s.mu.Lock()
+	need := s.slotsPredicted
+	s.mu.Unlock()
+	if !need {
+		return
+	}
+	_ = s.conn.WritePacket(&packet.ContainerClose{WindowID: 0})
+	deadline := time.Now().Add(slotResyncWait)
+	for time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+		s.mu.Lock()
+		done := !s.slotsPredicted
+		s.mu.Unlock()
+		if done {
+			return
+		}
+	}
+}
+
 func (s *session) addItemLocked(item protocol.ItemInstance) {
 	if item.Stack.Count == 0 {
 		return
@@ -3388,11 +3550,17 @@ func (s *session) addItemLocked(item protocol.ItemInstance) {
 		it.Stack.Count += item.Stack.Count
 		s.rawSlots[slot] = it
 		s.syncSlotLocked(slot, it)
+		// ここで書いた個数はこちらの予測で、そのスタックの識別子は
+		// サーバー側で既に変わっている。後で取り直す印を立てる。
+		s.slotsPredicted = true
 		return
 	}
 	if slot, ok := s.freeSlotLocked(); ok {
+		// 地面のアイテムの識別子は、持ち物のスタックの識別子ではない。
+		// そのまま素材に指すと拒否されるので、ここも予測扱いにする。
 		s.rawSlots[slot] = item
 		s.syncSlotLocked(slot, item)
+		s.slotsPredicted = true
 	}
 }
 
@@ -3546,7 +3714,7 @@ func (s *session) prepareStepLocked(st step) bool {
 		s.controls["forward"] = false
 		return false
 
-	case stepDig:
+	case stepDig, stepDigUp:
 		for _, b := range st.Dig {
 			if s.world.passable(b) {
 				continue

@@ -8,6 +8,8 @@
 		"dev": "tsx --watch src/workflow/index.ts",
 		"start:bedrock": "bash scripts/run-bedrock.sh",
 		"lint": "biome check .",
+		"test": "node --import tsx --test src/core/survival/*.test.ts",
+		"scenario": "tsx --env-file-if-exists=.env src/workflow/scenario.ts",
 		"format": "biome format --write ."
 	},
 	"keywords": [],

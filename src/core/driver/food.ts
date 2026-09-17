@@ -77,3 +77,37 @@ export function pickFood(names: readonly string[]): string | null {
 
 /** 満腹度がこれ未満なら食べる。18 を切ると体力が自然回復しなくなる。 */
 export const EAT_BELOW_FOOD = 18;
+
+/**
+ * 焼けば食べ物になるもの。生 → 焼き上がり。
+ *
+ * 狩って持ち帰った肉は、焼かなければ満腹度も回復量も半分以下で、
+ * 生鶏肉に至っては食中毒で逆に減る。狩り→焼き→食事が繋がって初めて
+ * 「食料を確保した」と言える。全ログ通算で食事は23回しか無く、
+ * この鎖はこれまで一度も通っていない。
+ */
+export const COOKABLE_FOOD = new Map<string, string>([
+	["beef", "cooked_beef"],
+	["porkchop", "cooked_porkchop"],
+	["mutton", "cooked_mutton"],
+	["chicken", "cooked_chicken"],
+	["rabbit", "cooked_rabbit"],
+	["salmon", "cooked_salmon"],
+	["cod", "cooked_cod"],
+	["potato", "baked_potato"],
+	["kelp", "dried_kelp"],
+]);
+
+/**
+ * 持ち物から「焼けば食べられるもの」を1つ選ぶ。無ければ null。
+ *
+ * 生でも食べられるもの(牛肉など)もここに入る。焼いた方が回復量が倍近いので、
+ * かまどが用意できるなら焼いてから食べる。
+ */
+export function pickCookable(names: readonly string[]): string | null {
+	const have = new Set(names);
+	for (const raw of COOKABLE_FOOD.keys()) {
+		if (have.has(raw)) return raw;
+	}
+	return null;
+}

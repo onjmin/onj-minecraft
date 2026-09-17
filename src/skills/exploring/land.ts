@@ -1,6 +1,14 @@
 import type { Position } from "../../core/driver/types";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
+/**
+ * これだけ動けていなければ、探索として成立していないと見なす。
+ *
+ * 目的地に着くこと自体は成果ではない。1ブロック先へ行って「着いた」を
+ * 返し続けても、読み込まれる地形は増えない。
+ */
+const MIN_EXPLORE_MOVE = 6;
+
 export const exploreLandSkill = createSkill<void, { x: number; z: number }>({
 	name: "exploring.explore_land",
 	description:
@@ -88,6 +96,7 @@ export const exploreLandSkill = createSkill<void, { x: number; z: number }>({
 			return skillResult.fail("No safe ground found in sampling.");
 		}
 
+		const before = { ...driver.getState().position };
 		try {
 			// 修正ポイント2: Goalの精度を調整
 			// GoalNearXZ(x, z, 1) は「半径1ブロック以内」で満足してしまうため、
@@ -98,7 +107,28 @@ export const exploreLandSkill = createSkill<void, { x: number; z: number }>({
 				new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 15000)),
 			]);
 
-			return skillResult.ok("Reached destination.", { x: targetPos.x, z: targetPos.z });
+			// 「着いた」だけで成功にしない。
+			//
+			// このスキルは目的地に着くので毎回 Success を返していた。何も
+			// 得ないまま成功を繰り返せるため、停滞判定(失敗でしか発火しない)
+			// も効かない。実測 2026-09-17 01:37、4〜5秒おきに37回連続で
+			// 選ばれ、その間ずっと同じ場所におり、最後は探索中に落下死した。
+			// 探索の成果は「新しい地形を読み込めたか」で、その代理として
+			// 実際に動いた距離を見る。
+			const after = driver.getState().position;
+			const moved = Math.hypot(after.x - before.x, after.z - before.z);
+			if (moved < MIN_EXPLORE_MOVE) {
+				agent.noteStall(
+					`exploring.explore_land: "arrived" after moving only ${moved.toFixed(1)} blocks; exploring here finds nothing new.`,
+				);
+				return skillResult.fail(
+					`Arrived but only moved ${moved.toFixed(1)} blocks; nothing new was explored.`,
+				);
+			}
+			return skillResult.ok(`Explored ${moved.toFixed(0)} blocks away.`, {
+				x: targetPos.x,
+				z: targetPos.z,
+			});
 		} catch {
 			// --- 3. リカバリ (スタック解除) ---
 			// スタック解除はベストエフォート。中断済みでも必ず実行したいので、

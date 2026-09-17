@@ -28,6 +28,7 @@ const (
 	stepTower         // 跳んで足元に置き、1段上がる（柱積み）
 	stepSwim          // 水の中を進む（足場は要らない）
 	stepSwimUp        // 水の中を浮上して1段上がる
+	stepDigUp         // 壁を刻んで1段上がる（階段状に掘る）
 )
 
 type step struct {
@@ -152,7 +153,15 @@ const (
 
 // findPath は from から goal へ行ける手順を返す。見つからなければ nil。
 // maxNodes は tick を止めないための上限。
-func (w *world) findPath(from, goal blockPos, tolerance float64, maxNodes int, c caps) []step {
+//
+// matchY は「高さも合わせる」かどうか。真上へ行きたいときに要る。
+// 呼び出し側(steerLocked)は hasY のとき高さ1.5以内に入るまで到着と認めない
+// のに、ここでは水平距離しか見ていなかった。真上が目標だと開始地点が
+// そのまま「到着」になり、手順を1つも組まずに空の経路を返す。実測
+// 2026-09-16、地下25〜39メートルから「残り 0.2 ブロック / 高さ差 25.3 /
+// 経路 0手」を延々と返し、ボットは一歩も動かないまま時間切れになっていた。
+// 上へ行く手(tower/swimUp/digUp)が揃っていても、探索が始まらないので使われない。
+func (w *world) findPath(from, goal blockPos, tolerance float64, matchY bool, maxNodes int, c caps) []step {
 	h := func(p blockPos) float64 {
 		dx := float64(p.X - goal.X)
 		dy := float64(p.Y - goal.Y)
@@ -162,7 +171,15 @@ func (w *world) findPath(from, goal blockPos, tolerance float64, maxNodes int, c
 	reached := func(p blockPos) bool {
 		dx := float64(p.X - goal.X)
 		dz := float64(p.Z - goal.Z)
-		return math.Sqrt(dx*dx+dz*dz) <= tolerance
+		if math.Sqrt(dx*dx+dz*dz) > tolerance {
+			return false
+		}
+		if !matchY {
+			return true
+		}
+		// 呼び出し側の到着判定(1.5)に合わせる。1段ぶんのずれは許す。
+		dy := p.Y - goal.Y
+		return dy >= -1 && dy <= 1
 	}
 
 	open := &nodeQueue{{pos: from, g: 0, f: h(from)}}
@@ -284,6 +301,47 @@ func (w *world) moves(p blockPos, c caps) []move {
 			}
 		}
 
+		// 掘って1段上がる。壁を階段状に刻んで登る手。
+		//
+		// これが無いと、上へ伸びる手は jump(既に立てる段が隣にある) /
+		// swimUp(水がある) / tower(置けるブロックがある) の3つしかない。
+		// 手ぶらで、水も自然の段も無い場所では上への辺が1本も無くなり、
+		// A* をどれだけ広げても登る経路は見つからない。実測 2026-09-16、
+		// 足場0(＝設置可能な持ち物ゼロ)のまま Y=28〜31 を6分足踏みした。
+		//
+		// これまではスキル側(goto.surface の digStepUp)に手書きしていた。
+		// 探索の外にあると「数歩歩いてから刻む」と組み合わせられず、
+		// 他の手とコストを比べることもできない。手として置けば、
+		// 壁際への移動と刻みは探索が勝手に組み立てる。
+		//
+		// 踏み台は隣の足元 {x, p.Y, z}。壁ならここが固い。そこへ跳び乗るので、
+		// その上2マスと、跳ぶための自分の頭上を空ける。
+		if c.CanDig && w.solidFloor(blockPos{x, p.Y, z}) {
+			target := blockPos{x, p.Y + 1, z}
+			var dig []blockPos
+			ok := true
+			for _, b := range []blockPos{
+				{p.X, p.Y + 2, p.Z},
+				target,
+				{x, p.Y + 2, z},
+			} {
+				if w.passable(b) {
+					continue
+				}
+				if !w.diggable(b) {
+					ok = false
+					break
+				}
+				dig = append(dig, b)
+			}
+			if ok && len(dig) > 0 {
+				out = append(out, move{
+					step{Pos: target, Action: stepDigUp, Dig: dig},
+					costJump + costDig*float64(len(dig)),
+				})
+			}
+		}
+
 		// 掘って抜ける。足場があり、塞いでいるものが壊せるとき。
 		if c.CanDig && w.solidFloor(blockPos{x, p.Y - 1, z}) {
 			var dig []blockPos
@@ -384,6 +442,8 @@ func stepName(action int) string {
 		return "swim"
 	case stepSwimUp:
 		return "swimUp"
+	case stepDigUp:
+		return "digUp"
 	default:
 		return "unknown"
 	}
