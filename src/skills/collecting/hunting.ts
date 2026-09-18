@@ -74,20 +74,42 @@ export const huntAnimalsSkill = createSkill<void, { hunted: string; success: boo
 			// 時間切れで抜ける。逃げる動物を延々と追いかけるのも損なので、
 			// 予算は短く取る。
 			let lastPos = target.position;
-			const until = Date.now() + HUNT_BUDGET_MS;
+			let attacks = 0;
+			let killed = false;
+			let lastError = "";
+			let blocked = 0;
+			const startedAt = Date.now();
+			const until = startedAt + HUNT_BUDGET_MS;
 			while (Date.now() < until) {
 				if (signal.aborted) break;
 				const current = driver.nearbyEntities(32).find((e) => e.id === target.id);
-				if (!current) break;
+				if (!current) {
+					killed = true;
+					break;
+				}
 				lastPos = current.position;
 				try {
 					await driver.goto(signal, { kind: "follow", entityId: target.id, distance: 1.5 });
 					await driver.attack(signal, target.id);
+					attacks++;
+					// 遮られた回数を数える。統合版は壁越しの攻撃を黙って
+					// 無視するので、これが立っていれば「当たっていない」
+					// 理由がそこにある。
+					const d = driver as unknown as { lastAttackBlocked?: boolean };
+					if (d.lastAttackBlocked) blocked++;
 					await new Promise((r) => setTimeout(r, ATTACK_INTERVAL_MS));
-				} catch {
+				} catch (err) {
+					// 止まった理由を残す。「遠すぎます」「間に障害物があって
+					// 当たりません」のように、サイドカーが理由を返している。
+					// 捨てると、外からは「殴ったのに減らない」としか見えない。
+					lastError = err instanceof Error ? err.message : String(err);
 					break;
 				}
 			}
+			const spentSec = Math.round((Date.now() - startedAt) / 1000);
+			agent.log(
+				`[collecting.hunting] ${target.name} を ${attacks} 回攻撃 (${spentSec}秒) → ${killed ? "倒した" : "生きたまま"}${blocked > 0 ? ` / 遮蔽 ${blocked}回` : ""}${lastError ? ` / 中断: ${lastError}` : ""}`,
+			);
 
 			// 4. Wait a moment and collect drops (Reflex)
 			// ドロップアイテムを拾うために移動（脊髄反射）
@@ -99,11 +121,23 @@ export const huntAnimalsSkill = createSkill<void, { hunted: string; success: boo
 
 			const gained = gainedSince(driver, before);
 			if (totalGain(gained) === 0) {
+				// 倒せていないのか、倒したのに拾えていないのか。同じ文面にすると
+				// 次にどこを直すのか分からない。前者は武器と攻撃の届く距離の話、
+				// 後者は拾う処理の話で、直す場所がまったく別になる。
+				if (killed) {
+					agent.noteStall(
+						`The ${target.name} is gone but nothing was picked up: it either fled out of range or the drops were not collected.`,
+					);
+					return skillResult.fail(
+						`The ${target.name} disappeared after ${attacks} hits but nothing was picked up.`,
+					);
+				}
+				const why = lastError ? ` (stopped: ${lastError})` : "";
 				agent.noteStall(
-					`Hunting a ${target.name} yielded nothing: it was not killed, or the drops could not be picked up.`,
+					`Could not kill a ${target.name} in ${attacks} hits over ${spentSec}s${why}; a better weapon, a clear line of sight, or getting closer is needed.`,
 				);
 				return skillResult.fail(
-					`Attacked a ${target.name} but nothing was picked up (not killed, or drops out of reach).`,
+					`Could not kill a ${target.name}: ${attacks} hits in ${spentSec}s and it is still alive${why}.`,
 				);
 			}
 			return skillResult.ok(`Hunted a ${target.name} and picked up ${describeGain(gained)}.`, {

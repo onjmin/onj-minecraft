@@ -888,6 +888,10 @@ export class BedrockDriver implements BotDriver {
 	 * 届く距離まで自分で寄る。skills/ 側は追従してから呼ぶが、
 	 * 相手が動くので呼ばれた時点で離れていることがある。
 	 */
+	/** 直前の攻撃が遮蔽されていたか。当たらない理由を外へ出すために持つ。 */
+	public lastAttackBlocked = false;
+	/** 直前の攻撃時の距離。 */
+	public lastAttackDistance = 0;
 	async attack(signal: AbortSignal, entityId: number): Promise<void> {
 		// 相手は動く。寄っている間に離れるので、座標を取り直しながら追う。
 		for (let i = 0; i < 4; i++) {
@@ -897,7 +901,13 @@ export class BedrockDriver implements BotDriver {
 			if (!target) throw new Error(`攻撃対象(${entityId})が見つかりません`);
 
 			if (distance(this.state.position, target.position) <= 3) {
-				await this.sidecar.send("attack", { count: entityId });
+				const res = (await this.sidecar.send("attack", { count: entityId })) as
+					| { distance?: number; blocked?: boolean }
+					| undefined;
+				// 遮られていると、サーバーは黙って無視する。当たらない理由が
+				// 分からないまま殴り続けるのを避けるため、呼び出し側へ返す。
+				this.lastAttackBlocked = res?.blocked === true;
+				this.lastAttackDistance = Number(res?.distance ?? 0);
 				return;
 			}
 			await this.goto(signal, {

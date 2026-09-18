@@ -177,6 +177,17 @@ type target struct {
 	path []step
 	// 今の1歩で待っている下ごしらえ(掘る/置く)。終わるまで前進しない。
 	waiting bool
+	// 待ち始めた時刻と、待っている歩の位置。
+	//
+	// 待ちに期限が無いと、終わらない下ごしらえ(壊せないブロック、通らない
+	// 設置)の前で立ち止まったまま、目標の制限時間を丸ごと使い切る。実測
+	// 2026-09-17 17:43〜17:45、16〜19ブロック先の羊へ3回続けて30秒ずつ
+	// 歩き、一度も攻撃に入れていない。経路は21手引けていたのに距離が
+	// 縮んでいないので、動いていたのではなく止まっていた。
+	waitStart time.Time
+	waitStep  blockPos
+	// 下ごしらえを諦めて経路を引き直した回数。繰り返すなら別の手が要る。
+	abandoned int
 	// 経路を引き直した時刻。地形の読み込みが進むと道が見つかることがある。
 	lastPlan time.Time
 }
@@ -1254,7 +1265,15 @@ func (s *session) steerLocked(n uint64) {
 		// 掘る/置くが要る歩は、それが済むまで前進しない。
 		// 進みながらやると、まだ空いていない穴に突っ込んで弾かれる。
 		if !s.prepareStepLocked(st) {
-			g.waiting = true
+			if !g.waiting || g.waitStep != st.Pos {
+				g.waiting = true
+				g.waitStep = st.Pos
+				g.waitStart = time.Now()
+			} else if time.Since(g.waitStart) > stepWaitLimit {
+				// この歩は終わらない。経路ごと捨てて引き直す。
+				s.abandonStepLocked(g, st)
+				return
+			}
 			s.controls["forward"] = false
 			s.controls["jump"] = false
 			return
@@ -1816,7 +1835,40 @@ const (
 	planInterval = 2 * time.Second
 	// 一度に狙う距離。読み込み済みの範囲(周囲3チャンク)に収まる値にする。
 	planReach float32 = 32
+	// 1歩の下ごしらえ(掘る/置く)を待ってよい時間。
+	//
+	// 素手で石を掘ると7秒ほどかかるので、それは通る長さにする。ただし
+	// 目標の制限時間(30秒)を1歩で食い潰さない長さに抑える。
+	stepWaitLimit = 8 * time.Second
+	// 下ごしらえを諦めた回数の上限。これを超えたら目標ごと失敗にする。
+	stepAbandonLimit = 3
 )
+
+// abandonStepLocked は、終わらない下ごしらえを諦めて経路を引き直させる。
+//
+// 同じ経路を引き直せば同じ歩でまた止まるので、回数を数えて、続くようなら
+// 目標そのものを失敗にする。立ち止まったまま制限時間を使い切るより、
+// 早く失敗を返した方がよい。呼び出し側(スキル)はそれを見て別の手を選べるが、
+// 何も返ってこない30秒からは何も学べない。
+func (s *session) abandonStepLocked(g *target, st step) {
+	g.abandoned++
+	g.path = nil
+	g.waiting = false
+	// 進まない採掘を抱えたままだと、次の経路でも同じところで待つ。
+	// 移動のための採掘(id 0)だけを捨てる。命令された採掘は触らない。
+	if s.digging != nil && s.digging.id == 0 {
+		s.digging = nil
+	}
+	// すぐ引き直させる。
+	g.lastPlan = time.Time{}
+	fmt.Fprintf(os.Stderr,
+		"[sidecar] 下ごしらえが終わらない歩を諦めた（%d回目 / 動作%d / (%d,%d,%d)）\n",
+		g.abandoned, int(st.Action), st.Pos.X, st.Pos.Y, st.Pos.Z)
+	if g.abandoned >= stepAbandonLimit {
+		s.finishGoalLocked(false, fmt.Sprintf(
+			"進めない歩で%d回止まった（掘れないか、置けない）", g.abandoned))
+	}
+}
 
 // clampToward は遠すぎる目標を、その方向の手前の点に切り詰める。
 // 読み込んでいない場所へは道を引けないので、探せる範囲に区切って進む。
@@ -2966,6 +3018,14 @@ func (s *session) dispatch(c command) {
 
 	case "attack":
 		// 攻撃は InventoryTransaction に載せる。手に持っている物で威力が変わる。
+		//
+		// 送る前に持ち物の識別子を取り直す。攻撃の取引にも HeldItem が載る
+		// ので、拾った直後の予測値(サーバーと違う StackNetworkID)のまま
+		// 送ると、取引ごと無視される。クラフトは 49 という返事が来るので
+		// 気づけたが、攻撃は**何も返ってこない**。実測 2026-09-17 17:37、
+		// 遮蔽なし・距離内で17回殴っても豚は減らず、ログには理由が
+		// 一つも残らなかった。
+		s.resyncSlotsIfPredicted()
 		rid := uint64(c.Count)
 		s.mu.Lock()
 		e, ok := s.entities[rid]
@@ -2981,6 +3041,18 @@ func (s *session) dispatch(c command) {
 			s.reply(c.ID, false, fmt.Sprintf("遠すぎます（%.1f ブロック）", dist), nil)
 			return
 		}
+		// 壁越しには当たらない。ただし、ここでは止めずに記録だけする。
+		//
+		// 届く距離にいても、間にブロックがあるとサーバーは黙って無視する。
+		// 黙って無視されると、こちらは「殴った」と数え続ける。実測
+		// 2026-09-17 17:21、豚を20秒で24回殴って一度も減らず、理由が
+		// ログに何も残らなかった。
+		//
+		// 一度は「遮られていたら送らない」にしたが、ローカルで牛を隣に
+		// 置いても 7回中7回「遮られている」と判定された。判定の方が
+		// 間違っている可能性があるうちに攻撃を止めると、いま通っている
+		// 経路まで塞ぐことになる。まず数字を出して、確かめてから決める。
+		blocked := !s.clearPathLocked(s.feetLocked(), e.Pos)
 		// 目線が外れていると当たらない判定のサーバーがある。
 		s.lookAtLocked(e.Pos[0], e.Pos[1]+1, e.Pos[2])
 		held := s.rawSlots[int(s.heldSlot)]
@@ -2988,6 +3060,18 @@ func (s *session) dispatch(c command) {
 		pos := s.pos
 		s.mu.Unlock()
 
+		// 腕を振ってから殴る。
+		//
+		// 本物のクライアントは攻撃のたびに Animate(SwingArm) を送る。
+		// 取引だけを送っても、サーバー側の実装によっては当たり判定に
+		// 入らない。実測 2026-09-18 09:25、羊を20秒で51回殴っても
+		// 減らなかった(羊の体力は8、素手でも8回で足りる)。届いていて、
+		// 遮蔽も無く、それでも減らないなら、殴ったと見なされていない。
+		_ = s.conn.WritePacket(&packet.Animate{
+			ActionType:      packet.AnimateActionSwingArm,
+			EntityRuntimeID: s.game.EntityRuntimeID,
+			SwingSource:     packet.AnimateSwingSourceAttack,
+		})
 		err := s.conn.WritePacket(&packet.InventoryTransaction{
 			TransactionData: &protocol.UseItemOnEntityTransactionData{
 				TargetEntityRuntimeID: rid,
@@ -3003,7 +3087,7 @@ func (s *session) dispatch(c command) {
 			s.reply(c.ID, false, fmt.Sprintf("攻撃の送信に失敗: %v", err), nil)
 			return
 		}
-		s.reply(c.ID, true, "", map[string]any{"distance": dist})
+		s.reply(c.ID, true, "", map[string]any{"distance": dist, "blocked": blocked})
 
 	case "snapshot":
 		// TypeScript 側の world.* は同期APIなので、都度問い合わせるわけにいかない。
@@ -3728,10 +3812,12 @@ func (s *session) prepareStepLocked(st step) bool {
 			}
 			s.digging = &digTask{
 				// id 0 は移動のための内部的な採掘。結果を返す相手がいない。
-				id:       0,
-				pos:      protocol.BlockPos{b.X, b.Y, b.Z},
+				id:  0,
+				pos: protocol.BlockPos{b.X, b.Y, b.Z},
+				// 期限は1歩ぶんに合わせる。15秒だと、壊せないブロックを2回
+				// 相手にしただけで目標の制限時間(30秒)を使い切る。
 				face:     faceToward(s.pos, b.X, b.Y, b.Z),
-				deadline: time.Now().Add(15 * time.Second),
+				deadline: time.Now().Add(stepWaitLimit),
 			}
 			s.lookAtLocked(float32(b.X)+0.5, float32(b.Y)+0.5, float32(b.Z)+0.5)
 			return false
