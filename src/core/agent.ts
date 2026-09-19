@@ -739,6 +739,15 @@ export class MinecraftAgent {
 	/** スキルごとの、成功を返したのに何も変わらなかった連続回数。 */
 	private readonly emptyRuns = new Map<string, number>();
 	/**
+	 * 生存側が担当を握っているか。
+	 *
+	 * 握っている間、思考ループは「乗り換え」で実行中の行動を殺してはいけない。
+	 * 実測 2026-09-18 09:28、狩りが2秒と7秒で「中断された」で終わっていた。
+	 * 止めていたのは敵でも地形でもなく、次の行動を選んだ自分の思考だった。
+	 * 裁定者は担当に期限を持っているので、待たせても止まりはしない。
+	 */
+	private survivalHolding = false;
+	/**
 	 * 死んだ場所と時刻。持ち物はそこに落ちているので、取りに戻る手掛かり。
 	 * 落下物は5分ほどで消えるため、古くなったら捨てる。
 	 */
@@ -2810,6 +2819,17 @@ export class MinecraftAgent {
 	}
 
 	private cancelCurrentExecution() {
+		// 生存側が担当を握っている間は止めない。
+		//
+		// ここは「思考が別の行動を選んだので、走っているものを止める」処理で、
+		// 相手が思考の選んだスキルなら正しい。だが生存側の行動(狩り・退避・
+		// 地上復帰)まで同じ合図で殺していた。狩りは20秒かけて獲物へ寄る行動
+		// なので、30秒ごとの思考が来るたびに2〜7秒で刻まれ、一度も殴り切れない。
+		// 担当には裁定者が期限を付けているので、待たせても止まりはしない。
+		if (this.survivalHolding) {
+			this.log("[生存] 担当中なので、思考の乗り換えでは中断しない");
+			return;
+		}
 		if (this.currentAbort) {
 			this.currentAbort.abort("New task assigned by thinking loop");
 		}
@@ -3318,12 +3338,15 @@ export class MinecraftAgent {
 			this.maybeGreetNearbyPlayer();
 
 			const snapshot = await this.buildSurvivalSnapshot();
+			this.survivalHolding = true;
 			const decision = await this.arbiter.tick(snapshot, this.survivalActions, signal);
+			this.survivalHolding = decision.rule !== null;
 			this.metrics.noteTick(snapshot, decision.rule?.name ?? null);
 			this.metrics.reportIfDue(METRICS_REPORT_MS);
 			return decision.rule !== null;
 		} catch (e) {
 			// 反射行動で本来の行動を止めない。
+			this.survivalHolding = false;
 			if (!signal.aborted) this.log(`反射行動でつまずいた: ${e}`);
 			return false;
 		}

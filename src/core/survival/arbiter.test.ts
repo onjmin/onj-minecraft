@@ -240,6 +240,70 @@ test("夜に自分で潜って塞がっている状態を、閉じ込められ�
 	assert.equal(decision.rule?.name, "shelter");
 });
 
+test("素手で狩りに行かない。武器を作れるなら先に作る", () => {
+	// 素手の攻撃力は1、牛の体力は10。木の剣なら3発で済む。
+	const arbiter = new SurvivalArbiter();
+	const decision = arbiter.select(
+		emptySnapshot({
+			food: 12,
+			edible: null,
+			cookable: null,
+			preyDistance: 8,
+			armed: false,
+			armored: false,
+			craftableWeapon: true,
+		}),
+	);
+	assert.equal(decision.rule?.name, "arm");
+});
+
+test("素手で、武器も作れないなら狩りに行かない（飢えていない限り）", () => {
+	const arbiter = new SurvivalArbiter();
+	const decision = arbiter.select(
+		emptySnapshot({
+			food: 12,
+			edible: null,
+			cookable: null,
+			preyDistance: 8,
+			armed: false,
+			armored: false,
+			craftableWeapon: false,
+		}),
+	);
+	assert.notEqual(decision.rule?.name, "secure_food");
+});
+
+test("本当に飢えているなら、素手でも獲物へ行く", () => {
+	const arbiter = new SurvivalArbiter();
+	const decision = arbiter.select(
+		emptySnapshot({
+			food: 4,
+			edible: null,
+			cookable: null,
+			preyDistance: 8,
+			armed: false,
+			armored: false,
+			craftableWeapon: false,
+		}),
+	);
+	assert.equal(decision.rule?.name, "secure_food");
+});
+
+test("武器があるなら、食料の確保が武器作りより先", () => {
+	const arbiter = new SurvivalArbiter();
+	const decision = arbiter.select(
+		emptySnapshot({
+			food: 12,
+			edible: null,
+			cookable: null,
+			preyDistance: 8,
+			armed: true,
+			craftableWeapon: true,
+		}),
+	);
+	assert.equal(decision.rule?.name, "secure_food");
+});
+
 test("死んだら担当は持ち越さない", () => {
 	const arbiter = new SurvivalArbiter();
 	arbiter.select(emptySnapshot({ night: true, armed: false, armored: false, edible: null }));

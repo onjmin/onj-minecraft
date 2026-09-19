@@ -268,8 +268,79 @@ async function tryCraft(
 		return true;
 	} catch (err) {
 		agent.log(`[${label}] クラフトが拒否された: ${itemName} x${count}: ${err}`);
-		return false;
+		if (!String(err).includes("status=49")) return false;
 	}
+	// FailedToValidateSrcSlot(49): 拾った直後で、素材の山の識別子をこちらが
+	// 知らない。統合版は拾っても持ち物の更新を送ってこず、閉じる・開く・
+	// 主張違いの持ち替えや取引で促しても返ってこない(実測 2026-09-19、
+	// 5通り全滅)。返ってくるのは**実際に持ち物が変わったあと**だけなので、
+	// 余っているブロックを1個置いて変化を起こし、一覧を取り直してから
+	// もう一度だけ作る。置いたものは作ったあとに掘り戻す(先に掘り戻すと
+	// 拾い直しでまた識別子が分からなくなる)。
+	const placed = await placeSpareBlock(agent, label);
+	if (!placed) return false;
+	let ok = false;
+	try {
+		await agent.driver.craft(itemName, count, craftingTable);
+		ok = true;
+	} catch (err) {
+		agent.log(`[${label}] 取り直しても拒否された: ${itemName} x${count}: ${err}`);
+	}
+	if (placed.recover) {
+		try {
+			await agent.driver.dig(neverAbort(), placed.block.position);
+			await agent.driver.pickupNearbyItems(neverAbort());
+		} catch (err) {
+			agent.log(`[${label}] 置いたブロックを掘り戻せなかった: ${err}`);
+		}
+	}
+	return ok;
+}
+
+/** 素手で掘り戻せる順。cobblestone は素手だと落ちないので最後で、掘り戻さない。 */
+const SPARE_BLOCKS = [
+	"dirt",
+	"grass_block",
+	"sand",
+	"gravel",
+	"netherrack",
+	"moss_block",
+	"oak_planks",
+	"spruce_planks",
+	"birch_planks",
+	"jungle_planks",
+	"acacia_planks",
+	"dark_oak_planks",
+	"oak_log",
+	"spruce_log",
+	"birch_log",
+	"jungle_log",
+	"acacia_log",
+	"dark_oak_log",
+	"cobblestone",
+];
+
+/**
+ * 余っているブロックを1個置く。識別子を取り直すための「実際の変化」を起こす。
+ * 置けたらそのブロックと、掘り戻してよいかを返す。
+ */
+async function placeSpareBlock(
+	agent: MinecraftAgent,
+	label: string,
+): Promise<{ block: BlockInfo; recover: boolean } | null> {
+	const items = agent.driver.inventory.items();
+	const name = SPARE_BLOCKS.find((n) => items.some((i) => i.name === n && i.count > 0));
+	if (!name) {
+		agent.log(`[${label}] 識別子を取り直すために置けるブロックが無い`);
+		return null;
+	}
+	agent.log(`[${label}] 識別子を取り直すため ${name} を1個置く`);
+	const block = await tryPlaceBlock(agent, name, name);
+	if (!block) return null;
+	// 置いた直後に一覧が届くまでの間。クラフトはサイドカー側の写しを使うので、
+	// こちらの一覧を取り直す必要は無い。
+	await new Promise((r) => setTimeout(r, 700));
+	return { block, recover: name !== "cobblestone" };
 }
 
 /**

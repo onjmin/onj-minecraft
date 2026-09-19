@@ -286,10 +286,22 @@ type session struct {
 	world *world
 	// 進行中の採掘。tick ループが毎回 BlockActions を積む。
 	digging *digTask
+	// digStop は採掘が終わった位置。次の tick で StopBreak を一度だけ送る。
+	//
+	// 壊れたあとに「やめた」を送らないと、サーバー側の破壊状態がその位置に
+	// 残ることがある。そこへ作業台を置くと、置いた瞬間に壊れて拾い直す
+	// (実測 2026-09-19 12:53、土を掘って置いた作業台が3秒後に item として
+	// 拾われ、開けずに終わった)。
+	digStop *protocol.BlockPos
 	// 既知の安全地帯(村・ベッド・拠点)。逃走時に defendLocked が参照する。
 	safeSpots []safeSpot
 	// 次の tick で送る設置。統合版の設置は player_auth_input に載せる。
 	pendingPlace *protocol.UseItemTransactionData
+	// pendingAttack は次の tick で送る攻撃。
+	//
+	// 設置と同じく、入力と同じ tick の流れに載せる。コマンドの goroutine から
+	// 直接 WritePacket していたときは、サーバーが受け取っても何も起きなかった。
+	pendingAttack *protocol.UseItemOnEntityTransactionData
 
 	// レシピ。サーバーが接続時に全部送ってくる。出来上がる物の名前で引く。
 	recipes map[string][]craftRecipe
@@ -300,6 +312,13 @@ type session struct {
 	// クラフトの結果は ItemStackResponse で返り、InventorySlot では来ない。
 	// 何を作って何を消したかを覚えておき、成功したら持ち物の写しに反映する。
 	craftEffect map[int32]craftOutcome
+	// スロット移動の結果も ItemStackResponse でしか返らない。成功したら
+	// 写しの from/to を入れ替える。ContainerInfo は識別子と個数しか
+	// 持たず、どの物がどこへ動いたかは載っていない。
+	moveEffect map[int32][2]int
+	// 戦闘の持ち替えで、奥の武器をホットバーへ移す要求を出した時刻。
+	// 応答が来る前に毎 tick 重ねて出さないための間隔に使う。
+	weaponMoveAt time.Time
 
 	done chan struct{}
 	once sync.Once
@@ -337,6 +356,7 @@ func newSession(conn *minecraft.Conn, game minecraft.GameData) *session {
 		craftReqID:  1, // 最初の -2 で -1 になる
 		craftWaiter: map[int32]int{},
 		craftEffect: map[int32]craftOutcome{},
+		moveEffect:  map[int32][2]int{},
 		done:        make(chan struct{}),
 	}
 }
@@ -669,6 +689,10 @@ func (s *session) handle(pk packet.Packet) {
 		}
 		s.mu.Lock()
 		if e, ok := s.entities[v.ItemEntityRuntimeID]; ok && e.Type == "item" {
+			if os.Getenv("BEDROCK_TRACE_INV") == "1" {
+				fmt.Fprintf(os.Stderr, "pickup %s x%d groundID=%d\n",
+					e.Name, e.Item.Stack.Count, e.Item.StackNetworkID)
+			}
 			s.addItemLocked(e.Item)
 			delete(s.entities, v.ItemEntityRuntimeID)
 			delete(s.unique, e.UniqueID)
@@ -685,6 +709,31 @@ func (s *session) handle(pk packet.Packet) {
 
 	case *packet.MoveActorAbsolute:
 		s.updateEntityPos(v.EntityRuntimeID, v.Position)
+
+	case *packet.MoveActorDelta:
+		// mob の移動はほぼ全部こちらで来る。MoveActorAbsolute はテレポートや
+		// 乗り物など限られた場面にしか使われない。
+		//
+		// これを読んでいなかったので、羊や牛の位置は湧いた瞬間のまま止まって
+		// いた。こちらは「届く距離にいる」と判定して攻撃を送るが、サーバー側の
+		// 本当の位置は離れているので取引は黙って捨てられる。実測 2026-09-19、
+		// 本番 Realm で羊を20秒に57回殴って一度も減らない、が28回続いた。
+		// 持ち物は空で識別子の問題ではなく、ローカルで真隣に湧かせた牛は
+		// 倒せていた(動かないので位置がずれない)。名前に反して中身は差分では
+		// なく絶対座標で、送られてこない軸は前の値のまま。
+		s.mu.Lock()
+		if e, ok := s.entities[v.EntityRuntimeID]; ok {
+			if x, ok := v.PositionX.Value(); ok {
+				e.Pos[0] = x
+			}
+			if y, ok := v.PositionY.Value(); ok {
+				e.Pos[1] = y
+			}
+			if z, ok := v.PositionZ.Value(); ok {
+				e.Pos[2] = z
+			}
+		}
+		s.mu.Unlock()
 
 	case *packet.Text:
 		// 自分の発言もサーバーから返ってくるので、送信者で切り分ける。
@@ -876,12 +925,44 @@ func (s *session) handle(pk packet.Packet) {
 					s.applyCraftLocked(eff)
 					delete(s.craftEffect, r.RequestID)
 				}
+				if mv, ok := s.moveEffect[r.RequestID]; ok {
+					// 写しの上で from と to を入れ替える。空の枠へ置いた場合も
+					// この形で書ける(空側は削除になる)。
+					from, to := mv[0], mv[1]
+					a, okA := s.rawSlots[from]
+					b, okB := s.rawSlots[to]
+					delete(s.rawSlots, from)
+					delete(s.rawSlots, to)
+					if okA && a.Stack.Count > 0 {
+						s.rawSlots[to] = a
+						s.syncSlotLocked(to, a)
+					} else {
+						s.syncSlotLocked(to, protocol.ItemInstance{})
+					}
+					if okB && b.Stack.Count > 0 {
+						s.rawSlots[from] = b
+						s.syncSlotLocked(from, b)
+					} else {
+						s.syncSlotLocked(from, protocol.ItemInstance{})
+					}
+					delete(s.moveEffect, r.RequestID)
+				}
 				s.mu.Unlock()
 				// 応答には変わったスロットの新しい識別子が入っている。これを
 				// 取り込まないと、次の要求で古い StackNetworkID を送ることになり
 				// FailedToValidateSrcSlot(49) で拒否される。作業台を置いたあと
 				// 3x3 のクラフトが通らなかったのがこれ。
 				s.mu.Lock()
+				if os.Getenv("BEDROCK_TRACE_CRAFT") == "1" {
+					fmt.Fprintf(os.Stderr, "craft reqID=%d ok containers=%d\n", r.RequestID, len(r.ContainerInfo))
+					for _, info := range r.ContainerInfo {
+						for _, si := range info.SlotInfo {
+							fmt.Fprintf(os.Stderr, "  c=%d slot=%d id=%d n=%d\n",
+								info.Container.ContainerID, si.Slot, si.StackNetworkID, si.Count)
+						}
+					}
+				}
+				touched := 0
 				for _, info := range r.ContainerInfo {
 					if info.Container.ContainerID != protocol.ContainerCombinedHotBarAndInventory &&
 						info.Container.ContainerID != protocol.ContainerInventory &&
@@ -889,6 +970,7 @@ func (s *session) handle(pk packet.Packet) {
 						continue
 					}
 					for _, si := range info.SlotInfo {
+						touched++
 						slot := int(si.Slot)
 						it, ok := s.rawSlots[slot]
 						if !ok {
@@ -907,10 +989,25 @@ func (s *session) handle(pk packet.Packet) {
 
 				// 作った物の識別子はこちらでは分からない。0 のまま次の素材に
 				// 使うと FailedToValidateSrcSlot(49) で弾かれる。応答の
-				// ContainerInfo にも載ってこないので、持ち物の画面を閉じて
-				// サーバーに一覧を送り直させる。届けば InventoryContent が
-				// 全スロットを正しい識別子で埋め直す。
-				_ = s.conn.WritePacket(&packet.ContainerClose{WindowID: 0})
+				// ContainerInfo にも載ってこない。
+				//
+				// ContainerClose{0} で一覧を送り直させるつもりだったが、本番
+				// Realm では何も返ってこない(実測 2026-09-19)。素材を取った枠の
+				// 識別子も変わっているので、成功後の写しは信用しない。予測扱いに
+				// して、次の要求の前に resyncSlotsIfPredicted で取り直す。
+				// 実測 11:34、ツルハシを作った直後の板材クラフトが、出来上がりを
+				// 重ねる先(枠6)の食い違いで CannotPlaceItem(55) を7回続けていた。
+				//
+				// ただし応答の ContainerInfo に持ち物の枠が載っていれば(2x2 の
+				// クラフトでは素材の枠と出来上がりの枠の両方が載る。実測
+				// 12:49)、上の取り込みで写しは正しくなっている。予測扱いに
+				// するのは載っていなかったときだけ。
+				s.mu.Lock()
+				if touched == 0 {
+					s.slotsPredicted = true
+				}
+				s.mu.Unlock()
+				s.closeOpenScreen()
 				s.reply(id, true, "", nil)
 			} else {
 				// moveSlot・wear もこの待ち行列に相乗りしているので、
@@ -939,8 +1036,42 @@ func (s *session) handle(pk packet.Packet) {
 				if r.Status == protocol.ItemStackResponseStatusFailedToValidateSrcSlot {
 					_ = s.conn.WritePacket(&packet.ContainerClose{WindowID: 0})
 				}
+				s.mu.Lock()
+				delete(s.moveEffect, r.RequestID)
+				s.mu.Unlock()
+				if os.Getenv("BEDROCK_TRACE_CRAFT") == "1" {
+					s.mu.Lock()
+					fmt.Fprintf(os.Stderr, "craft reqID=%d rejected status=%d predicted=%v containers=%d\n",
+						r.RequestID, r.Status, s.slotsPredicted, len(r.ContainerInfo))
+					for slot, it := range s.rawSlots {
+						fmt.Fprintf(os.Stderr, "  slot=%d net=%d id=%d n=%d\n",
+							slot, it.Stack.ItemType.NetworkID, it.StackNetworkID, it.Stack.Count)
+					}
+					s.mu.Unlock()
+				}
+				s.closeOpenScreen()
 				s.reply(id, false, fmt.Sprintf("操作が拒否されました(status=%d)", r.Status), nil)
 			}
+		}
+
+	case *packet.ActorEvent:
+		// 負傷・死亡などの合図。攻撃が当たっているかの、いちばん直接の証拠。
+		if os.Getenv("ONJ_TRACE_HIT") != "" {
+			fmt.Fprintf(os.Stderr, "[sidecar] ActorEvent 相手=%d 種類=%d\n",
+				v.EntityRuntimeID, v.EventType)
+		}
+
+	case *packet.UpdateAbilities:
+		// サーバーが配る「してよいこと」。攻撃が黙って効かないときに、
+		// ここで mob への攻撃が落ちていることがある。読めるようにしておく。
+		for _, layer := range v.AbilityData.Layers {
+			fmt.Fprintf(os.Stderr,
+				"[sidecar] 権限 type=%d (攻撃mob=%v 攻撃player=%v 建築=%v 採掘=%v)\n",
+				layer.Type,
+				layer.Values&protocol.AbilityAttackMobs != 0,
+				layer.Values&protocol.AbilityAttackPlayers != 0,
+				layer.Values&protocol.AbilityBuild != 0,
+				layer.Values&protocol.AbilityMine != 0)
 		}
 
 	case *packet.PacketViolationWarning:
@@ -1013,6 +1144,20 @@ func (s *session) tick() {
 		if err := s.conn.WritePacket(s.buildInput(n)); err != nil {
 			s.close(fmt.Sprintf("入力の送信に失敗: %v", err))
 			return
+		}
+		// 攻撃はこの tick の入力の直後に送る。順番に意味がある。
+		s.mu.Lock()
+		atk := s.pendingAttack
+		s.pendingAttack = nil
+		s.mu.Unlock()
+		if atk != nil {
+			// 本物のクライアントは殴るたびに腕を振る。
+			_ = s.conn.WritePacket(&packet.Animate{
+				ActionType:      packet.AnimateActionSwingArm,
+				EntityRuntimeID: s.game.EntityRuntimeID,
+				SwingSource:     packet.AnimateSwingSourceAttack,
+			})
+			_ = s.conn.WritePacket(&packet.InventoryTransaction{TransactionData: atk})
 		}
 	}
 }
@@ -1133,6 +1278,14 @@ func (s *session) buildInput(n uint64) *packet.PlayerAuthInput {
 			BlockPos: d.pos,
 			Face:     d.face,
 		}})
+	} else if p := s.digStop; p != nil {
+		// 終わった採掘の「やめた」を一度だけ送る。
+		flags.Set(packet.InputFlagPerformBlockActions)
+		pk.BlockActions = protocol.Option([]protocol.PlayerBlockAction{{
+			Action:   protocol.PlayerActionStopBreak,
+			BlockPos: *p,
+		}})
+		s.digStop = nil
 	}
 
 	// 設置は1tickぶんだけ載せる。載せっぱなしにすると毎tick置き続ける。
@@ -1264,6 +1417,16 @@ func (s *session) steerLocked(n uint64) {
 		}
 		// 掘る/置くが要る歩は、それが済むまで前進しない。
 		// 進みながらやると、まだ空いていない穴に突っ込んで弾かれる。
+		// 下ごしらえの前に一旦倒す。順番が要る。
+		//
+		// 以前はここが prepareStepLocked の**後**にあり、柱積み(stepTower)や
+		// 浮上(stepSwimUp)が「跳ぶ」ために立てた jump を、その場で打ち消して
+		// いた。跳ばないので空中に行けず、空中に行けないので足元に置けず、
+		// 置けないので永久に終わらない。実測 2026-09-18 10:08〜10:11、
+		// 動作5(柱積み)だけが繰り返し諦められ、地表まで14〜22マスの穴から
+		// 一度も上がれなかった。
+		s.controls["forward"] = false
+		s.controls["jump"] = false
 		if !s.prepareStepLocked(st) {
 			if !g.waiting || g.waitStep != st.Pos {
 				g.waiting = true
@@ -1274,8 +1437,6 @@ func (s *session) steerLocked(n uint64) {
 				s.abandonStepLocked(g, st)
 				return
 			}
-			s.controls["forward"] = false
-			s.controls["jump"] = false
 			return
 		}
 		g.waiting = false
@@ -1715,8 +1876,15 @@ func (s *session) holdBestWeaponLocked() {
 	rank := []string{"netherite", "diamond", "iron", "stone", "golden", "wooden"}
 	bestSlot := -1
 	bestRank := len(rank)
+	// ホットバー(0..8)の外も見る。
+	//
+	// 拾った物や作った物がどのスロットに入るかはこちらで決められない。
+	// ホットバーだけを見ていたので、作った木の剣が9番以降に入ると
+	// 永久に握られず、素手で殴り続けることになっていた。素手の攻撃力は1、
+	// 木の剣は4。牛(体力10)を倒すのに10発と3発の差になる。
+	// 置ける物を握る側(holdPlaceableLocked)は既に奥から移して握っている。
 	for _, it := range s.slots {
-		if it.Slot < 0 || it.Slot > 8 {
+		if it.Slot < 0 || it.Slot > 35 {
 			continue
 		}
 		if !strings.HasSuffix(it.Name, "_sword") && !strings.HasSuffix(it.Name, "_axe") {
@@ -1739,6 +1907,66 @@ func (s *session) holdBestWeaponLocked() {
 		}
 	}
 	if bestSlot < 0 || int32(bestSlot) == s.heldSlot {
+		return
+	}
+	// ホットバーの外にあるなら、先に手前の枠へ移す。握るのは移ってから。
+	//
+	// MobEquipment は選ぶだけで物を動かさない。HotBarSlot に 9 以上を
+	// 入れても枠が無いし、InventorySlot だけ奥を指しても、サーバーは
+	// 「主張が違う」と持ち物一式を送り返してくるだけで剣は奥のまま
+	// (実測 2026-09-19 11:15、13秒間の攻撃中に InventoryContent が20回)。
+	// 移すのは ItemStackRequest(moveSlot と同じ)で、応答が来るまで
+	// 同じ要求を重ねない。
+	if bestSlot > 8 {
+		if time.Since(s.weaponMoveAt) < 3*time.Second {
+			return
+		}
+		s.weaponMoveAt = time.Now()
+		src := s.rawSlots[bestSlot]
+		inv := protocol.FullContainerName{ContainerID: protocol.ContainerCombinedHotBarAndInventory}
+		dst := -1
+		for slot := 0; slot <= 8; slot++ {
+			if item, ok := s.rawSlots[slot]; !ok || item.Stack.Count == 0 {
+				dst = slot
+				break
+			}
+		}
+		var action protocol.StackRequestAction
+		if dst < 0 {
+			// ホットバーが満杯なら末尾と入れ替える。
+			dst = 8
+			swap := &protocol.SwapStackRequestAction{}
+			swap.Source = protocol.StackRequestSlotInfo{
+				Container: inv, Slot: byte(bestSlot), StackNetworkID: src.StackNetworkID,
+			}
+			swap.Destination = protocol.StackRequestSlotInfo{
+				Container: inv, Slot: byte(dst), StackNetworkID: s.rawSlots[dst].StackNetworkID,
+			}
+			action = swap
+		} else {
+			place := &protocol.PlaceStackRequestAction{}
+			place.Count = byte(min(src.Stack.Count, 64))
+			place.Source = protocol.StackRequestSlotInfo{
+				Container: inv, Slot: byte(bestSlot), StackNetworkID: src.StackNetworkID,
+			}
+			place.Destination = protocol.StackRequestSlotInfo{
+				Container: inv, Slot: byte(dst), StackNetworkID: 0,
+			}
+			action = place
+		}
+		s.craftReqID -= 2
+		reqID := s.craftReqID
+		// 応答は誰も待たない(id 0)。成功なら moveEffect で写しを入れ替える。
+		s.craftWaiter[reqID] = 0
+		s.moveEffect[reqID] = [2]int{bestSlot, dst}
+		// 奥の枠を触る要求は、持ち物の画面を開いていないと拒否される(moveSlot 参照)。
+		_ = s.conn.WritePacket(&packet.Interact{
+			ActionType:            packet.InteractActionOpenInventory,
+			TargetEntityRuntimeID: s.game.EntityRuntimeID,
+		})
+		_ = s.conn.WritePacket(&packet.ItemStackRequest{
+			Requests: []protocol.ItemStackRequest{{RequestID: reqID, Actions: []protocol.StackRequestAction{action}}},
+		})
 		return
 	}
 	s.heldSlot = int32(bestSlot)
@@ -1837,9 +2065,12 @@ const (
 	planReach float32 = 32
 	// 1歩の下ごしらえ(掘る/置く)を待ってよい時間。
 	//
-	// 素手で石を掘ると7秒ほどかかるので、それは通る長さにする。ただし
-	// 目標の制限時間(30秒)を1歩で食い潰さない長さに抑える。
-	stepWaitLimit = 8 * time.Second
+	// 素手の採掘は遅い。統合版で石は約7.5秒、深層岩なら倍近くかかる。
+	// 8秒にしていたら、階段を刻む歩(stepDigUp)が毎回わずかに間に合わず、
+	// 同じ場所で3回諦めて目標ごと失敗していた(実測 2026-09-18 10:00、
+	// (-8,65,61) で動作8を3回)。掘り切れる長さは要る。
+	// ただし目標の制限時間(30秒)を1歩で食い潰さない長さに抑える。
+	stepWaitLimit = 12 * time.Second
 	// 下ごしらえを諦めた回数の上限。これを超えたら目標ごと失敗にする。
 	stepAbandonLimit = 3
 )
@@ -2360,6 +2591,9 @@ func (s *session) dispatch(c command) {
 				}
 				action = swap
 			} else {
+				// 形は Place(c=12→c=12)でよい。2026-09-19 に Take・別コンテナ番号・
+				// 識別子0 も試したが、拒否の原因は形ではなく「持ち物の画面を
+				// 開いていない」ことだった(下の Interact を参照)。
 				place := &protocol.PlaceStackRequestAction{}
 				place.Count = byte(min(src.Stack.Count, 64))
 				place.Source = protocol.StackRequestSlotInfo{
@@ -2369,6 +2603,10 @@ func (s *session) dispatch(c command) {
 					Container: inv, Slot: byte(to), StackNetworkID: 0,
 				}
 				action = place
+				if os.Getenv("BEDROCK_TRACE_CRAFT") == "1" {
+					fmt.Fprintf(os.Stderr, "moveSlot reqID=%d from=%d(id=%d) to=%d\n",
+						reqID, from, src.StackNetworkID, to)
+				}
 			}
 			// 送りっぱなしで即 true を返していた。サーバーがこの要求を
 			// 拒否しても(例: 元の識別子が古くて FailedToValidateSrcSlot)
@@ -2380,8 +2618,20 @@ func (s *session) dispatch(c command) {
 			// 直した値を使えるので、moveSlot 直後のクラフトが古い識別子で
 			// 弾かれることも減る。
 			s.craftWaiter[reqID] = c.ID
+			s.moveEffect[reqID] = [2]int{from, to}
 			s.mu.Unlock()
 
+			// 先に持ち物の画面を開く。クラフトと同じ。
+			//
+			// 開いていないと、奥の枠(9..35)を元にした要求が
+			// FailedToValidateSrcSlot(49) で拒否される。識別子を正しくしても、
+			// 形を Take/別コンテナ/識別子0 に変えても同じだった(実測 2026-09-19
+			// 12:29、4通り×2周すべて 49)。クラフトの直後だけ通っていたのは、
+			// その画面がまだ開いていたから。
+			_ = s.conn.WritePacket(&packet.Interact{
+				ActionType:            packet.InteractActionOpenInventory,
+				TargetEntityRuntimeID: s.game.EntityRuntimeID,
+			})
 			if err := s.conn.WritePacket(&packet.ItemStackRequest{
 				Requests: []protocol.ItemStackRequest{{RequestID: reqID, Actions: []protocol.StackRequestAction{action}}},
 			}); err != nil {
@@ -3057,36 +3307,37 @@ func (s *session) dispatch(c command) {
 		s.lookAtLocked(e.Pos[0], e.Pos[1]+1, e.Pos[2])
 		held := s.rawSlots[int(s.heldSlot)]
 		slot := s.heldSlot
-		pos := s.pos
+		// player_pos は足元。目線の高さではない。
+		//
+		// これが攻撃が一度も通らなかった原因。s.pos は目線の高さ(足元+1.62)で、
+		// PlayerAuthInput はその形で送る。だが攻撃の取引に載せる player_pos は
+		// 足元で、1.62 ずれた値を送るとサーバーは取引ごと黙って捨てる。
+		// エラーも違反通知も返らないので、こちらからは「殴っているのに減らない」
+		// としか見えない。実測 2026-09-18、真隣の牛に素手で93発当てても無傷。
+		// 足元に直した途端、25発で倒れて beef と leather が入った。
+		//
+		// 統合版の座標が目線の高さなのは既知の罠で、他の箇所では引いていた。
+		// ここだけ引き忘れていた。
+		pos := s.feetLocked()
 		s.mu.Unlock()
 
-		// 腕を振ってから殴る。
+		// 次の tick で送る。ここから直接送らない。
 		//
-		// 本物のクライアントは攻撃のたびに Animate(SwingArm) を送る。
-		// 取引だけを送っても、サーバー側の実装によっては当たり判定に
-		// 入らない。実測 2026-09-18 09:25、羊を20秒で51回殴っても
-		// 減らなかった(羊の体力は8、素手でも8回で足りる)。届いていて、
-		// 遮蔽も無く、それでも減らないなら、殴ったと見なされていない。
-		_ = s.conn.WritePacket(&packet.Animate{
-			ActionType:      packet.AnimateActionSwingArm,
-			EntityRuntimeID: s.game.EntityRuntimeID,
-			SwingSource:     packet.AnimateSwingSourceAttack,
-		})
-		err := s.conn.WritePacket(&packet.InventoryTransaction{
-			TransactionData: &protocol.UseItemOnEntityTransactionData{
-				TargetEntityRuntimeID: rid,
-				ActionType:            protocol.UseItemOnEntityActionAttack,
-				HotBarSlot:            slot,
-				HeldItem:              held,
-				Position:              pos,
-				// 相手の中心あたりを叩く。
-				ClickedPosition: mgl32.Vec3{0, 1, 0},
-			},
-		})
-		if err != nil {
-			s.reply(c.ID, false, fmt.Sprintf("攻撃の送信に失敗: %v", err), nil)
-			return
+		// 設置・採掘・食事はすべて PlayerAuthInput と同じ tick の流れに
+		// 載っていて、それらは動いている。攻撃だけがコマンドの goroutine から
+		// 直接送られていて、そして一度も効いていなかった。実測
+		// 2026-09-18 11:12、真隣の牛に素手で80発送って無傷。
+		s.mu.Lock()
+		s.pendingAttack = &protocol.UseItemOnEntityTransactionData{
+			TargetEntityRuntimeID: rid,
+			ActionType:            protocol.UseItemOnEntityActionAttack,
+			HotBarSlot:            slot,
+			HeldItem:              held,
+			Position:              pos,
+			// 相手の中心あたりを叩く。
+			ClickedPosition: mgl32.Vec3{0, 1, 0},
 		}
+		s.mu.Unlock()
 		s.reply(c.ID, true, "", map[string]any{"distance": dist, "blocked": blocked})
 
 	case "snapshot":
@@ -3584,7 +3835,7 @@ func firstFreeSlotLocked(s *session, used map[int]bool) int {
 //
 // 待たずに進むと結局古い識別子で送ることになる。届かなければ諦めて進む
 // (待ち続けるより、拒否されて次の手に移る方がまだ動く)。
-const slotResyncWait = 800 * time.Millisecond
+const slotResyncWait = 600 * time.Millisecond
 
 // resyncSlotsIfPredicted は、予測で書いた持ち物があるならサーバーに
 // 一覧を送り直させ、正しい識別子を取り直す。
@@ -3593,23 +3844,62 @@ const slotResyncWait = 800 * time.Millisecond
 // InventoryContent で全スロットを送り直す。クラフトの応答から識別子を
 // 取り込むのと同じ手で、あちらは「作った物の識別子が分からない」ときに使う。
 func (s *session) resyncSlotsIfPredicted() {
+	// 拾った直後の写しは識別子が予測のまま。サーバーに一覧を送り直させる
+	// 手は無い。ContainerClose{0}・Interact{OpenInventory}・主張違いの
+	// MobEquipment・ClickAir(ItemInteraction / InventoryTransaction 直送)を
+	// 本番 Realm で試したが、どれも何も返ってこなかった(実測 2026-09-19)。
+	// 一覧が届くのは、設置・消費・耐久減りなど実際に持ち物が変わったあとだけ。
+	//
+	// なのでここでは、直前の変化で届きかけている一覧があれば少しだけ待つに
+	// とどめる。届かなければ古い識別子で送って 49 で拒否され、呼び出し側
+	// (skills/crafting/util.ts の tryCraft)がブロックを1個置いて変化を起こし、
+	// 一覧を取り直してから作り直す。
 	s.mu.Lock()
 	need := s.slotsPredicted
 	s.mu.Unlock()
 	if !need {
 		return
 	}
-	_ = s.conn.WritePacket(&packet.ContainerClose{WindowID: 0})
-	deadline := time.Now().Add(slotResyncWait)
+	started := time.Now()
+	deadline := started.Add(slotResyncWait)
 	for time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 		s.mu.Lock()
 		done := !s.slotsPredicted
 		s.mu.Unlock()
 		if done {
+			if os.Getenv("BEDROCK_TRACE_INV") == "1" {
+				fmt.Fprintf(os.Stderr, "resync ok after %dms\n", time.Since(started).Milliseconds())
+			}
 			return
 		}
 	}
+	if os.Getenv("BEDROCK_TRACE_INV") == "1" {
+		fmt.Fprintf(os.Stderr, "resync timeout after %dms (InventoryContent 未着)\n",
+			time.Since(started).Milliseconds())
+	}
+}
+
+// closeOpenScreen は ItemStackRequest のために開いた画面を閉じる。
+//
+// クラフト・moveSlot は Interact{OpenInventory} か作業台の ClickBlock で
+// 画面を開いてから要求を送る。閉じずに放置すると、サーバーから見て画面が
+// 開いたままになり、次に作業台やかまどを ClickBlock しても ContainerOpen が
+// 返ってこない(実測 2026-09-19 13:58、目の前の作業台に対して
+// 「コンテナが開きませんでした」が続いた。成功後の ContainerClose{0} を
+// 外した直後から)。応答が来たら、開いていた窓と持ち物の画面を閉じる。
+func (s *session) closeOpenScreen() {
+	s.mu.Lock()
+	win := byte(0)
+	if s.container != nil {
+		win = s.container.WindowID
+		s.container = nil
+	}
+	s.mu.Unlock()
+	if win != 0 {
+		_ = s.conn.WritePacket(&packet.ContainerClose{WindowID: win})
+	}
+	_ = s.conn.WritePacket(&packet.ContainerClose{WindowID: 0})
 }
 
 func (s *session) addItemLocked(item protocol.ItemInstance) {
@@ -3710,6 +4000,8 @@ func (s *session) checkDig() {
 	expired := time.Now().After(d.deadline)
 	if done || expired {
 		s.digging = nil
+		pos := d.pos
+		s.digStop = &pos
 	}
 	s.mu.Unlock()
 

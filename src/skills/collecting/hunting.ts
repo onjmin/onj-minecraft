@@ -11,6 +11,14 @@ import { createSkill, type SkillResponse, skillResult } from "../types";
 const HUNT_BUDGET_MS = 20_000;
 /** 攻撃の間隔。統合版に厳密なクールダウンは無いが、詰めすぎると弾かれる。 */
 const ATTACK_INTERVAL_MS = 350;
+/**
+ * これより近ければ寄り直さずに殴る。
+ *
+ * サイドカーの攻撃の届く距離は3.5。そこに少し余裕を足した値にする。
+ */
+const APPROACH_RANGE = 4.5;
+/** 1回の寄りに使ってよい時間。刻んで、間に攻撃を挟む。 */
+const APPROACH_SLICE_MS = 5_000;
 
 /**
  * Collecting Domain: Hunting passive animals.
@@ -89,7 +97,30 @@ export const huntAnimalsSkill = createSkill<void, { hunted: string; success: boo
 				}
 				lastPos = current.position;
 				try {
-					await driver.goto(signal, { kind: "follow", entityId: target.id, distance: 1.5 });
+					// 近いときは寄り直さない。
+					//
+					// goto は1回あたり最大30秒待つ。動き回る動物に距離1.5まで
+					// 寄り切ろうとすると、それだけで狩りの持ち時間(20秒)を
+					// 使い切る。実測 2026-09-18 12:09、22秒かけて攻撃は1回。
+					// 殴れる距離にいるなら、寄るより殴る。届かないときの
+					// 寄りは driver.attack が内側で面倒を見る。
+					const me = driver.getState().position;
+					const gap = Math.hypot(
+						current.position.x - me.x,
+						current.position.y - me.y,
+						current.position.z - me.z,
+					);
+					if (gap > APPROACH_RANGE) {
+						// 短く刻む。動く相手に長い goto を掛けると、1回で
+						// 持ち時間を使い切って攻撃が入らない。
+						await driver
+							.goto(
+								signal,
+								{ kind: "follow", entityId: target.id, distance: 1.5 },
+								{ timeoutMs: APPROACH_SLICE_MS },
+							)
+							.catch(() => {});
+					}
 					await driver.attack(signal, target.id);
 					attacks++;
 					// 遮られた回数を数える。統合版は壁越しの攻撃を黙って
@@ -103,6 +134,20 @@ export const huntAnimalsSkill = createSkill<void, { hunted: string; success: boo
 					// 当たりません」のように、サイドカーが理由を返している。
 					// 捨てると、外からは「殴ったのに減らない」としか見えない。
 					lastError = err instanceof Error ? err.message : String(err);
+					// サイドカー側で相手が消えているなら倒している。
+					//
+					// 上の nearbyEntities は写しなので、サイドカーが RemoveActor を
+					// 受けた直後の攻撃は、写しに残ったまま「見当たりません」で
+					// 投げられる。実測 2026-09-19 11:15、羊を16発で倒して
+					// 羊毛と生羊肉を拾ったのに「生きたまま / 中断」で失敗に
+					// なっていた。
+					// 「その相手が見当たりません」(攻撃)と「攻撃対象(id)が見つかりません」
+					// (寄り)の2通りの文面がある。実測 11:50、鶏を1発で倒したのに
+					// 後者の文面で「生きたまま」になっていた。
+					if (lastError.includes("見当たりません") || lastError.includes("が見つかりません")) {
+						killed = true;
+						lastError = "";
+					}
 					break;
 				}
 			}

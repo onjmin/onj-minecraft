@@ -25,6 +25,7 @@ import type {
 	InventoryReader,
 	ItemInfo,
 	MoveGoal,
+	MoveOptions,
 	Position,
 	Registry,
 	WorldReader,
@@ -669,7 +670,7 @@ export class BedrockDriver implements BotDriver {
 	/** 最後に状態を読んだ時刻。時刻の飛びを見るために持つ。 */
 	private lastStateAt = 0;
 
-	async goto(signal: AbortSignal, goal: MoveGoal): Promise<void> {
+	async goto(signal: AbortSignal, goal: MoveGoal, options?: MoveOptions): Promise<void> {
 		const target = this.resolveGoal(goal);
 		if (!target) notImplemented(`この移動目標(${goal.kind})`);
 
@@ -689,7 +690,7 @@ export class BedrockDriver implements BotDriver {
 					// 掘らずに行きたいときは face に 1 を載せる。専用の欄が
 					// 無いので流用している。
 					face: target.noDig ? 1 : 0,
-					timeoutMs: 30_000,
+					timeoutMs: options?.timeoutMs ?? 30_000,
 				},
 				35_000,
 			);
@@ -894,6 +895,7 @@ export class BedrockDriver implements BotDriver {
 	public lastAttackDistance = 0;
 	async attack(signal: AbortSignal, entityId: number): Promise<void> {
 		// 相手は動く。寄っている間に離れるので、座標を取り直しながら追う。
+		let lastApproachError = "";
 		for (let i = 0; i < 4; i++) {
 			if (signal.aborted) throw new Error("中断された");
 			await this.refresh();
@@ -910,14 +912,32 @@ export class BedrockDriver implements BotDriver {
 				this.lastAttackDistance = Number(res?.distance ?? 0);
 				return;
 			}
-			await this.goto(signal, {
-				kind: "xz",
-				x: target.position.x,
-				z: target.position.z,
-				distance: 1.2,
-			});
+			try {
+				// 高さも合わせる。
+				//
+				// 水平距離だけの goto は、相手の真上や真下に立った時点で
+				// 「着いた」と返す。こちらの届く距離の判定は3次元なので、
+				// 高さが3マス違うと、成功を返され続けて一度も殴れない。
+				// 実測 2026-09-18 12:19、牛に対して寄り直しが4回とも成功し、
+				// それでも「近づけませんでした」で終わっていた(理由が
+				// 付かないのは、goto が失敗していないという意味だった)。
+				await this.goto(
+					signal,
+					{ kind: "near", position: { ...target.position }, distance: 1.2 },
+					// 相手は動く。長く粘るより、寄り直して座標を取り直す方が早い。
+					{ timeoutMs: 4_000 },
+				);
+			} catch (err) {
+				// 寄れなかった理由を捨てない。「近づけませんでした」だけでは、
+				// 経路が無いのか、遮られているのか、相手が逃げているのかが
+				// 分からない。実測 2026-09-18 12:17、牛に寄れず6秒で終わった
+				// ときも、外からは理由が一つも見えなかった。
+				lastApproachError = err instanceof Error ? err.message : String(err);
+			}
 		}
-		throw new Error(`攻撃対象(${entityId})に近づけませんでした`);
+		throw new Error(
+			`攻撃対象(${entityId})に近づけませんでした${lastApproachError ? `（${lastApproachError}）` : ""}`,
+		);
 	}
 	async equip(itemName: string, destination: string): Promise<void> {
 		const want = stripNamespace(itemName);

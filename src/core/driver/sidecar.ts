@@ -140,8 +140,26 @@ export class BedrockSidecar {
 		if (o.name) args.push("-name", o.name);
 		if (o.tokenCache) args.push("-token-cache", o.tokenCache);
 
+		// 検証用の環境変数を WSL 側へ持ち込む。
+		//
+		// Windows の環境変数は wsl 経由では引き継がれない。攻撃の送り方を
+		// 切り替えて実測するのに、その都度ビルドし直すのは無駄なので、
+		// ONJ_ で始まるものだけを明示的に渡す。
+		const passthrough = Object.entries(process.env)
+			.filter(([k, v]) => k.startsWith("ONJ_") && v)
+			.map(([k, v]) => `${k}=${v}`);
 		const [file, spawnArgs] = viaWsl
-			? ["wsl", ["-d", o.wslDistro ?? "Ubuntu", "--", toWslPath(bin), ...args]]
+			? [
+					"wsl",
+					[
+						"-d",
+						o.wslDistro ?? "Ubuntu",
+						"--",
+						...(passthrough.length > 0 ? ["env", ...passthrough] : []),
+						toWslPath(bin),
+						...args,
+					],
+				]
 			: [bin, args];
 
 		const proc = spawn(file as string, spawnArgs as string[], {

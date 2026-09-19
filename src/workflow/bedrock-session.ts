@@ -64,6 +64,41 @@ export function isLeaveRequest(message: string): boolean {
 	return LEAVE_REQUESTS.some((w) => text.includes(w.toLowerCase()));
 }
 
+/** 自分宛てかどうかを判断する手がかり。 */
+export interface AddressCue {
+	/** 自分の接続名。 */
+	selfName: string;
+	/** 自分が最後に発言してからの経過(ms)。発言していなければ null。 */
+	botSpokeAgoMs: number | null;
+	/** 発言者との距離(ブロック)。見えていなければ null。 */
+	speakerDistance: number | null;
+}
+
+/** ボットを指す言い方。名前を正確に呼ばなくても宛先は分かる。 */
+const BOT_WORDS = ["bot", "ボット", "ぼっと", "くさぼ", "kusabot"];
+/** 自分の発言への返事とみなす猶予。 */
+export const REPLY_WINDOW_MS = 120_000;
+/** この距離より近い人の発言は自分に向けたものとみなす。 */
+export const NEARBY_SPEAKER_BLOCKS = 12;
+
+/**
+ * 退出要請が自分宛てか。
+ *
+ * 言い回しだけで抜けると、他人同士のやり取りで抜けてしまう。実測 2026-09-19
+ * 12:19、他プレイヤー同士の PK で出た「やめてね」を自分宛てと取って席を譲り、
+ * 30秒後に戻る、を繰り返した。名前やボットを指す語が入っているか、自分の
+ * 発言の直後か、発言者がすぐ近くにいるか、のどれかなら自分宛てとみなす。
+ * 「このbotの動作を止めてほしい」のような依頼は語で拾えるので取りこぼさない。
+ */
+export function isAddressedToBot(message: string, cue: AddressCue): boolean {
+	const text = message.toLowerCase();
+	if (cue.selfName && text.includes(cue.selfName.toLowerCase())) return true;
+	if (BOT_WORDS.some((w) => text.includes(w))) return true;
+	if (cue.botSpokeAgoMs !== null && cue.botSpokeAgoMs <= REPLY_WINDOW_MS) return true;
+	if (cue.speakerDistance !== null && cue.speakerDistance <= NEARBY_SPEAKER_BLOCKS) return true;
+	return false;
+}
+
 /**
  * 席を譲るべきか。
  *

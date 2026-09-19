@@ -14,7 +14,7 @@ import { MinecraftAgent } from "../core/agent";
 import { BedrockDriver } from "../core/driver/bedrock";
 import { envNum } from "../core/utils/env";
 import { kusabot } from "../profiles/kusabot";
-import { isLeaveRequest, shouldYieldSeat } from "./bedrock-session";
+import { isAddressedToBot, isLeaveRequest, shouldYieldSeat } from "./bedrock-session";
 import { bedrockSkills } from "./bedrock-skills";
 
 /** 席を譲って抜けたときの終了コード。呼び出し側が再入場の判断に使う。 */
@@ -73,11 +73,41 @@ async function main() {
 		}
 	});
 
+	// 自分がいつ発言したかを控える。直後の「やめて」は自分への返事の可能性が高い。
+	let botSpokeAt: number | null = null;
+	const originalChat = driver.chat.bind(driver);
+	driver.chat = async (message: string) => {
+		botSpokeAt = Date.now();
+		return originalChat(message);
+	};
+
 	// 「抜けて」と言われたら、次の思考を待たずに抜ける。
+	//
+	// ただし自分宛てのときだけ。他プレイヤー同士の PK で出た「やめてね」を
+	// 拾って抜けたことがある(2026-09-19)。宛先の判断は isAddressedToBot。
 	driver.on("chat", (from: string, message: string) => {
-		if (isLeaveRequest(message)) {
-			void yieldSeat(`${from} に退出を頼まれた`);
+		if (!isLeaveRequest(message)) return;
+		const speaker = driver
+			.nearbyEntities(64)
+			.find((e) => e.kind === "player" && e.username === from);
+		const me = driver.getState().position;
+		const speakerDistance = speaker
+			? Math.hypot(
+					speaker.position.x - me.x,
+					speaker.position.y - me.y,
+					speaker.position.z - me.z,
+				)
+			: null;
+		const addressed = isAddressedToBot(message, {
+			selfName: driver.getState().username,
+			botSpokeAgoMs: botSpokeAt === null ? null : Date.now() - botSpokeAt,
+			speakerDistance,
+		});
+		if (!addressed) {
+			console.log(`[bedrock] ${from} の「${message}」は自分宛てではないと判断して残る`);
+			return;
 		}
+		void yieldSeat(`${from} に退出を頼まれた`);
 	});
 
 	// 誰かが寝ているのに近くにベッドが無くて自分は寝られなかったら、

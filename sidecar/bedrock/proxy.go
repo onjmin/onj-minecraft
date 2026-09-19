@@ -166,10 +166,20 @@ func proxyOne(ctx context.Context, client *minecraft.Conn, upstream string) {
 // 手順のパケットをそのまま転送すると、サーバーは二度目を受け取ることになり
 // "Unexpected packet" で接続を切る。
 func skipToServer(pk packet.Packet) bool {
-	switch pk.(type) {
+	switch v := pk.(type) {
 	case *packet.RequestNetworkSettings, *packet.Login, *packet.ClientToServerHandshake,
 		*packet.ResourcePackClientResponse, *packet.ClientCacheStatus,
 		*packet.RequestChunkRadius, *packet.SetLocalPlayerAsInitialised:
+		return true
+	case *packet.Unknown:
+		// このライブラリが知らないパケット。
+		//
+		// 実クライアント(1.26.51)は、こちらの gophertunnel(1.26.50 相当)の
+		// 表に無い ID を送ってくる。中身が分からないものをそのまま上流へ
+		// 流すと、サーバーが "Unexpected packet" で接続ごと切る。
+		// 実測 2026-09-18、ID 312 がこれで、繋いだ直後に切れていた。
+		// 観察が目的なので、知らないものは落として先へ進む。
+		fmt.Fprintf(os.Stderr, "[proxy] 知らないパケットを落とした ID=%d\n", v.PacketID)
 		return true
 	}
 	return false
@@ -177,6 +187,56 @@ func skipToServer(pk packet.Packet) bool {
 
 // inspect は見たいパケットだけを詳しく出す。全部出すと読めない。
 func inspect(pk packet.Packet) {
+	switch v := pk.(type) {
+	case *packet.InventoryTransaction:
+		// 攻撃はここに載る。中身をそのまま出す。
+		if d, ok := v.TransactionData.(*protocol.UseItemOnEntityTransactionData); ok {
+			emit(event{Event: "attack_request", Data: map[string]any{
+				"target":          d.TargetEntityRuntimeID,
+				"actionType":      d.ActionType,
+				"hotBarSlot":      d.HotBarSlot,
+				"heldItemNetID":   d.HeldItem.StackNetworkID,
+				"heldItemID":      d.HeldItem.Stack.ItemType.NetworkID,
+				"heldItemCount":   d.HeldItem.Stack.Count,
+				"heldItemMeta":    d.HeldItem.Stack.MetadataValue,
+				"playerPos":       []float32{d.Position[0], d.Position[1], d.Position[2]},
+				"clickPos":        []float32{d.ClickedPosition[0], d.ClickedPosition[1], d.ClickedPosition[2]},
+				"legacyRequestID": v.LegacyRequestID,
+				"legacySlots":     len(v.LegacySetItemSlots),
+				"actions":         len(v.Actions),
+			}})
+		}
+	case *packet.Animate:
+		emit(event{Event: "animate", Data: map[string]any{
+			"actionType":  v.ActionType,
+			"swingSource": v.SwingSource,
+			"entity":      v.EntityRuntimeID,
+			"data":        v.Data,
+		}})
+	case *packet.LevelSoundEvent:
+		// 殴った音。本物が添えているなら、こちらも要る。
+		emit(event{Event: "sound", Data: map[string]any{
+			"soundType":  v.SoundType,
+			"entityType": v.EntityType,
+			"extraData":  v.ExtraData,
+			"position":   []float32{v.Position[0], v.Position[1], v.Position[2]},
+		}})
+	case *packet.PlayerAuthInput:
+		// 攻撃した tick の入力。フラグの立ち方を見るために、
+		// 何かしらの操作フラグが付いているものだけ出す。
+		_, hasInteraction := v.ItemInteractionData.Value()
+		_, hasStackReq := v.ItemStackRequest.Value()
+		_, hasBlockAction := v.BlockActions.Value()
+		if hasInteraction || hasStackReq || hasBlockAction {
+			emit(event{Event: "auth_input", Data: map[string]any{
+				"tick":        v.Tick,
+				"interaction": hasInteraction,
+				"stackReq":    hasStackReq,
+				"blockAction": hasBlockAction,
+			}})
+		}
+	}
+
 	req, ok := pk.(*packet.ItemStackRequest)
 	if !ok {
 		return

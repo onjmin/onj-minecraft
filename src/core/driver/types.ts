@@ -74,6 +74,16 @@ export type MoveGoal =
 	/** エンティティを追従する（GoalFollow 相当） */
 	| { kind: "follow"; entityId: number; distance: number };
 
+/**
+ * 移動の共通の指定。
+ *
+ * timeoutMs は「ここまで待つ」上限。既定は長め(30秒)で、着くまで粘る移動に
+ * 合っている。動く相手へ寄るときは短く刻むこと。1回の goto が30秒粘ると、
+ * 狩りの持ち時間(20秒)を1回で使い切り、攻撃が一度も入らない。
+ * 実測 2026-09-18 12:22、牛への接近に40秒かけて攻撃は1回だった。
+ */
+export type MoveOptions = { timeoutMs?: number };
+
 export type ControlState = "forward" | "back" | "left" | "right" | "jump" | "sprint" | "sneak";
 
 /** ワールド読み取り。統合版では実装が最も重くなる部分。 */
@@ -181,7 +191,7 @@ export interface BotDriver {
 	nearbyEntities(maxDistance: number): EntityInfo[];
 
 	// --- 行動（すべて中断可能） ---
-	goto(signal: AbortSignal, goal: MoveGoal): Promise<void>;
+	goto(signal: AbortSignal, goal: MoveGoal, options?: MoveOptions): Promise<void>;
 	stopMoving(): void;
 	setControlState(
 		signal: AbortSignal,

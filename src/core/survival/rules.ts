@@ -30,6 +30,8 @@ export const DEATH_STORM_LIMIT = envNum("DEATH_STORM_LIMIT", 3);
 export const DEEP_UNDERGROUND_GAP = envNum("DEEP_UNDERGROUND_GAP", 5);
 /** 頭上にこれだけ固いものが積まっていたら「埋まっている」。 */
 export const BURIED_THICKNESS = envNum("BURIED_THICKNESS", 4);
+/** これを下回ったら、割の悪い手段でも食料を取りに行く。 */
+export const STARVING_FOOD = envNum("STARVING_FOOD", 6);
 /** 狩りに出てよい距離。これより遠い獲物は追わない。 */
 export const HUNT_RANGE = envNum("HUNT_RANGE", 32);
 
@@ -202,6 +204,24 @@ export const SURVIVAL_RULES: readonly SurvivalRule[] = [
 		run: (a, signal) => a.shelter(signal),
 	},
 	{
+		// 丸腰なら剣。食料の確保より先に置く。
+		//
+		// 素手の攻撃力は1で、牛・豚・羊の体力は10。木の剣なら4なので3発で
+		// 済む。素手で狩りに出るのは、当たったとしても割に合わない。実測
+		// 2026-09-18 12:28、素手で20秒に35回殴って倒せていない。
+		// 材料があるなら、先に剣を作ってから獲物へ行く。
+		// 材料があるのに素手で探索を続けていた実測がある。
+		// 敵が近いときはやらない。クラフト中は無防備で、作りかけで
+		// 殺されると材料ごと落とす。
+		name: "arm",
+		why: () => "丸腰。手元の材料で武器を作る",
+		when: (s) =>
+			s.ready && s.health > 0 && !s.armed && s.craftableWeapon && s.hostilesNear === 0 && !s.night,
+		holdMs: 60_000,
+		cooldownMs: 60_000,
+		run: (a, signal) => a.armSelf(signal),
+	},
+	{
 		// 食料の確保。ここが生存の鎖の1本目で、ずっと抜けていた。
 		//
 		// 食料 → 自然回復 → 夜を越す → 持ち物を保つ → 道具、という鎖の
@@ -219,7 +239,14 @@ export const SURVIVAL_RULES: readonly SurvivalRule[] = [
 			// 焼けば食べられるなら、獲物がいなくても仕事がある。
 			if (s.cookable !== null) return !s.night || s.sheltered;
 			if (s.preyDistance === null || s.preyDistance > HUNT_RANGE) return false;
-			if (s.night) return s.food <= 6 && s.hostilesNear === 0;
+			// 素手では狩りに行かない。
+			//
+			// 武器を作れるなら、上の arm が先に担当する。作れないなら、
+			// 木を集めるところから始めるのが筋で、それは思考側の仕事。
+			// ただし本当に飢えているときだけは、割が悪くても行かせる。
+			// 待っていても減るだけなので、可能性のある方を選ぶ。
+			if (!s.armed && s.food > STARVING_FOOD) return false;
+			if (s.night) return s.food <= STARVING_FOOD && s.hostilesNear === 0;
 			return true;
 		},
 		holdMs: envNum("SECURE_FOOD_HOLD_MS", 3 * 60_000),
@@ -252,17 +279,5 @@ export const SURVIVAL_RULES: readonly SurvivalRule[] = [
 		holdMs: envNum("RECOVER_HOLD_MS", 2 * 60_000),
 		cooldownMs: envNum("RECOVER_COOLDOWN_MS", 60_000),
 		run: (a, signal) => a.recoverLoot(signal),
-	},
-	{
-		// 丸腰なら剣。材料があるのに素手で探索を続けていた実測がある。
-		// 敵が近いときはやらない。クラフト中は無防備で、作りかけで
-		// 殺されると材料ごと落とす。
-		name: "arm",
-		why: () => "丸腰。手元の材料で武器を作る",
-		when: (s) =>
-			s.ready && s.health > 0 && !s.armed && s.craftableWeapon && s.hostilesNear === 0 && !s.night,
-		holdMs: 60_000,
-		cooldownMs: 60_000,
-		run: (a, signal) => a.armSelf(signal),
 	},
 ];
