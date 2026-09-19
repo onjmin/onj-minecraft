@@ -54,6 +54,8 @@ export interface SurvivalActions {
 	sleep(signal: AbortSignal): Promise<boolean>;
 	/** 手元の材料で武器を作る。 */
 	armSelf(signal: AbortSignal): Promise<void>;
+	/** 掘り荒らされた区域から、掘らずに歩いて出る。 */
+	leaveHazard(signal: AbortSignal): Promise<void>;
 }
 
 export interface SurvivalRule {
@@ -264,6 +266,23 @@ export const SURVIVAL_RULES: readonly SurvivalRule[] = [
 		holdMs: envNum("SURFACE_HOLD_MS", 3 * 60_000),
 		cooldownMs: envNum("SURFACE_COOLDOWN_MS", 60_000),
 		run: (a, signal) => a.goToSurface(signal),
+	},
+	{
+		// 穴だらけの区域から出る。地上に出た後、落とし物より先。
+		//
+		// 初期リスの周りは自分で掘った穴の集まりで、実測 2026-09-19 は
+		// 時間の 90% を地表より下で過ごし、落下死は全部その真下だった。
+		// 探索も採集も、そこにいる限り穴の底で終わる。上の surface が
+		// 先に地上へ出し、ここは地上を歩いて縁の外まで出る。掘らない。
+		//
+		// 夜で装備が無いときは shelter が上で担当する。装備があるなら
+		// 夜でも出る。穴の縁で夜を待つ方が危ない。
+		name: "leave_hazard",
+		why: () => "掘り荒らされた区域にいる。歩いて外へ出る",
+		when: (s) => s.ready && s.health > 0 && s.insideHazard && !isBuried(s),
+		holdMs: envNum("LEAVE_HAZARD_HOLD_MS", 3 * 60_000),
+		cooldownMs: envNum("LEAVE_HAZARD_COOLDOWN_MS", 2 * 60_000),
+		run: (a, signal) => a.leaveHazard(signal),
 	},
 	{
 		// 落とし物の回収。安全なときだけ。

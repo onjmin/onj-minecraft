@@ -9,83 +9,99 @@ import { createSkill, type SkillResponse, skillResult } from "../types";
  */
 const MIN_EXPLORE_MOVE = 6;
 
+/**
+ * 探索の目標までの距離。遠い順に試す。
+ *
+ * 以前は [16, 8, 4] だった。初期リスの周りは半径48のクレーターで、
+ * 16 ブロック先はまだ穴の中。実測 2026-09-19、位置の 76% が初期リスから
+ * 32 ブロック以内に収まり、地表にいた時間は 10% だった。資源は水平方向
+ * (新しい地形・森・動物・村)にあるので、届く限り遠くを狙う。
+ * 遠い目標の地面は blockAt(半径16)では読めないので surfaceScan で見る。
+ */
+const EXPLORE_RADII = [48, 32, 20, 12];
+/** 地表とみなす、その列の上の空き。天井の下(洞窟の床)を地表と呼ばない。 */
+const MIN_OPEN_ABOVE = 8;
+/** 移動にかける時間。距離に応じて延ばす。 */
+const MOVE_TIMEOUT_BASE_MS = 15_000;
+const MOVE_TIMEOUT_PER_BLOCK_MS = 700;
+
 export const exploreLandSkill = createSkill<void, { x: number; z: number }>({
 	name: "exploring.explore_land",
 	description:
-		"Explores the nearby surface by sampling safe ground. Heads toward the nearest man-made structure you have seen, otherwise prioritizes the forward direction.",
+		"Explores the surface horizontally toward new terrain (up to ~48 blocks per call). Heads toward the nearest man-made structure you have seen, otherwise away from dug-out hazard zones, otherwise forward. Use this to find forests, animals and villages; resources are found by walking, not by digging down.",
 	inputSchema: {} as any,
 	handler: async ({ agent, signal }): Promise<SkillResponse<{ x: number; z: number }>> => {
 		const { driver } = agent;
 		const state = driver.getState();
 		if (!state.isReady) return skillResult.fail("Bot entity not loaded");
 		const currentPos = state.position;
-		const currentY = Math.floor(currentPos.y);
 		const yaw = state.yaw; // 現在の向き
 
-		// 行き先を知っているなら、そちらへ寄せる。
-		//
-		// 前方優先とはいえ向き自体はランダムに変わるので、結局その場を
-		// うろつくだけになる。実測で7日間、地上に出ても拠点に一度も
-		// 到達せず Known Bases は空のままだった。見かけた建物を覚えて
-		// いるなら、探索もそちらを向いて行う。
+		// 向きを決める。優先順は 目印 > 危険域から離れる > 前方。
 		//
 		// 角度の取り方は下の dx/dz と揃えること。
 		// dx = -sin(a)*d, dz = -cos(a)*d なので、方向ベクトル(vx,vz)に
 		// 対応する角度は atan2(-vx, -vz)。
-		const landmark = agent.getKnownLandmarks()[0];
 		let baseAngle = yaw;
 		let spread = Math.PI; // ±90度
-		if (landmark) {
+		let heading = "forward";
+		const landmark = agent.getKnownLandmarks()[0];
+		const zone = agent
+			.getHazardZones()
+			.find((z) => Math.hypot(z.x - currentPos.x, z.z - currentPos.z) <= z.radius + 8);
+		if (
+			landmark &&
+			Math.hypot(landmark.position.x - currentPos.x, landmark.position.z - currentPos.z) > 6
+		) {
+			// 行き先を知っているなら、そちらへ寄せる。実測で7日間、地上に
+			// 出ても拠点に一度も到達せず Known Bases は空のままだった。
 			const vx = landmark.position.x - currentPos.x;
 			const vz = landmark.position.z - currentPos.z;
-			// 目の前にあるなら向きを固定する意味が無い。素直に見回す。
-			if (Math.hypot(vx, vz) > 6) {
-				baseAngle = Math.atan2(-vx, -vz);
-				// 寄せる以上は幅を狭める。±90度のままだと横へ逸れて進まない。
-				spread = Math.PI / 2; // ±45度
+			baseAngle = Math.atan2(-vx, -vz);
+			spread = Math.PI / 2; // ±45度
+			heading = `toward ${landmark.name}`;
+		} else if (zone) {
+			// 穴だらけの区域の中か縁にいる。中心から離れる向きへ。
+			let vx = currentPos.x - zone.x;
+			let vz = currentPos.z - zone.z;
+			if (Math.hypot(vx, vz) < 0.5) {
+				vx = 1;
+				vz = 0;
 			}
+			baseAngle = Math.atan2(-vx, -vz);
+			spread = Math.PI / 2;
+			heading = "away from hazard zone";
 		}
 
-		// --- 1. 段階的・方向優先サンプリング ---
-		// 遠く(16)から近く(4)へ、あるいはその逆でも良いですが、
-		// 「探索」なら少し遠め(12~16)を最初に狙い、ダメなら手前に落とすのが自然です。
-		const radii = [16, 8, 4];
-		let targetPos: Position | null = null;
+		// 周りの地表を読む。遠い目標は blockAt では見えない。
+		let surface = new Map<string, { y: number; name: string; open: number }>();
+		try {
+			const cols = await driver.world.surfaceScan(EXPLORE_RADII[0]);
+			surface = new Map(cols.map((c) => [`${c.x},${c.z}`, { y: c.y, name: c.name, open: c.open }]));
+		} catch {
+			// 読めなければ近場だけ blockAt で探す。
+		}
 
-		search: for (const radius of radii) {
+		// --- 段階的・方向優先サンプリング ---
+		// 遠くから順に、向きに幅を持たせて地面を探す。
+		let targetPos: Position | null = null;
+		search: for (const radius of EXPLORE_RADII) {
 			const attempts = 8;
 			for (let i = 0; i < attempts; i++) {
-				// 前方優先ロジック:
-				// 完全にランダムではなく、現在の視線方向に ±90度のバイアスをかける
 				const angleOffset = (Math.random() - 0.5) * spread;
 				const finalAngle = baseAngle + angleOffset;
-
-				const dist = radius * (0.5 + Math.random() * 0.5); // 半径の50%〜100%の距離
+				const dist = radius * (0.6 + Math.random() * 0.4); // 半径の60%〜100%
 				const dx = Math.floor(-Math.sin(finalAngle) * dist);
 				const dz = Math.floor(-Math.cos(finalAngle) * dist);
-
 				const tx = Math.floor(currentPos.x + dx);
 				const tz = Math.floor(currentPos.z + dz);
 
-				// 地面探索ロジック
-				let foundY: number | null = null;
-				for (let dy = 5; dy >= -5; dy--) {
-					const block = driver.world.blockAt({ x: tx, y: currentY + dy, z: tz });
-					const up1 = driver.world.blockAt({ x: tx, y: currentY + dy + 1, z: tz });
-					const up2 = driver.world.blockAt({ x: tx, y: currentY + dy + 2, z: tz });
+				// 危険域の中は目標にしない。
+				if (agent.isInHazard({ x: tx, z: tz })) continue;
 
-					if (block?.solid && up1 && !up1.solid && up2 && !up2.solid) {
-						// 危険ブロック（溶岩・水）を避ける
-						const groundBlock = block;
-						if (groundBlock.name !== "water" && groundBlock.name !== "lava") {
-							foundY = currentY + dy + 1;
-							break;
-						}
-					}
-				}
-
+				const foundY = groundAt(agent, surface, tx, tz, Math.floor(currentPos.y));
 				if (foundY !== null) {
-					// 修正ポイント1: ブロックの真ん中 (+0.5) を狙うことでスタックを激減させる
+					// ブロックの真ん中 (+0.5) を狙うことでスタックを減らす
 					targetPos = { x: tx + 0.5, y: foundY, z: tz + 0.5 };
 					break search;
 				}
@@ -97,14 +113,20 @@ export const exploreLandSkill = createSkill<void, { x: number; z: number }>({
 		}
 
 		const before = { ...driver.getState().position };
+		const planned = Math.hypot(targetPos.x - before.x, targetPos.z - before.z);
+		agent.log(
+			`[explore] ${heading}: (${Math.floor(targetPos.x)}, ${targetPos.y}, ${Math.floor(targetPos.z)}) へ ${planned.toFixed(0)} ブロック`,
+		);
+		// サイドカーの timeoutMs は整数。小数を渡すと命令ごと解釈されずに落ちる。
+		const timeoutMs = Math.round(MOVE_TIMEOUT_BASE_MS + planned * MOVE_TIMEOUT_PER_BLOCK_MS);
 		try {
-			// 修正ポイント2: Goalの精度を調整
-			// GoalNearXZ(x, z, 1) は「半径1ブロック以内」で満足してしまうため、
-			// 階段の途中で「着いた」と判定して止まり、次の動作で詰まることがあります。
-			// 探索なら 0.5 くらいまで詰め寄るのが安全です。
 			await Promise.race([
-				driver.goto(signal, { kind: "xz", x: targetPos.x, z: targetPos.z, distance: 0.5 }),
-				new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 15000)),
+				driver.goto(
+					signal,
+					{ kind: "xz", x: targetPos.x, z: targetPos.z, distance: 1 },
+					{ timeoutMs },
+				),
+				new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), timeoutMs)),
 			]);
 
 			// 「着いた」だけで成功にしない。
@@ -125,12 +147,22 @@ export const exploreLandSkill = createSkill<void, { x: number; z: number }>({
 					`Arrived but only moved ${moved.toFixed(1)} blocks; nothing new was explored.`,
 				);
 			}
-			return skillResult.ok(`Explored ${moved.toFixed(0)} blocks away.`, {
+			return skillResult.ok(`Explored ${moved.toFixed(0)} blocks ${heading}.`, {
 				x: targetPos.x,
 				z: targetPos.z,
 			});
-		} catch {
-			// --- 3. リカバリ (スタック解除) ---
+		} catch (err) {
+			// 届かなくても、進んだぶんは無駄ではない。
+			const after = driver.getState().position;
+			const moved = Math.hypot(after.x - before.x, after.z - before.z);
+			if (moved >= MIN_EXPLORE_MOVE) {
+				return skillResult.ok(
+					`Moved ${moved.toFixed(0)} blocks ${heading} before the path ran out.`,
+					{ x: targetPos.x, z: targetPos.z },
+				);
+			}
+			if (signal.aborted) throw err;
+			// --- リカバリ (スタック解除) ---
 			// スタック解除はベストエフォート。中断済みでも必ず実行したいので、
 			// AbortSignal を見る setControlState ではなく素の操作で行う。
 			try {
@@ -147,3 +179,35 @@ export const exploreLandSkill = createSkill<void, { x: number; z: number }>({
 		}
 	},
 });
+
+/**
+ * その列で立てる地面の高さ。無ければ null。
+ *
+ * まず surfaceScan の列(空が見えている一番上の固いブロック)を見る。
+ * 上の空きが少ない列は天井の下なので、地表と呼ばない。水と溶岩は避ける。
+ * 列が読めていなければ、近場だけ blockAt で上下5マスを探す。
+ */
+function groundAt(
+	agent: { driver: { world: { blockAt(p: Position): { solid: boolean; name: string } | null } } },
+	surface: Map<string, { y: number; name: string; open: number }>,
+	tx: number,
+	tz: number,
+	currentY: number,
+): number | null {
+	const col = surface.get(`${tx},${tz}`);
+	if (col) {
+		if (col.open < MIN_OPEN_ABOVE) return null;
+		if (col.name === "water" || col.name === "lava") return null;
+		return col.y + 1;
+	}
+	const world = agent.driver.world;
+	for (let dy = 5; dy >= -5; dy--) {
+		const block = world.blockAt({ x: tx, y: currentY + dy, z: tz });
+		const up1 = world.blockAt({ x: tx, y: currentY + dy + 1, z: tz });
+		const up2 = world.blockAt({ x: tx, y: currentY + dy + 2, z: tz });
+		if (block?.solid && up1 && !up1.solid && up2 && !up2.solid) {
+			if (block.name !== "water" && block.name !== "lava") return currentY + dy + 1;
+		}
+	}
+	return null;
+}

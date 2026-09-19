@@ -28,6 +28,14 @@ export const gotoCoordsSkill = createSkill<
 			);
 		}
 
+		// 掘り荒らされた区域の中は行き先にしない。実測 2026-09-19、このスキルが
+		// 58回選ばれ、ほぼ全部が初期リスの穴の中の作業台に向いていた。
+		if (agent.isInHazard({ x, z })) {
+			return skillResult.fail(
+				`(${x}, ${y}, ${z}) is inside a dug-out hazard zone (cratered ground). Do not go there; explore new terrain on the surface instead.`,
+			);
+		}
+
 		agent.log(`[goto.coords] Moving to (${x}, ${y}, ${z})`);
 
 		try {

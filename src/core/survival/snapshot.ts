@@ -62,6 +62,13 @@ export interface SurvivalSnapshot {
 	readonly deathPoint: Position | null;
 	/** 寝床までの距離。登録が無ければ null。 */
 	readonly homeDistance: number | null;
+	/**
+	 * 掘り荒らされた区域(hazard.ts)の中にいるか。
+	 *
+	 * 初期リスの周りは自分で掘った穴の集まりで、そこにいる限り落ちるか
+	 * 地下に閉じ込められるかしかない。中にいるなら歩いて外へ出る。
+	 */
+	readonly insideHazard: boolean;
 	/** 他の誰かが寝ていて、こちらの就寝を待っている。 */
 	readonly sleepRequested: boolean;
 	/** 人から頼まれた直後か。生存が懸かっていない限り譲る。 */
@@ -95,6 +102,7 @@ export function describeSnapshot(s: SurvivalSnapshot): string {
 	else parts.push("食料なし");
 	if (s.sheltered) parts.push("潜伏中");
 	if (s.boxedIn) parts.push("四方塞がり");
+	if (s.insideHazard) parts.push("危険域");
 	if (s.depthBelowSurface !== null && s.depthBelowSurface > 0) {
 		parts.push(`地表-${s.depthBelowSurface}`);
 	}
@@ -132,6 +140,7 @@ export function emptySnapshot(over: Partial<SurvivalSnapshot> = {}): SurvivalSna
 		recentDeaths: 0,
 		deathPoint: null,
 		homeDistance: null,
+		insideHazard: false,
 		sleepRequested: false,
 		humanRequestFresh: false,
 		...over,

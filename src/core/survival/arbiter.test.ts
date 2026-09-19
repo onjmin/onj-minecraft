@@ -311,3 +311,40 @@ test("死んだら担当は持ち越さない", () => {
 	arbiter.reset();
 	assert.equal(arbiter.holding, null);
 });
+
+test("危険域の中で地上にいるなら、歩いて出る", () => {
+	const arbiter = new SurvivalArbiter();
+	const decision = arbiter.select(emptySnapshot({ insideHazard: true }));
+	assert.equal(decision.rule?.name, "leave_hazard");
+});
+
+test("危険域の中でも埋まっているなら、先に地上へ出る", () => {
+	const arbiter = new SurvivalArbiter();
+	const decision = arbiter.select(emptySnapshot({ insideHazard: true, depthBelowSurface: 20 }));
+	assert.equal(decision.rule?.name, "surface");
+});
+
+test("危険域の中の落とし物より、出る方が先", () => {
+	const arbiter = new SurvivalArbiter();
+	const decision = arbiter.select(
+		emptySnapshot({ insideHazard: true, deathPoint: { x: 6, y: 40, z: 70 } }),
+	);
+	assert.equal(decision.rule?.name, "leave_hazard");
+});
+
+test("夜で丸腰なら、危険域の中でも籠りが先", () => {
+	const arbiter = new SurvivalArbiter();
+	const decision = arbiter.select(
+		emptySnapshot({ insideHazard: true, night: true, armed: false, armored: false }),
+	);
+	assert.equal(decision.rule?.name, "shelter");
+});
+
+test("区域を出たら手放し、スキル層に戻る", () => {
+	const arbiter = new SurvivalArbiter();
+	const holders = simulate(arbiter, { insideHazard: true }, 1);
+	assert.ok(holders.every((h) => h === "leave_hazard"));
+	const out = arbiter.select(emptySnapshot({ insideHazard: false, at: 61_000 }));
+	assert.equal(out.kind, "release");
+	assert.equal(out.rule, null);
+});

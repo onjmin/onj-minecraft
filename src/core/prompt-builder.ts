@@ -45,6 +45,14 @@ export interface ThinkingState {
 	landmarks?: string[];
 	/** リスポーン地点として登録したベッドの位置。無ければ未登録。 */
 	spawnBed?: string;
+	/**
+	 * 掘り荒らされた区域。行き先に選ばせない。
+	 *
+	 * 初期リスの周りは自分で掘った穴の集まりで、そこの作業台や落とし物を
+	 * 目当てに goto.coords を選ぶと穴へ戻る。実測 2026-09-19、goto.coords
+	 * が58回、goto.landmark が31回、ほぼ全部その中の残骸に向いていた。
+	 */
+	hazardZones?: string[];
 
 	/** 自発的な発言を出力させるか。使わない出力は書かせない。 */
 	allowSpontaneousChat?: boolean;
@@ -197,6 +205,14 @@ Man-made structures you have seen (someone's base — go here instead of wanderi
 ${formatList(state.landmarks)}
 
 Respawn point registered at: ${state.spawnBed ?? "None (you will respawn at world spawn if you die)"}
+${
+	state.hazardZones && state.hazardZones.length > 0
+		? `
+DUG-OUT HAZARD ZONES (cratered ground, many vertical shafts — never pick a destination inside one; if you are inside, walk out on the surface and explore elsewhere):
+${formatList(state.hazardZones)}
+Resources are found by walking the surface horizontally (new terrain, forests, animals, villages), not by digging down. Do not dig downward until you have an iron pickaxe, torches and food.`
+		: ""
+}
 `.trim();
 }
 

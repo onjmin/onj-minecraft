@@ -122,18 +122,85 @@ function skyAbove(driver: BotDriver, x: number, fromY: number, z: number): SkySt
  * 登れたら true。どの向きも成立しなければ false。
  */
 async function digStepUp(agent: MinecraftAgent, signal: AbortSignal): Promise<boolean> {
+	if (await tryDigStepUp(agent, signal)) return true;
+	// 四方どこにも踏み台が無い。広い穴の底に立っているときで、初期リスの
+	// クレーターがまさにそれ。実測 2026-09-19、Y=33 で「nothing to stand on」を
+	// 3分間繰り返して取り上げられた。壁まで歩けば階段は刻める。
+	if (!(await approachWall(agent, signal))) return false;
+	return tryDigStepUp(agent, signal);
+}
+
+const STEP_DIRS = [
+	{ dx: 1, dz: 0 },
+	{ dx: -1, dz: 0 },
+	{ dx: 0, dz: 1 },
+	{ dx: 0, dz: -1 },
+];
+
+/** 壁を探す範囲。これより遠い壁へ歩くくらいなら、次の周で測り直す。 */
+const WALL_SEARCH_RADIUS = 8;
+
+/**
+ * 足の高さに固いブロックがあり、その隣に立てる場所がある、一番近い所へ歩く。
+ * 着いたら true。見つからない・届かないなら false。掘らない。
+ */
+async function approachWall(agent: MinecraftAgent, signal: AbortSignal): Promise<boolean> {
+	const { driver } = agent;
+	const here = driver.getState().position;
+	const fx = Math.floor(here.x);
+	const fy = Math.floor(here.y);
+	const fz = Math.floor(here.z);
+	const solidAt = (x: number, y: number, z: number): boolean => {
+		const b = driver.world.blockAt({ x, y, z });
+		return !!b && b.solid && b.name !== "water" && b.name !== "lava";
+	};
+	const airAt = (x: number, y: number, z: number): boolean => {
+		const b = driver.world.blockAt({ x, y, z });
+		return !!b && b.name === "air";
+	};
+
+	let best: { x: number; z: number; d: number } | null = null;
+	for (let dx = -WALL_SEARCH_RADIUS; dx <= WALL_SEARCH_RADIUS; dx++) {
+		for (let dz = -WALL_SEARCH_RADIUS; dz <= WALL_SEARCH_RADIUS; dz++) {
+			const wx = fx + dx;
+			const wz = fz + dz;
+			if (!solidAt(wx, fy, wz)) continue;
+			for (const n of STEP_DIRS) {
+				const sx = wx + n.dx;
+				const sz = wz + n.dz;
+				// 立てる場所: 足と頭が空いていて、足元が固い。
+				if (!airAt(sx, fy, sz) || !airAt(sx, fy + 1, sz) || !solidAt(sx, fy - 1, sz)) continue;
+				const d = Math.hypot(sx - here.x, sz - here.z);
+				if (d < 0.8) continue; // ここに立っている。踏み台があるなら上で見つかっている
+				if (!best || d < best.d) best = { x: sx, z: sz, d };
+			}
+		}
+	}
+	if (!best) return false;
+	agent.log(
+		`[goto.surface] 隣に踏み台が無い。${best.d.toFixed(0)} ブロック先の壁 (${best.x}, ${fy}, ${best.z}) まで歩く`,
+	);
+	try {
+		await driver.goto(
+			signal,
+			{ kind: "near", position: { x: best.x + 0.5, y: fy, z: best.z + 0.5 }, distance: 0.6 },
+			{ timeoutMs: 15_000 },
+		);
+	} catch {
+		// 届かなくても、近づいたぶんで踏み台が見つかることがある。
+	}
+	const now = driver.getState().position;
+	return Math.hypot(now.x - here.x, now.z - here.z) >= 1;
+}
+
+async function tryDigStepUp(agent: MinecraftAgent, signal: AbortSignal): Promise<boolean> {
 	const { driver } = agent;
 	const here = driver.getState().position;
 	const fx = Math.floor(here.x);
 	const fy = Math.floor(here.y);
 	const fz = Math.floor(here.z);
 
-	const dirs = [
-		{ dx: 1, dz: 0 },
-		{ dx: -1, dz: 0 },
-		{ dx: 0, dz: 1 },
-		{ dx: 0, dz: -1 },
-	];
+	const dirs = STEP_DIRS;
 
 	for (const { dx, dz } of dirs) {
 		if (signal.aborted) return false;

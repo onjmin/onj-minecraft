@@ -692,7 +692,10 @@ export class BedrockDriver implements BotDriver {
 					face: target.noDig ? 1 : 0,
 					timeoutMs: options?.timeoutMs ?? 30_000,
 				},
-				35_000,
+				// 応答待ちは移動の上限より少し長く。固定 35 秒にしていたため、
+				// 45 秒を指定した危険域からの離脱が毎回 35 秒で切られていた
+				// (実測 2026-09-19 16:38、33 ブロックのうち 12 で中断)。
+				(options?.timeoutMs ?? 30_000) + 5_000,
 			);
 		} finally {
 			signal.removeEventListener("abort", onAbort);

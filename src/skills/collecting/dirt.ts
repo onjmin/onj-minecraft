@@ -1,4 +1,5 @@
 import { envNum } from "../../core/utils/env";
+import { notBelowFeet } from "../dig-guard";
 import { describeGain, gainedSince, snapshotInventory, totalGain } from "../inventory-delta";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
@@ -15,7 +16,11 @@ export const collectDirtSkill = createSkill<void, { count: number }>({
 	handler: async ({ agent, signal }): Promise<SkillResponse<{ count: number }>> => {
 		const { driver } = agent;
 
-		const dirtBlocks = driver.world.findBlocks(["dirt", "grass_block"], 16, 20);
+		// 下へは掘らない(dig-guard.ts)。足元の土を取ると自分が沈む。
+		const dirtBlocks = notBelowFeet(
+			driver,
+			driver.world.findBlocks(["dirt", "grass_block"], 16, 20),
+		);
 
 		if (dirtBlocks.length === 0) {
 			return skillResult.fail("No dirt or grass blocks found nearby.");

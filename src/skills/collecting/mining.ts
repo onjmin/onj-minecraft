@@ -1,4 +1,5 @@
 import type { BlockInfo, BotDriver } from "../../core/driver/types";
+import { notBelowFeet } from "../dig-guard";
 import { describeGain, gainedSince, snapshotInventory, totalGain } from "../inventory-delta";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
@@ -12,7 +13,8 @@ export const mineOresSkill = createSkill<void, { minedCount: number }>({
 	handler: async ({ agent, signal }): Promise<SkillResponse<{ minedCount: number }>> => {
 		const { driver } = agent;
 
-		const orePositions = miningScanner.findNearbyOres(driver);
+		// 下へは掘らない(dig-guard.ts)。装備が揃うまで鉱石は地表に露出した物だけ。
+		const orePositions = notBelowFeet(driver, miningScanner.findNearbyOres(driver));
 
 		if (orePositions.length === 0) {
 			return skillResult.fail("No valuable ores found nearby. Try moving to a different location.");

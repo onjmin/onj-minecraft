@@ -1,5 +1,6 @@
 import type { BlockInfo, BotDriver } from "../../core/driver/types";
 import { envNum } from "../../core/utils/env";
+import { notBelowFeet } from "../dig-guard";
 import { describeGain, gainedSince, snapshotInventory, totalGain } from "../inventory-delta";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
@@ -15,8 +16,8 @@ export const collectStoneSkill = createSkill<void, { minedCount: number }>({
 	handler: async ({ agent, signal }): Promise<SkillResponse<{ minedCount: number }>> => {
 		const { driver } = agent;
 
-		// 石系ブロックを近場からスキャン
-		const stonePositions = stoneScanner.findNearbyStone(driver);
+		// 石系ブロックを近場からスキャン。下へは掘らない(dig-guard.ts)。
+		const stonePositions = notBelowFeet(driver, stoneScanner.findNearbyStone(driver));
 
 		if (stonePositions.length === 0) {
 			return skillResult.fail("No stone blocks found nearby. Try moving to a lower altitude.");

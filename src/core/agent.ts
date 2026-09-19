@@ -12,7 +12,7 @@ import { giveItemSkill } from "../skills/social/give";
 import { secureFoodSkill } from "../skills/survival/food";
 import type { SkillResponse } from "../skills/types";
 import { type ChatSituation, Conversation } from "./conversation";
-import { EAT_BELOW_FOOD, pickCookable, pickFood } from "./driver/food";
+import { pickCookable, pickFood } from "./driver/food";
 import { JavaDriver } from "./driver/java";
 import type { BotDriver, Position } from "./driver/types";
 import { fetchMinecraftKnowledge } from "./knowledge/wiki";
@@ -21,6 +21,14 @@ import { parseLlmOutput } from "./llm-output-parser";
 import { createPerceptionSnapshot, type DamageInfo } from "./perception";
 import { buildThinkingPrompt } from "./prompt-builder";
 import { SurvivalArbiter } from "./survival/arbiter";
+import {
+	type FallDeath,
+	type HazardZone,
+	hazardAt,
+	hazardExit,
+	noteFallDeath,
+	parseHazardFile,
+} from "./survival/hazard";
 import { SurvivalMetrics } from "./survival/metrics";
 import {
 	BURIED_THICKNESS,
@@ -509,6 +517,23 @@ const MAX_STRATEGIES = 3;
  */
 const HOME_FILE = "logs/home.json";
 /**
+ * 掘り荒らされた区域の控え。中身と計算は survival/hazard.ts。
+ *
+ * 落下死が固まった場所は自動で足す。再起動で忘れると、また同じ穴に
+ * 落ちてから覚え直すことになる。
+ */
+const HAZARD_FILE = "logs/hazard-zones.json";
+/**
+ * 人工物が「埋まっている」とみなす、その列の地表からの深さ。
+ *
+ * 初期リスの作業台や板は Y=14〜61 の穴の中にあり、地表(Y=73〜79)から
+ * 12〜60 マス下。これを目印にすると穴へ戻る。2〜3 マスなら地下室や
+ * 段差なので目印のまま残す。
+ */
+const LANDMARK_BURIED_DEPTH = envNum("LANDMARK_BURIED_DEPTH", 4);
+/** 人工物の埋まり具合を確かめる範囲。surfaceScan の上限(48)まで。 */
+const LANDMARK_SURFACE_RADIUS = 48;
+/**
  * 四方を塞がれて掘り抜けるまでの間隔。
  *
  * この反射はログで579回発火していて、破壊の最大の出どころだった。
@@ -692,9 +717,19 @@ export class MinecraftAgent {
 	 * 地上に出ても行き先が無いと、その場でランダムに歩き回るだけで拠点へ
 	 * 一向に着かない。視界から外れた建物を覚えておき、向かう先として使う。
 	 */
-	private knownLandmarks: { position: Position; name: string; at: number }[] = [];
+	private knownLandmarks: { position: Position; name: string; at: number; buried: boolean }[] = [];
 	/** 最後に人工物を探した時刻。全走査に振れうるので間隔を空ける。 */
 	private lastLandmarkScanAt = 0;
+	/**
+	 * 掘り荒らされた区域。行き先の候補から外し、中にいれば歩いて出る。
+	 *
+	 * 初期リスの周りがこれで、以前ボット自身が Y=-41〜59 まで掘り抜いた。
+	 * 実測 2026-09-19、時間の 90% を地表より下で過ごし、落下死は全部
+	 * その真下だった。計算は survival/hazard.ts、控えは HAZARD_FILE。
+	 */
+	private hazardZones: HazardZone[] = [];
+	/** 落下死の記録。固まったら区域として足す。 */
+	private fallDeaths: FallDeath[] = [];
 	/** 思考が続けて落ちた回数。脳無しで動く判断に切り替えるために数える。 */
 	private thinkFailures = 0;
 	/** 最後に「四方を塞がれて掘り抜けた」時刻。掘り広げ続けないために見る。 */
@@ -863,6 +898,7 @@ export class MinecraftAgent {
 			this.isJava = false;
 			this.driver = injectedDriver;
 			this.loadHome();
+			this.loadHazards();
 			// 他プレイヤーとの意思疎通のため、発言の受信だけは共通で購読する
 			this.driver.on("chat", (username: string, message: string) =>
 				this.handleIncomingChat(username, message),
@@ -891,9 +927,18 @@ export class MinecraftAgent {
 				this.log(`[通知] 誰かがベッドに入った(${count}人)`);
 			});
 			// 死んだ場所を控える。持ち物は全部そこに落ちている。
-			this.driver.on("death", () => {
+			this.driver.on("death", (d?: { cause?: string }) => {
 				this.noteDeath();
 				this.noteDeathPlace(this.driver.getState().position);
+				// 落ちて死んだ場所は覚える。固まってきたら、そこは穴だらけ。
+				const cause = String(d?.cause ?? "");
+				if (
+					cause.startsWith("death.fell") ||
+					cause === "death.attack.fall" ||
+					(cause === "" && this.lastDamageCause?.type === "fall")
+				) {
+					this.noteFallDeathHere();
+				}
 				// 回収に戻った先で殺されたなら、まだ敵がそこにいる。
 				// 諦めはしないが、すぐ戻ると同じことになる。間を置く。
 				// 実測で90秒に4回、ほぼ同じ座標で死に続けた。戻るたびに
@@ -905,7 +950,17 @@ export class MinecraftAgent {
 					this.currentTaskSince = Date.now();
 					return;
 				}
-				this.deathPoint = { position: { ...this.driver.getState().position }, at: Date.now() };
+				const where = { ...this.driver.getState().position };
+				// 穴だらけの区域に落とした物は追わない。取りに戻る先が、
+				// さっき落ちた穴そのものになる。
+				if (this.isInHazard(where)) {
+					this.deathPoint = null;
+					this.log(
+						`死亡地点 (${where.x.toFixed(0)}, ${where.y.toFixed(0)}, ${where.z.toFixed(0)}) は危険域の中。落とし物は諦める`,
+					);
+					return;
+				}
+				this.deathPoint = { position: where, at: Date.now() };
 				this.log(
 					`死亡地点を記録: (${this.deathPoint.position.x.toFixed(0)}, ${this.deathPoint.position.y.toFixed(0)}, ${this.deathPoint.position.z.toFixed(0)})`,
 				);
@@ -948,6 +1003,7 @@ export class MinecraftAgent {
 		this.driver = new JavaDriver(this);
 		// 統合版と同じく、壊したものを控える。
 		this.loadHome();
+		this.loadHazards();
 
 		// インスタンス作成時に一度だけプラグインをロード
 		this.bot.loadPlugin(pathfinder);
@@ -2633,6 +2689,14 @@ export class MinecraftAgent {
 			spawnBed: this.spawnBed
 				? `(${this.spawnBed.x}, ${this.spawnBed.y}, ${this.spawnBed.z})`
 				: undefined,
+			hazardZones: this.hazardZones.map((z) => {
+				const d = Math.hypot(z.x - origin.x, z.z - origin.z);
+				const where =
+					d <= z.radius
+						? "YOU ARE INSIDE IT"
+						: `${Math.round(d - z.radius)} blocks outside its edge`;
+				return `centered (${z.x}, ${z.z}) radius ${z.radius} — ${where}`;
+			}),
 			skills: skillsContext,
 			stallNotes: this.getStallNotes(),
 			allowSpontaneousChat: process.env.ENABLE_CHAT === "1",
@@ -3410,6 +3474,7 @@ export class MinecraftAgent {
 			recentDeaths: this.countRecentDeaths(),
 			deathPoint: point ? { ...point } : null,
 			homeDistance: this.spawnBed ? distanceTo(this.spawnBed) : null,
+			insideHazard: this.isInHazard(pos),
 			sleepRequested: Date.now() - this.othersSleepingAt <= SLEEP_REQUEST_TTL_MS,
 			humanRequestFresh: this.hasFreshHumanRequest(),
 		};
@@ -3435,7 +3500,97 @@ export class MinecraftAgent {
 		armSelf: async (signal: AbortSignal) => {
 			await this.runSurvivalSkill(craftWeaponSkill, signal);
 		},
+		leaveHazard: (signal: AbortSignal) => this.leaveHazardNow(signal),
 	};
+
+	/** その位置は掘り荒らされた区域の中か。スキル(goto.coords など)からも見る。 */
+	public isInHazard(pos: { x: number; z: number }): boolean {
+		return hazardAt(this.hazardZones, pos) !== null;
+	}
+
+	/** 区域の一覧。探索の向きを決めるのに使う。 */
+	public getHazardZones(): readonly HazardZone[] {
+		return this.hazardZones;
+	}
+
+	/**
+	 * 区域から歩いて出る。掘らない。
+	 *
+	 * 1回の呼び出しは移動1回ぶん(既定30秒)。担当している間は毎周呼ばれる
+	 * ので、届かなくても次の周で続きから進む。出た瞬間に when が false に
+	 * なり、裁定者が手放す。
+	 */
+	private async leaveHazardNow(signal: AbortSignal): Promise<void> {
+		const pos = this.driver.getState().position;
+		const zone = hazardAt(this.hazardZones, pos);
+		if (!zone) return;
+		const exit = hazardExit(this.hazardZones, zone, pos);
+		const dist = Math.hypot(exit.x - pos.x, exit.z - pos.z);
+		this.log(
+			`[生存:leave_hazard] (${zone.x}, ${zone.z}) 半径${zone.radius} の区域。(${exit.x}, ${exit.z}) へ ${dist.toFixed(0)} ブロック歩く`,
+		);
+		const from = { ...pos };
+		try {
+			await this.driver.goto(
+				signal,
+				{ kind: "xz", x: exit.x, z: exit.z, distance: 2 },
+				{ timeoutMs: 45_000 },
+			);
+		} catch (err) {
+			if (signal.aborted) return;
+			const now = this.driver.getState().position;
+			const moved = Math.hypot(now.x - from.x, now.z - from.z);
+			this.log(
+				`[生存:leave_hazard] 届かなかった(${moved.toFixed(0)} ブロック進んだ): ${err instanceof Error ? err.message : String(err)}`,
+			);
+		}
+	}
+
+	/** いまの場所で落ちて死んだ。固まってきたら区域にして控える。 */
+	private noteFallDeathHere(): void {
+		const pos = this.driver.getState().position;
+		const r = noteFallDeath(this.hazardZones, this.fallDeaths, {
+			x: Math.round(pos.x),
+			z: Math.round(pos.z),
+			at: Date.now(),
+		});
+		this.hazardZones = r.zones;
+		this.fallDeaths = r.deaths;
+		if (r.added) {
+			this.log(
+				`[記録] (${r.added.x}, ${r.added.z}) の周り ${r.added.radius} ブロックは穴だらけ(${r.added.reason})。近づかない`,
+			);
+		}
+		this.saveHazards();
+	}
+
+	private loadHazards(): void {
+		try {
+			const file = path.join(process.cwd(), HAZARD_FILE);
+			if (!fs.existsSync(file)) return;
+			const parsed = parseHazardFile(JSON.parse(fs.readFileSync(file, "utf8")));
+			this.hazardZones = parsed.zones;
+			this.fallDeaths = parsed.fallDeaths;
+			for (const z of this.hazardZones) {
+				this.log(`[記録] 危険域 (${z.x}, ${z.z}) 半径${z.radius}: ${z.reason}`);
+			}
+		} catch {
+			// 壊れていたら無かったことにする。
+		}
+	}
+
+	private saveHazards(): void {
+		try {
+			const file = path.join(process.cwd(), HAZARD_FILE);
+			fs.mkdirSync(path.dirname(file), { recursive: true });
+			fs.writeFileSync(
+				file,
+				JSON.stringify({ zones: this.hazardZones, fallDeaths: this.fallDeaths }, null, 2),
+			);
+		} catch (e) {
+			this.log(`[記録] 危険域を書けなかった: ${e}`);
+		}
+	}
 
 	/**
 	 * 生存側がスキルを1回動かす。
@@ -3872,20 +4027,39 @@ export class MinecraftAgent {
 		const found = await this.driver.world.findBlocksFar(MANMADE_BLOCKS, LANDMARK_SEARCH_RADIUS, 8);
 		if (found.length === 0) return;
 
+		// 埋まっている人工物は自分の残骸。地表より深くにある作業台や板を
+		// 目印にすると、穴へ戻る。列の地表が読めた分だけ判定する。
+		// 読めない(遠い)列は「分からない」なので、目印のまま残す。
+		let surface = new Map<string, number>();
+		try {
+			const cols = await this.driver.world.surfaceScan(LANDMARK_SURFACE_RADIUS);
+			surface = new Map(cols.map((c) => [`${c.x},${c.z}`, c.y]));
+		} catch {
+			// 読めなければ深さの判定は飛ばす。
+		}
+		const buriedAt = (p: Position): boolean => {
+			const top = surface.get(`${Math.floor(p.x)},${Math.floor(p.z)}`);
+			if (top === undefined) return false;
+			return top - p.y > LANDMARK_BURIED_DEPTH;
+		};
+
 		const now = Date.now();
 		for (const b of found) {
 			// 同じ建物の中の別のブロックを何個も覚えない。粗い格子でまとめる。
 			const key = (p: Position) =>
 				`${Math.floor(p.x / LANDMARK_GRID)},${Math.floor(p.y / LANDMARK_GRID)},${Math.floor(p.z / LANDMARK_GRID)}`;
 			const k = key(b.position);
+			const buried = buriedAt(b.position) || this.isInHazard(b.position);
 			const existing = this.knownLandmarks.find((l) => key(l.position) === k);
 			if (existing) {
 				existing.at = now;
+				// 一度「埋まっている」と分かったら、読めない周で戻さない。
+				existing.buried = existing.buried || buried;
 				continue;
 			}
-			this.knownLandmarks.push({ position: { ...b.position }, name: b.name, at: now });
+			this.knownLandmarks.push({ position: { ...b.position }, name: b.name, at: now, buried });
 			this.log(
-				`[記憶] 人工物を見つけた: ${b.name} (${b.position.x}, ${b.position.y}, ${b.position.z})`,
+				`[記憶] 人工物を見つけた: ${b.name} (${b.position.x}, ${b.position.y}, ${b.position.z})${buried ? "（埋まっている・目印にしない）" : ""}`,
 			);
 		}
 
@@ -3912,6 +4086,8 @@ export class MinecraftAgent {
 				.slice()
 				// 二度殺された区域にある建物は行き先にしない。
 				.filter((l) => !this.isNearRecentDeath(l.position))
+				// 埋まっている残骸と、掘り荒らされた区域の中の物も行き先にしない。
+				.filter((l) => !l.buried && !this.isInHazard(l.position))
 				.sort(
 					(a, b) =>
 						Math.hypot(a.position.x - here.x, a.position.z - here.z) -
