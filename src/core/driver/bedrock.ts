@@ -427,7 +427,15 @@ export class BedrockDriver implements BotDriver {
 				// death.attack.explosion.player で来るので、素通ししていた。
 				// 実際、接続16秒後の初死亡がこれで、加害者を覚えないまま
 				// 相手に近づき直していた。
-				if (isPlayerKill(message) && args[0] === this.username && args[1]) {
+				// 加害者が "%entity.creeper.name" のような翻訳キーなら mob の爆発。
+				// death.attack.explosion.player はクリーパーでも来る(実測 2026-09-20
+				// 19:22)。これをプレイヤーと取ると、以後しばらく人を避けてしまう。
+				if (
+					isPlayerKill(message) &&
+					args[0] === this.username &&
+					args[1] &&
+					!args[1].startsWith("%entity.")
+				) {
 					for (const l of this.attackerListeners) l(args[1]);
 				}
 				// 誰かが寝ると届く。夜をスキップできるかは全員(自分含む)が

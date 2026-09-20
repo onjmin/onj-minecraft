@@ -401,17 +401,68 @@ test("担当の取得と取り上げも LLM に報告する", () => {
 	assert.ok(reports.some((r) => r.includes("forced to stop")));
 });
 
-test("LLM が籠りを断ったら、夜でも shelter は担当しない(瀕死・死に続けは除く)", () => {
+test("LLM が籠りを断っても、防具の無い夜は shelter が担当する。剣と防具が揃えば従う", () => {
 	const arbiter = new SurvivalArbiter();
 	const night = { night: true, armed: false, armored: false, edible: null as string | null };
 	assert.equal(arbiter.select(emptySnapshot(night)).rule?.name, "shelter");
-	// 断った → 手放して idle。LLM の選んだスキル(例: goto.surface)が走れる。
-	const declined = arbiter.select(emptySnapshot({ ...night, at: 5_000, shelterDeclined: true }));
+	// 防具の無い夜に断っても籠る(2026-09-20、夜の死12件中10件が no の直後)。
+	const declinedBare = arbiter.select(
+		emptySnapshot({ ...night, at: 5_000, shelterDeclined: true }),
+	);
+	assert.equal(declinedBare.rule?.name, "shelter");
+	// 剣だけでは足りない。
+	const swordOnly = new SurvivalArbiter().select(
+		emptySnapshot({ ...night, armed: true, shelterDeclined: true }),
+	);
+	assert.equal(swordOnly.rule?.name, "shelter");
+	// 剣と防具が揃っていれば、断りに従って手放す(装備があれば元から担当しない)。
+	const declined = new SurvivalArbiter().select(
+		emptySnapshot({ ...night, armed: true, armored: true, shelterDeclined: true }),
+	);
 	assert.equal(declined.rule, null);
+	// 昼の断りは従来どおり従う(傷・死に続けは別)。
+	const dayDeclined = new SurvivalArbiter().select(
+		emptySnapshot({ night: false, health: 6, hostilesNear: 1, food: 20, shelterDeclined: true }),
+	);
+	assert.equal(dayDeclined.rule?.name, "shelter");
 	// 瀕死なら断っていても籠る。
 	const dying = new SurvivalArbiter();
 	assert.equal(
 		dying.select(emptySnapshot({ ...night, shelterDeclined: true, recentDeaths: 3 })).rule?.name,
 		"shelter",
 	);
+});
+
+test("夜に籠って保持中なら、潜った先が深くても shelter は手放さない", () => {
+	const night = { night: true, armed: false, armored: false, edible: null as string | null };
+	// 保持していないなら、地下深くでは担当しない(従来どおり)。
+	const loose = new SurvivalArbiter().select(
+		emptySnapshot({ ...night, depthBelowSurface: 12, shelterHeld: false }),
+	);
+	assert.notEqual(loose.rule?.name, "shelter");
+	// 保持中は深くても持ち続ける(2026-09-20 21:21、潜った先が洞窟に抜けて手放し、探索して死亡)。
+	const held = new SurvivalArbiter().select(
+		emptySnapshot({ ...night, depthBelowSurface: 12, shelterHeld: true }),
+	);
+	assert.equal(held.rule?.name, "shelter");
+	// 昼になれば保持中でも手放す。
+	const day = new SurvivalArbiter().select(
+		emptySnapshot({ ...night, night: false, depthBelowSurface: 12, shelterHeld: true }),
+	);
+	assert.notEqual(day.rule?.name, "shelter");
+});
+
+test("頼まれごとがあっても、防具の無い夜は shelter が担当し続ける", () => {
+	const night = { night: true, armed: false, armored: false, edible: null as string | null };
+	const asked = new SurvivalArbiter().select(emptySnapshot({ ...night, humanRequestFresh: true }));
+	assert.equal(asked.rule?.name, "shelter");
+	// 昼の頼まれごとは従来どおり譲る(傷は別)。
+	const day = new SurvivalArbiter().select(
+		emptySnapshot({ night: false, health: 6, hostilesNear: 1, food: 20, humanRequestFresh: true }),
+	);
+	assert.notEqual(day.rule?.name, undefined);
+	const dayFine = new SurvivalArbiter().select(
+		emptySnapshot({ ...night, night: false, humanRequestFresh: true }),
+	);
+	assert.notEqual(dayFine.rule?.name, "shelter");
 });

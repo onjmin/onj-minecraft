@@ -81,6 +81,11 @@ export interface SurvivalSnapshot {
 	 * LLM が出力の Hide 欄で断ったら、瀕死・死に続けの場合を除いて籠らない。
 	 */
 	readonly shelterDeclined: boolean;
+	/**
+	 * 今夜すでに籠りに入り、保持している(agent の shelterLatch)。
+	 * 保持中は、潜った先が深くても担当を手放さない。
+	 */
+	readonly shelterHeld: boolean;
 }
 
 /** 満腹度がこれ以上あるときだけ体力は自然に戻る。 */
@@ -152,6 +157,7 @@ export function emptySnapshot(over: Partial<SurvivalSnapshot> = {}): SurvivalSna
 		sleepRequested: false,
 		humanRequestFresh: false,
 		shelterDeclined: false,
+		shelterHeld: false,
 		...over,
 	};
 }

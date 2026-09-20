@@ -133,6 +133,11 @@ function armorRank(itemName: string): number {
  * 夜か。mob が湧き、地上を歩けば囲まれる時間帯。
  * 同じ式が反射のあちこちに散らばっていたので一箇所に寄せる。
  */
+/** 木を構成するブロックか。蓋・地表・埋まりの判定で「地形」と区別する。 */
+function isTreeBlockName(name: string): boolean {
+	return /_leaves$|_log$|_wood$|_stem$|^leaves/.test(name);
+}
+
 function isNightTime(timeOfDay: number): boolean {
 	return timeOfDay >= 13000 && timeOfDay <= 23000;
 }
@@ -701,6 +706,15 @@ export class MinecraftAgent {
 	private mutedUntil = 0;
 	/** 直近に死んだ時刻の列。死亡ログを撒き散らしていないか見るために持つ。 */
 	private recentDeaths: number[] = [];
+	/**
+	 * 直近の死に方。夜か、地上か。
+	 *
+	 * 「夜に地上を歩くと死ぬ」は LLM に事実として渡す。全ログで死因の 62% が
+	 * モブで、その大半が夜の地上。木の剣を持つと籠り反射は手を引くので、
+	 * 夜に歩くかどうかは LLM の判断になる。判断の材料として、自分が何度
+	 * それで死んだかを見せる(2026-09-20 17:35、剣を持って夜に探索して死亡)。
+	 */
+	private deathFacts: { night: boolean; surface: boolean }[] = [];
 	/** 誰かがベッドに入ったのを最後に見た時刻。0 は未受信。 */
 	private othersSleepingAt = 0;
 	/** 最後にベッドを使った時刻。入り直して自分を起こさないために見る。 */
@@ -869,6 +883,24 @@ export class MinecraftAgent {
 	 */
 	private shelterDeclinedUntil = 0;
 	/**
+	 * 夜の籠りに入ったときの体力。null なら籠っていない。
+	 *
+	 * 一度籠ったら、夜が明けるか被弾するまで LLM の Hide: no を無視する。
+	 * 実測 2026-09-20 16:16〜16:36、LLM が 2 分ごとに Hide を反転させ(許す→
+	 * 断る→許す→断る…6回)、そのたびに籠りから出て夜の地上を歩き、矢で死んだ。
+	 * 籠り反射は「分単位で握る唯一の例外」として認めてあり、これはその延長
+	 * (オーナー承認)。被弾で解くのは、籠っているのに削られているなら籠りが
+	 * 効いていないから。
+	 */
+	private shelterLatch: { health: number } | null = null;
+	/**
+	 * 被弾で保持を解いたあと、次に保持に入ってよくなる時刻。
+	 * 解いた同じ周で反射がまた籠って保持し直すと、LLM に判断を返した
+	 * ことにならない(実測 2026-09-20 17:10:54、解いた1行後に再保持)。
+	 * LLM が Hide: yes と答えたら待たずに戻る。
+	 */
+	private shelterLatchBlockedUntil = 0;
+	/**
 	 * LLM が "Hide: yes" と明示した期限。この間の籠りは LLM の判断として数える。
 	 *
 	 * 計測(skillIdleRatio)と採点の「握りっぱなし」は、コードが LLM から時間を
@@ -890,7 +922,11 @@ export class MinecraftAgent {
 	 * 本番では collecting.stone が「10個収集」と返しながら持ち物が空だった。
 	 * ああいうものを人が気付くまで選ばせ続けるのは無駄が大きい。
 	 */
-	private skillStats = new Map<string, { ok: number; fail: number }>();
+	private skillStats = new Map<string, { ok: number; fail: number; progressed: number }>();
+	/** 高さの推移。5秒ごとの反射で足す。「登っているのか行き来しているのか」を LLM に見せる。 */
+	private heightSamples: { at: number; y: number }[] = [];
+	/** いまのスキルを担当し始めたときの高さ。登坂の進みを CURRENT ACTION に出す。 */
+	private currentTaskStartY: number | null = null;
 
 	private bases: {
 		id: string;
@@ -2206,6 +2242,16 @@ export class MinecraftAgent {
 				return names.some((n) => n === "furnace" || n === "cobblestone" || n === "blackstone")
 					? null
 					: "needs a furnace, or 8 cobblestone to build one (you have neither)";
+			case "survival.eat": {
+				// 食べる物が無いのに 35 回選ばれていた(実測 2026-09-20 22:00〜22:20)。
+				// 対象の有無はこちらで分かる。腐った肉は食べ物に数える(LLM が選ぶ)。
+				const state = this.driver.getState();
+				if (state.food >= 20) return "hunger is already full (20/20)";
+				const edible = pickFood(names) ?? (names.includes("rotten_flesh") ? "rotten_flesh" : null);
+				return edible
+					? null
+					: "nothing edible in inventory (no food, no raw meat, no rotten flesh)";
+			}
 			case "building.bed": {
 				const hasBed = names.some((n) => n === "bed" || n.endsWith("_bed"));
 				if (!hasBed && pickBedWool(items) === null) {
@@ -2249,6 +2295,9 @@ export class MinecraftAgent {
 				return this.getKnownLandmarks().length > 0;
 			case "goto.player":
 				return this.driver.nearbyEntities(64).some((e) => e.kind === "player");
+			case "collecting.pickup":
+				// 落ちている物が無いときは載せない。対象そのものが無い。
+				return this.driver.nearbyEntities(24).some((e) => e.kind === "item");
 			case "social.give":
 				return (
 					this.driver.nearbyEntities(64).some((e) => e.kind === "player") &&
@@ -2260,7 +2309,7 @@ export class MinecraftAgent {
 	}
 
 	private recordSkillOutcome(name: string, ok: boolean) {
-		const st = this.skillStats.get(name) ?? { ok: 0, fail: 0 };
+		const st = this.skillStats.get(name) ?? { ok: 0, fail: 0, progressed: 0 };
 		if (ok) st.ok++;
 		else st.fail++;
 		this.skillStats.set(name, st);
@@ -2273,12 +2322,21 @@ export class MinecraftAgent {
 	 * 失敗と区別できないので、外すのではなくプロンプトで注意を促すに留める。
 	 * 完全に外すと、材料が揃った後も二度と選ばれなくなる。
 	 */
-	private skillReliability(name: string): { tried: number; rate: number } | null {
+	private skillReliability(
+		name: string,
+	): { tried: number; rate: number; progressed: number } | null {
 		const st = this.skillStats.get(name);
 		if (!st) return null;
 		const tried = st.ok + st.fail;
 		if (tried === 0) return null;
-		return { tried, rate: st.ok / tried };
+		return { tried, rate: st.ok / tried, progressed: st.progressed };
+	}
+
+	/** 成否とは別に「世界が変わった(物を得た・動いた)」回数を数える。 */
+	private recordSkillProgress(name: string) {
+		const st = this.skillStats.get(name) ?? { ok: 0, fail: 0, progressed: 0 };
+		st.progressed++;
+		this.skillStats.set(name, st);
 	}
 
 	/**
@@ -2431,6 +2489,12 @@ export class MinecraftAgent {
 							to.z - positionBefore.z,
 						);
 						const changed = totalGain(gained) > 0 || moved > 1;
+						// 登坂は「地表に着いた」だけが成功だが、1段でも上がったなら進んでいる。
+						// 成功率 0% とだけ見せると、実際に高さを稼いでいる唯一の手を LLM が
+						// 捨てる(実測 2026-09-20 23:00、Y=18→24 と登っているのに
+						// 「15回試して0%、別を試せ」と出て探索に切り替え、洞窟で行き来した)。
+						const climbed = to.y - positionBefore.y >= 1;
+						if (changed || climbed) this.recordSkillProgress(skill.name);
 						const ranMs = executionBeganAt > 0 ? Date.now() - executionBeganAt : 0;
 						this.metrics.noteSkill(
 							skill.name,
@@ -2547,6 +2611,7 @@ export class MinecraftAgent {
 					await new Promise((r) => setTimeout(r, 2000));
 				}
 				this.currentTaskName = fallback;
+				this.currentTaskStartY = Math.floor(this.driver.getState().position.y);
 			}
 
 			// 空回りしているぶんだけ間隔を空ける。思考ループが次の行動を決めれば
@@ -2696,6 +2761,7 @@ export class MinecraftAgent {
 		const next = candidates[Math.floor(Math.random() * candidates.length)];
 		this.log(`[思考停止] LLM に繋がらないので ${next} に切り替える`);
 		this.currentTaskName = next;
+		this.currentTaskStartY = Math.floor(this.driver.getState().position.y);
 		this.currentTaskSince = Date.now();
 		this.instantRepeats = 0;
 	}
@@ -2716,10 +2782,19 @@ export class MinecraftAgent {
 					: "";
 				// これまでの実績を添える。うまくいっていない手段を避けられる。
 				const rel = this.skillReliability(t.name);
+				// 「成功」は目的を果たした回数、「progress」は世界が変わった(物を得た・
+				// 動いた・登った)回数。登坂は 0% success でも progress が付く。捨てて
+				// よいのは、成功もせず進みもしないものだけ。
 				const note =
 					rel && rel.tried >= 3
-						? ` [tried ${rel.tried} times, ${Math.round(rel.rate * 100)}% success${
-								rel.rate < 0.2 ? "; almost always fails here, try something else first" : ""
+						? ` [tried ${rel.tried} times, ${Math.round(rel.rate * 100)}% success, ${
+								rel.progressed
+							} made progress${
+								rel.rate < 0.2 && rel.progressed / rel.tried < 0.3
+									? "; almost always fails here and gets nowhere, try something else first"
+									: rel.rate < 0.2
+										? "; it has not finished yet but it IS making progress — repeated calls continue it"
+										: ""
 							}]`
 						: "";
 				// 前提が欠けているなら、外さずに書く。選ぶのは LLM。
@@ -2865,6 +2940,7 @@ export class MinecraftAgent {
 			currentAction: this.describeCurrentAction(),
 			stance: this.stance,
 			hideDeclined: Date.now() < this.shelterDeclinedUntil,
+			hideHeld: this.shelterLatch !== null,
 			stallNotes: this.getStallNotes(),
 			allowSpontaneousChat: process.env.ENABLE_CHAT === "1",
 			pendingRequest,
@@ -2908,19 +2984,34 @@ export class MinecraftAgent {
 			const pos = this.driver.getState().position;
 			const zone = hazardAt(this.hazardZones, pos);
 			const items = this.driver.inventory.items();
-			const count = (name: string) =>
-				items.filter((i) => i.name === name).reduce((n, i) => n + i.count, 0);
 			return describeSituation(s, {
 				hazardExit: zone ? hazardExit(this.hazardZones, zone, pos) : null,
 				wool: totalWool(items),
 				bedWoolReady: pickBedWool(items) !== null,
+				heightTrend: this.heightTrend(),
+				rottenFlesh: items
+					.filter((i) => i.name === "rotten_flesh")
+					.reduce((n, i) => n + i.count, 0),
+				droppedItems: this.driver
+					.nearbyEntities(24)
+					.filter((e) => e.kind === "item")
+					.sort(
+						(a, b) =>
+							Math.hypot(a.position.x - pos.x, a.position.z - pos.z) -
+							Math.hypot(b.position.x - pos.x, b.position.z - pos.z),
+					)
+					.map(
+						(e) =>
+							`${e.name}(${Math.round(Math.hypot(e.position.x - pos.x, e.position.y - pos.y, e.position.z - pos.z))}m)`,
+					),
 				respawnInHazard:
 					(this.spawnBed && this.isInHazard(this.spawnBed)) ||
 					(!this.spawnBed && !!this.lastRespawnPos && this.isInHazard(this.lastRespawnPos)),
 				lootNearRecentDeath: s.deathPoint ? this.isNearRecentDeath(s.deathPoint) : false,
-				hasFurnace: items.some((i) => i.name === "furnace"),
-				hasPickaxe: items.some((i) => i.name.endsWith("_pickaxe")),
-				cobblestone: count("cobblestone") + count("blackstone"),
+				nightSurfaceDeaths: {
+					night: this.deathFacts.filter((d) => d.night && d.surface).length,
+					total: this.deathFacts.length,
+				},
 			});
 		} catch (e) {
 			this.log(`状況の言語化でつまずいた: ${e}`);
@@ -2940,7 +3031,49 @@ export class MinecraftAgent {
 				? Math.round((Date.now() - this.currentExecutionStartedAt) / 1000)
 				: 0;
 		const state = running > 0 ? `running for ${running}s now` : "between runs";
-		return `${this.currentTaskName} — you have been on it for ${owned}s (${state}). Choosing it again lets it continue; choosing anything else interrupts it. Long actions (climbing out, walking somewhere) need more than one thought to finish.`;
+		// 登坂中は、担当し始めてから何段上がったかを添える。
+		let climb = "";
+		if (this.currentTaskStartY !== null) {
+			const dy = Math.floor(this.driver.getState().position.y) - this.currentTaskStartY;
+			if (dy !== 0) {
+				climb = ` Since you started it your height changed by ${dy > 0 ? "+" : ""}${dy} blocks.`;
+			}
+		}
+		return `${this.currentTaskName} — you have been on it for ${owned}s (${state}).${climb} Choosing it again lets it continue; choosing anything else interrupts it. Long actions (climbing out, walking somewhere) need more than one thought to finish.`;
+	}
+
+	/** 高さを控える。15分ぶん持つ。 */
+	private sampleHeight(): void {
+		const state = this.driver.getState();
+		if (!state.isReady) return;
+		const now = Date.now();
+		this.heightSamples.push({ at: now, y: Math.floor(state.position.y) });
+		const cutoff = now - 15 * 60_000;
+		while (this.heightSamples.length > 0 && this.heightSamples[0].at < cutoff) {
+			this.heightSamples.shift();
+		}
+	}
+
+	/** 直近の高さの推移。地下で行き来しているかを LLM に見せる材料。 */
+	private heightTrend(): {
+		minutes: number;
+		from: number;
+		to: number;
+		low: number;
+		high: number;
+	} | null {
+		if (this.heightSamples.length < 2) return null;
+		const first = this.heightSamples[0];
+		const last = this.heightSamples[this.heightSamples.length - 1];
+		const minutes = Math.round((last.at - first.at) / 60_000);
+		if (minutes < 3) return null;
+		let low = Number.POSITIVE_INFINITY;
+		let high = Number.NEGATIVE_INFINITY;
+		for (const s of this.heightSamples) {
+			if (s.y < low) low = s.y;
+			if (s.y > high) high = s.y;
+		}
+		return { minutes, from: first.y, to: last.y, low, high };
 	}
 
 	private async applyThoughtResult(result: any) {
@@ -2965,7 +3098,9 @@ export class MinecraftAgent {
 
 		// 反射 shelter のオンオフ。LLM が唯一、反射を直接切れる経路。
 		if (result.hide === false) {
-			if (Date.now() >= this.shelterDeclinedUntil) {
+			if (this.shelterLatch) {
+				this.log("[反射] 籠り中なので Hide: no は無視する(夜明けか被弾まで)");
+			} else if (Date.now() >= this.shelterDeclinedUntil) {
 				this.log("[反射] LLM が籠りを断った。瀕死でない限り、夜でも潜らない");
 			}
 			this.shelterDeclinedUntil = Date.now() + SHELTER_DECLINE_TTL_MS;
@@ -2973,6 +3108,8 @@ export class MinecraftAgent {
 			if (this.shelterDeclinedUntil > 0) this.log("[反射] LLM が籠りを許した");
 			this.shelterDeclinedUntil = 0;
 			this.shelterApprovedUntil = Date.now() + SHELTER_DECLINE_TTL_MS;
+			// LLM が籠ると言ったなら、被弾後の待ちは要らない。
+			this.shelterLatchBlockedUntil = 0;
 		}
 
 		const strategy: string[] = Array.isArray(result.strategy) ? result.strategy : [];
@@ -3074,6 +3211,7 @@ export class MinecraftAgent {
 			}
 			if (this.currentTaskName !== foundSkillName) {
 				this.currentTaskName = foundSkillName;
+				this.currentTaskStartY = Math.floor(this.driver.getState().position.y);
 				this.currentTaskSince = Date.now();
 				this.instantRepeats = 0;
 				this.latestRationale = rationale;
@@ -3651,6 +3789,8 @@ export class MinecraftAgent {
 			// ここで待つと反射ループそのものが詰まる。
 			this.maybeGreetNearbyPlayer();
 
+			this.releaseShelterLatchIfDue();
+			this.sampleHeight();
 			const snapshot = await this.buildSurvivalSnapshot();
 			this.survivalHolding = true;
 			const decision = await this.arbiter.tick(snapshot, this.survivalActions, signal);
@@ -3737,7 +3877,9 @@ export class MinecraftAgent {
 			insideHazard: this.isInHazard(pos),
 			sleepRequested: Date.now() - this.othersSleepingAt <= SLEEP_REQUEST_TTL_MS,
 			humanRequestFresh: this.hasFreshHumanRequest(),
-			shelterDeclined: Date.now() < this.shelterDeclinedUntil,
+			// 籠りを保持している間は、LLM の Hide: no を見せない(無視する)。
+			shelterDeclined: this.shelterLatch === null && Date.now() < this.shelterDeclinedUntil,
+			shelterHeld: this.shelterLatch !== null,
 		};
 	}
 
@@ -3853,10 +3995,23 @@ export class MinecraftAgent {
 	}
 
 	private async shelterNow(signal: AbortSignal): Promise<void> {
-		if (await this.retreatToHome(signal)) return;
+		if (await this.retreatToHome(signal)) {
+			this.latchNightShelter();
+			return;
+		}
 		const pos = this.driver.getState().position;
 		const foot = { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) };
-		if (this.isSheltered(foot) || this.solidAboveCount(foot) >= BURIED_THICKNESS) return;
+		if (this.isSheltered(foot) || this.solidAboveCount(foot) >= BURIED_THICKNESS) {
+			this.latchNightShelter();
+			return;
+		}
+		// 地下深くでは掘らない。潜るのは足元を掘ることで、地下では「深くなる」
+		// だけ。保持中にここへ来るのは、潜った先が洞窟に抜けたとき。動かずに
+		// 夜明けを待つ(担当は shelter が持ち続けるので LLM のスキルは動かない)。
+		{
+			const depth = this.lastKnownDepth();
+			if (depth !== null && depth > DEEP_UNDERGROUND_GAP) return;
+		}
 		// 掘り進み続けないための歯止め。ただし敵が目の前にいるときは待たない。
 		const threatened = this.driver
 			.nearbyEntities(HOME_THREAT_RADIUS)
@@ -3864,6 +4019,49 @@ export class MinecraftAgent {
 		if (!threatened && Date.now() - this.lastBurrowAt < BURROW_COOLDOWN_MS) return;
 		this.lastBurrowAt = Date.now();
 		await this.burrow(signal);
+	}
+
+	/** 夜に籠れた。夜明けか被弾まで Hide: no を受け付けない。 */
+	private latchNightShelter(): void {
+		const state = this.driver.getState();
+		if (!isNightTime(state.timeOfDay) || this.shelterLatch) return;
+		if (Date.now() < this.shelterLatchBlockedUntil) return;
+		this.shelterLatch = { health: state.health };
+		this.log("[反射] 夜の籠りに入った。夜明けか被弾まで Hide: no は無視する");
+	}
+
+	/** 籠りの保持を解く条件を毎周見る。夜明け・被弾・死亡。 */
+	private releaseShelterLatchIfDue(): void {
+		if (!this.shelterLatch) return;
+		const state = this.driver.getState();
+		if (state.health <= 0) {
+			this.shelterLatch = null;
+			return;
+		}
+		if (!isNightTime(state.timeOfDay)) {
+			this.shelterLatch = null;
+			this.log("[反射] 夜が明けた。籠りの保持を解く");
+			return;
+		}
+		if (state.health < this.shelterLatch.health) {
+			// 削られた理由を分ける。敵が近くにいないなら落下や溺れで、籠りが
+			// 効いていないわけではない(統合版では lastDamageCause は更新されず
+			// 常に fall なので使えない)。実測 2026-09-20 20:21、復帰直後に穴へ
+			// 落ちた分の被弾で保持を解き、穴底で LLM が夜の移動を始めた。
+			const attacked = this.driver
+				.nearbyEntities(HOME_THREAT_RADIUS)
+				.some((e) => isHostileMob(e.name));
+			if (!attacked) {
+				this.shelterLatch.health = state.health;
+				return;
+			}
+			this.shelterLatch = null;
+			this.log(
+				`[反射] 籠っているのに敵に削られた(体力 ${state.health})。保持を解き、Hide の判断を LLM に返す`,
+			);
+			this.shelterLatchBlockedUntil = Date.now() + SHELTER_DECLINE_TTL_MS;
+			this.requestImmediateThink();
+		}
 	}
 
 	/** 四方が塞がっていて歩いて出られないか。 */
@@ -4005,20 +4203,36 @@ export class MinecraftAgent {
 		}
 		const state = this.driver.getState();
 		if (!state.isReady) return null;
-		const myX = Math.floor(state.position.x);
 		const myY = Math.floor(state.position.y);
-		const myZ = Math.floor(state.position.z);
 		let depth: number | null = null;
 		try {
 			const columns = await this.driver.world.surfaceScan(SURFACE_PROBE_RADIUS);
 			// 自分の列が返るとは限らない。読めていない列は返らないので、
 			// 見つからなければ一番近い列で代用する。
-			const mine =
-				columns.find((c) => c.x === myX && c.z === myZ) ??
-				columns
-					.slice()
-					.sort((a, b) => Math.hypot(a.x - myX, a.z - myZ) - Math.hypot(b.x - myX, b.z - myZ))[0];
-			if (mine) depth = mine.y - myY;
+			// 自分の列だけで見ない。木の下に立つと自分の列の「地表」は葉の上
+			// (10マス上)になり、地上にいるのに「地下11」と数えて籠り反射が
+			// 「地下深くでは潜らない」で手を引く。実測 2026-09-20 19:41、日没に
+			// 木の下で反射が外れ、直後にクリーパーで死亡。半径2の列のうち葉や
+			// 幹でない列の最小を取れば、木の下でも地面の高さが出る。縦穴の中
+			// なら周りの列も全部高いので、深さはそのまま残る。
+			//
+			// ただし最小を無条件に取ると、クレーターの中で隣の縦穴の底が「地表」に
+			// なり、地下33で「地上」と数える(実測 20:24、水没した縦穴の中で籠り反射が
+			// 動いて溺死)。自分の列が葉・幹でなければ自分の列を信じ、葉・幹のとき
+			// だけ周りの地面の列の最小を使う。
+			const isTree = isTreeBlockName;
+			const myX = Math.floor(state.position.x);
+			const myZ = Math.floor(state.position.z);
+			const mine = columns.find((c) => c.x === myX && c.z === myZ);
+			if (mine && !isTree(mine.name)) {
+				depth = mine.y - myY;
+			} else {
+				const ground = columns.filter((c) => !isTree(c.name));
+				const pool = ground.length > 0 ? ground : columns;
+				if (pool.length > 0) {
+					depth = Math.max(0, Math.min(...pool.map((c) => c.y - myY)));
+				}
+			}
 		} catch {
 			// 数えられないなら「分からない」を返す。地上と決めつけない。
 		}
@@ -4037,7 +4251,8 @@ export class MinecraftAgent {
 		for (let y = foot.y + 2; y <= foot.y + 2 + BURIED_SCAN_HEIGHT; y++) {
 			const above = this.driver.world.blockAt({ x: foot.x, y, z: foot.z });
 			if (above === null) break;
-			if (above.name !== "air") solidAbove++;
+			// 葉や幹は「埋まっている」に数えない。木の下は地上。
+			if (above.name !== "air" && !isTreeBlockName(above.name)) solidAbove++;
 		}
 		return solidAbove;
 	}
@@ -4379,6 +4594,14 @@ export class MinecraftAgent {
 	private noteDeath(): void {
 		this.recentDeaths.push(Date.now());
 		this.metrics.noteDeath();
+		{
+			const depth = this.lastKnownDepth();
+			this.deathFacts.push({
+				night: isNightTime(this.driver.getState().timeOfDay),
+				surface: depth === null || depth <= DEEP_UNDERGROUND_GAP,
+			});
+			if (this.deathFacts.length > 20) this.deathFacts.splice(0, this.deathFacts.length - 20);
+		}
 		// 死んだら状況は作り直される。担当も持ち越さない。
 		this.arbiter.reset();
 		// 構えも既定に戻す。「殴り合え」と決めた前提(武器・体力)は死んで消えた。
@@ -4712,8 +4935,13 @@ export class MinecraftAgent {
 	 */
 	private isSheltered(foot: Position): boolean {
 		// 蓋がある。これが本来の潜れた形。
+		//
+		// 葉や幹は蓋ではない。木の下に立っているだけで「潜れた」と読み、
+		// 森の中で4分間突っ立ったままスケルトンに撃たれた(実測 2026-09-20
+		// 20:40〜20:44、原木を切った直後の日没)。矢は葉を抜けないが、
+		// スケルトンは横から歩いて来る。
 		const above = this.driver.world.blockAt({ ...foot, y: foot.y + 2 });
-		if (above && above.name !== "air") return true;
+		if (above && above.name !== "air" && !isTreeBlockName(above.name)) return true;
 
 		// 蓋が無くても、足元の高さが四方とも塞がっていれば穴の中にいる。
 		// 地上に立っているときはここが空くので、掘る前と後を取り違えない。

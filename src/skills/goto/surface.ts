@@ -481,8 +481,6 @@ export const gotoSurfaceSkill = createSkill<void, { y: number; method: string }>
 		// 目標を手の届く1マスに固定し、上がるのは経路探索と階段に任せる。
 		let lastY = startY;
 		let stuck = 0;
-		/** 経路探索(柱積み)がまだ見込みがあるか。一度失敗したら二度と頼まない。 */
-		let pillarUpWorks = true;
 
 		while (climbedBlocks() < MAX_CLIMB) {
 			if (signal.aborted) {
@@ -506,6 +504,25 @@ export const gotoSurfaceSkill = createSkill<void, { y: number; method: string }>
 			const block = driver.world.blockAt(headAbove);
 			// 水は掘らない。掘っても穴にならず、そのまま浮いて上がれる。
 			// 溶岩も掘らない（掘れば降ってくる）。
+			// 天井のさらに上が水なら、天井を抜くと水が降ってきて頭まで沈む。
+			// 実測 2026-09-20 16:12、掘り上がりの直後に溺死。ここは掘らない。
+			const aboveCeiling = driver.world.blockAt({ x: fx, y: fy + 3, z: fz });
+			if (
+				block &&
+				block.name !== "air" &&
+				aboveCeiling &&
+				(aboveCeiling.name === "water" || aboveCeiling.name === "flowing_water")
+			) {
+				agent.noteStall(
+					`goto.surface: water sits right above the ceiling at Y=${fy + 3}; digging up here would flood you. Climb out somewhere else.`,
+				);
+				return (
+					partial() ??
+					skillResult.fail(
+						"Water directly above the ceiling; digging up here would flood you. Move sideways and try another column.",
+					)
+				);
+			}
 			if (block && block.name !== "air" && block.name !== "water") {
 				if (block.name === "lava") {
 					return partial() ?? skillResult.fail("Lava directly overhead; cannot dig up here.");
@@ -547,40 +564,14 @@ export const gotoSurfaceSkill = createSkill<void, { y: number; method: string }>
 				}
 			}
 
-			// 1マス上がる。まず経路探索(柱積み)に任せ、駄目なら階段を掘る。
+			// 1マス上がる。階段を刻む。
 			//
-			// ただし一度駄目だったら、この呼び出しの間はもう頼まない。
-			// 柱積みは置けるブロックが要るので、手ぶらのまま同じ場所で
-			// 何度呼んでも結果は変わらない。実測 2026-09-16、足踏み3回で
-			// 失敗するまでの90秒はほぼこの待ちで、その間に刻めた段は0。
-			// 待つのをやめたぶんを階段掘りの試行に回す。
-			// 柱積みは手元に置けるブロックが要るので、死んで手ぶらの状態では
-			// 階段だけが頼りになる。
-			//
-			// 目標は「2マス上」にする。到達判定は高さ1.5マスまでを許すので、
-			// 1マス上を目標にすると、立っているその場所が最初から到達条件を
-			// 満たしてしまう。経路探索は即座に成功を返し、ボットは一度も
-			// 登らない。実測 2026-09-13、Y=39〜40 を往復して
-			// 「Could not climb: nothing to stand on」を繰り返していた。
-			if (pillarUpWorks) {
-				try {
-					await driver.goto(signal, {
-						kind: "near",
-						position: { x: fx + 0.5, y: fy + 2, z: fz + 0.5 },
-						distance: 1,
-						dig: true,
-					});
-				} catch {
-					// 次の手へ。
-				}
-				if (Math.floor(driver.getState().position.y) <= fy) {
-					pillarUpWorks = false;
-					agent.log("[goto.surface] 柱積みでは上がれない。以降は階段だけで登る");
-				}
-			}
-			if (Math.floor(driver.getState().position.y) <= fy) {
-				await digStepUp(agent, signal);
-			}
+			// 柱積み(跳んで足元に置く)は 2026-09-20 に外した。「跳んでいる
+			// 数tickの間に置く」というタイミングが統合版の入力予測と噛み合わず、
+			// 全ログ(run-bedrock-1xx)で試行 444 回・成功 0 回、経路探索側の
+			// stepTower も 203 回諦めていた。一方、階段は 664 段刻めている。
+			// 効かない手を毎周試すぶんの秒数を階段に回す。
+			await digStepUp(agent, signal);
 
 			const nowY = Math.floor(driver.getState().position.y);
 			if (nowY <= lastY) {

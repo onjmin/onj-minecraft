@@ -19,24 +19,13 @@ test("地下にいるなら、地表までの高さと「ここには何も無�
 	assert.match(text, /no wood or animals/);
 });
 
-test("生肉はあるがかまどが無いなら、何が要るかまで言う", () => {
+test("生肉はあるなら、焼けないこと(精錬は外した)と生で食べる道を言う", () => {
 	const text = joined(
-		describeSituation(emptySnapshot({ edible: null, cookable: "chicken", food: 10 }), {
-			hasFurnace: false,
-			hasPickaxe: true,
-			cobblestone: 0,
-		}),
+		describeSituation(emptySnapshot({ edible: null, cookable: "chicken", food: 10 })),
 	);
-	assert.match(text, /raw chicken but NO furnace/);
-	assert.match(text, /8 cobblestone/);
-	assert.match(text, /you have a pickaxe/);
-});
-
-test("かまどがあるなら焼けばよいと言う", () => {
-	const text = joined(
-		describeSituation(emptySnapshot({ edible: null, cookable: "beef" }), { hasFurnace: true }),
-	);
-	assert.match(text, /raw beef and a furnace/);
+	assert.match(text, /You carry raw chicken\. You have no way to cook it/);
+	assert.match(text, /eaten as-is via survival\.eat/);
+	assert.doesNotMatch(text, /furnace needs/);
 });
 
 test("丸腰でも材料があるなら、剣を作れると言う", () => {
@@ -51,7 +40,9 @@ test("危険域の中なら、出口の座標を添える", () => {
 		describeSituation(emptySnapshot({ insideHazard: true }), { hazardExit: { x: 60, z: 70 } }),
 	);
 	assert.match(text, /INSIDE a dug-out hazard zone/);
-	assert.match(text, /\(60, 70\)/);
+	// 出口は x,z の2値。"(60, 70)" と書くと LLM が x,y と読む(実測 2026-09-20)。
+	assert.match(text, /x=60, z=70/);
+	assert.match(text, /goto\.coords\(x: 60, z: 70\)/);
 });
 
 test("落とし物は位置・水平距離・高さの差・消える時間を言う", () => {
@@ -122,4 +113,61 @@ test("食料も動物も無いなら「動物はいない」と言う", () => {
 		describeSituation(emptySnapshot({ edible: null, cookable: null, preyDistance: null })),
 	);
 	assert.match(text, /No huntable animal is in sight/);
+});
+
+test("夜に地上で死んだ回数を言う。剣を持っていても言う", () => {
+	const text = joined(
+		describeSituation(emptySnapshot({ night: true, timeOfDay: 15000, armed: true }), {
+			nightSurfaceDeaths: { night: 4, total: 5 },
+		}),
+	);
+	assert.match(text, /Of your last 5 death\(s\), 4 happened at NIGHT on the SURFACE/);
+	assert.match(text, /it is night now/);
+	assert.match(text, /wooden sword has not changed that/);
+	const none = joined(
+		describeSituation(emptySnapshot(), { nightSurfaceDeaths: { night: 0, total: 3 } }),
+	);
+	assert.doesNotMatch(none, /at NIGHT on the SURFACE/);
+});
+
+test("腐った肉しか無いなら、食べられることと回復量・リスクを言う", () => {
+	const text = joined(
+		describeSituation(emptySnapshot({ edible: null, cookable: null, preyDistance: null }), {
+			rottenFlesh: 3,
+		}),
+	);
+	assert.match(text, /3 rotten flesh/);
+	assert.match(text, /\+4 hunger/);
+	assert.doesNotMatch(text, /You have no food and nothing to cook/);
+});
+
+test("落ちている物と、夜明け直後のゾンビの燃焼を言う", () => {
+	const text = joined(
+		describeSituation(emptySnapshot({ night: false, timeOfDay: 600, depthBelowSurface: 0 }), {
+			droppedItems: ["rotten_flesh(3m)", "spruce_log(12m)"],
+		}),
+	);
+	assert.match(text, /Items lying on the ground nearby: rotten_flesh\(3m\), spruce_log\(12m\)/);
+	assert.match(text, /collecting\.pickup/);
+	assert.match(text, /just after dawn/);
+	const noon = joined(describeSituation(emptySnapshot({ night: false, timeOfDay: 6000 })));
+	assert.doesNotMatch(noon, /just after dawn/);
+});
+
+test("地下では高さの推移を言う。往復しているだけかが読める", () => {
+	const text = joined(
+		describeSituation(emptySnapshot({ depthBelowSurface: 40 }), {
+			heightTrend: { minutes: 12, from: 18, to: 23, low: 18, high: 24 },
+		}),
+	);
+	assert.match(
+		text,
+		/Over the last 12 minutes your height went from Y=18 to Y=23 \(net \+5, ranging Y=18\.\.24\)/,
+	);
+	const surface = joined(
+		describeSituation(emptySnapshot({ depthBelowSurface: 0 }), {
+			heightTrend: { minutes: 12, from: 60, to: 62, low: 60, high: 62 },
+		}),
+	);
+	assert.doesNotMatch(surface, /your height went from/);
 });

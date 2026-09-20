@@ -237,6 +237,17 @@ type session struct {
 	online map[string]string
 	// 最後に damage を受けた時刻。撃たれているときは遠くの敵にも反応する。
 	lastHurt time.Time
+	// 頭まで水に沈み始めた時刻。ゼロなら沈んでいない。息の反射に使う。
+	submergedSince time.Time
+	// 空気を探して見つからなかったことを、沈んでいる間に一度だけ記録する。
+	noAirLogged bool
+	// 最後に空気へ向かう目標を立てた時刻。連発しないため。
+	lastEscapeAt time.Time
+	// 最後に頭が水に入っていなかった位置と時刻。溺れかけたら戻る先。
+	lastAirPos mgl32.Vec3
+	lastAirAt  time.Time
+	// 死んでから体力が戻るまで true。体力の 0→正 を復帰の合図にするため。
+	dead bool
 	// 殴ってきたプレイヤー。相手にせず逃げるためだけに覚える。
 	// 殴り返すと事が大きくなるだけで、こちらに得が無い。
 	playerThreat      uint64
@@ -557,6 +568,10 @@ func (s *session) handle(pk packet.Packet) {
 		// 消えた理由が分からないまま検証結果だけが揺れる。実際、土50個も
 		// ツルハシも失っていたのに気付けなかった。
 		emit(event{Event: "death", Data: map[string]any{"cause": v.Cause}})
+		s.mu.Lock()
+		s.dead = true
+		s.submergedSince = time.Time{}
+		s.mu.Unlock()
 		// 復帰を要求し続ける。サーバーが Respawn を送ってくる順番は当てに
 		// できず、1回投げただけでは死んだままになることがある。体力が
 		// 戻るまで数回繰り返す。
@@ -584,6 +599,9 @@ func (s *session) handle(pk packet.Packet) {
 		if v.State == packet.RespawnStateReadyToSpawn {
 			s.mu.Lock()
 			s.pos = v.Position
+			// ここで知らせるので、体力の戻りでもう一度知らせない。
+			s.dead = false
+			s.submergedSince = time.Time{}
 			s.mu.Unlock()
 			emit(event{Event: "respawn", Data: map[string]any{
 				"position": []float32{v.Position[0], v.Position[1], v.Position[2]},
@@ -594,9 +612,19 @@ func (s *session) handle(pk packet.Packet) {
 		s.mu.Lock()
 		if float32(v.Health) < s.health {
 			s.notePlayerAttackLocked()
+			// 息の反射は「削られた」を lastHurt で見る。こちらの経路でも立てる。
+			s.lastHurt = time.Now()
+			if s.headInWaterLocked() {
+				fmt.Fprintf(os.Stderr, "[sidecar] 水中で削られた(SetHealth) 体力 %.0f→%d 沈んで %.0fs\n",
+					s.health, v.Health, time.Since(s.submergedSince).Seconds())
+			}
 		}
 		s.health = float32(v.Health)
+		revived := s.noteRevivedLocked()
 		s.mu.Unlock()
+		if revived {
+			s.emitRespawn()
+		}
 
 	case *packet.UpdateAttributes:
 		if v.EntityRuntimeID != s.game.EntityRuntimeID {
@@ -611,13 +639,24 @@ func (s *session) handle(pk packet.Packet) {
 				if a.Value < s.health {
 					s.notePlayerAttackLocked()
 					s.lastHurt = time.Now()
+					// 水中で削られたときだけ残す。息の反射が動かずに溺死した
+					// 事例(2026-09-20 20:25)で、削られたことをこちらが見ていたか
+					// どうかが分からなかった。
+					if s.headInWaterLocked() {
+						fmt.Fprintf(os.Stderr, "[sidecar] 水中で削られた 体力 %.0f→%.0f 沈んで %.0fs\n",
+							s.health, a.Value, time.Since(s.submergedSince).Seconds())
+					}
 				}
 				s.health = a.Value
 			case "minecraft:player.hunger":
 				s.food = a.Value
 			}
 		}
+		revived := s.noteRevivedLocked()
 		s.mu.Unlock()
+		if revived {
+			s.emitRespawn()
+		}
 
 	case *packet.PlayerList:
 		// 誰が今いるかの一覧。Realms は10人までなので、混んできたら
@@ -1241,6 +1280,9 @@ func (s *session) buildInput(n uint64) *packet.PlayerAuthInput {
 	// スキルの合間に見るのでは遅い。息が続くのは十数秒で、その間に何度も
 	// 判断が挟まる保証が無い。毎tickここで見る。
 	swimming := s.inLiquidLocked()
+	// 息。跳び続けても水面に出られない場所(天井のある水路、水没した縦穴)
+	// がある。頭まで沈んだまま数秒たったら、目標より命を優先する。
+	s.breatheLocked()
 	if s.controls["jump"] || swimming {
 		flags.Set(packet.InputFlagJumping)
 		flags.Set(packet.InputFlagStartJumping)
@@ -1266,7 +1308,10 @@ func (s *session) buildInput(n uint64) *packet.PlayerAuthInput {
 
 	// 跳躍の縦移動。バニラは初速 0.42、重力 0.08、空気抵抗 0.98。
 	// 正確な再現ではないが、サーバーが受理する程度には合っている。
-	if s.controls["jump"] && s.onGround && !s.airborne {
+	// 頭上が塞がっていれば跳ばない。跳ぶと予測位置の頭が天井に入り、
+	// サーバーがそれを受けると窒息ダメージになる(death.attack.inWall、全ログで
+	// 8件)。階段掘りの途中の 2 マス高の通路で「進めないので跳ぶ」が出るとこれ。
+	if s.controls["jump"] && s.onGround && !s.airborne && !s.ceilingAboveLocked() {
 		s.vy = 0.42
 		s.airborne = true
 		flags.Set(packet.InputFlagJumping)
@@ -1298,8 +1343,15 @@ func (s *session) buildInput(n uint64) *packet.PlayerAuthInput {
 		fz := float32(cos)*move[1] + float32(sin)*move[0]
 		if l := float32(math.Hypot(float64(fx), float64(fz))); l > 0 {
 			delta = mgl32.Vec3{fx / l * speed, 0, fz / l * speed}
-			s.pos[0] += delta[0]
-			s.pos[2] += delta[2]
+			// 進む先が固いブロックなら予測を進めない。補正に任せると、引き戻される
+			// までの数tick、予測位置が壁の中にあり、サーバーがそのまま受けると
+			// 窒息になる。壁の中へは自分から入らない。
+			if !s.wallAheadLocked(delta) {
+				s.pos[0] += delta[0]
+				s.pos[2] += delta[2]
+			} else {
+				delta = mgl32.Vec3{}
+			}
 		}
 	}
 
@@ -2098,6 +2150,16 @@ func (s *session) finishGoalLocked(ok bool, errMsg string) {
 	s.controls["forward"] = false
 	s.controls["jump"] = false
 	s.goal = nil
+	if g.id == escapeGoalID {
+		// 脱出の結末は TS 側に受け手が無いので、ここで残す。「着いたのに頭が
+		// 水」なら写しが間違っている。「着けない」なら流されているか進めない。
+		// どちらか分からないと直せない(2026-09-20 17:19 の溺死はここが無くて
+		// 切り分けられなかった)。補正回数と最大ずれは接続開始からの累計。
+		feet := s.feetLocked()
+		fmt.Fprintf(os.Stderr,
+			"[sidecar] 脱出目標 終了 ok=%v %s 足元=(%.1f,%.1f,%.1f) 目標=(%.1f,%.1f,%.1f) 頭が水=%v 補正=%d 最大ずれ=%.2f\n",
+			ok, errMsg, feet[0], feet[1], feet[2], g.x, g.y, g.z, s.headInWaterLocked(), s.corrections, s.maxDrift)
+	}
 	d := map[string]any{"id": g.id, "ok": ok, "position": vec(s.feetLocked())}
 	if errMsg != "" {
 		d["error"] = errMsg
@@ -2211,6 +2273,14 @@ func (s *session) dispatch(c command) {
 			tol = 1
 		}
 		s.mu.Lock()
+		// 息の反射が空気へ向かっている間は、新しい移動を受けない。受けると
+		// 反射が次のtickでそれを「息が続かない」で潰し、スキルがまた出す、の
+		// 往復になる。実測 2026-09-20 16:12、34秒で394回往復して溺死した。
+		if s.escapingWaterLocked() {
+			s.mu.Unlock()
+			s.reply(c.ID, false, "息が続かないので空気のある場所へ向かっている。着くまで移動は受けない", nil)
+			return
+		}
 		if s.goal != nil {
 			// 先の目標は取り消す。呼び出し側は1つずつ出す前提。
 			emit(event{Event: "result", Data: map[string]any{
@@ -2253,20 +2323,24 @@ func (s *session) dispatch(c command) {
 
 	case "stop":
 		s.mu.Lock()
-		if s.goal != nil {
+		// 空気へ向かう途中は止めない。スキルの中断は移動の主導権を返すだけで、
+		// 息の方は待ってくれない。
+		if s.goal != nil && !s.escapingWaterLocked() {
 			emit(event{Event: "result", Data: map[string]any{
 				"id": s.goal.id, "ok": false, "error": "中断された",
 			}})
 			s.goal = nil
+			s.controls = map[string]bool{}
 		}
-		s.controls = map[string]bool{}
 		s.mu.Unlock()
 		s.reply(c.ID, true, "", nil)
 
 	case "control":
 		s.mu.Lock()
-		s.goal = nil // 手動操作が入ったら自動移動はやめる
-		s.controls[c.State] = c.Value
+		if !s.escapingWaterLocked() {
+			s.goal = nil // 手動操作が入ったら自動移動はやめる
+			s.controls[c.State] = c.Value
+		}
 		s.mu.Unlock()
 		s.reply(c.ID, true, "", nil)
 
@@ -3858,6 +3932,217 @@ func (s *session) inLiquidLocked() bool {
 	return false
 }
 
+// 頭まで水に沈んでいてよい時間。統合版の息は約15秒で、切れると毎秒2ダメージ。
+// 空気まで泳ぎ直す余裕を残して、その半分で手を打つ。
+const breathLimit = 6 * time.Second
+
+// 空気を探す半径。息が残っている間に泳げる距離。
+const airSearchRadius = 6
+
+// 息の反射が立てる目標の id。呼び出し側(TS)に対応する要求は無いので、
+// 結果は無視される(pending に無い id は捨てられる)。
+const escapeGoalID = -1
+
+// 脱出の目標が終わったあと、次を立てるまでの間。
+const escapeRetryGap = 3 * time.Second
+
+// escapingWaterLocked は、息の反射が立てた目標がまだ生きているか。
+// この間は goto / stop / control で目標を差し替えない。
+func (s *session) escapingWaterLocked() bool {
+	return s.goal != nil && s.goal.id == escapeGoalID && time.Now().Before(s.goal.deadline)
+}
+
+// ceilingAboveLocked は跳んだ先(足元+2)が固いブロックか。未取得は塞がっていない扱い。
+func (s *session) ceilingAboveLocked() bool {
+	feet := s.feetLocked()
+	name, ok := s.world.blockAt(
+		int32(math.Floor(float64(feet[0]))),
+		int32(math.Floor(float64(feet[1])))+2,
+		int32(math.Floor(float64(feet[2]))),
+	)
+	return ok && !passableBlocks[name]
+}
+
+// wallAheadLocked は、この tick の移動先の「頭の高さ」が固いブロックか。
+// 半身(0.3)ぶん先まで見る。足元だけが固い(1段の段差)のは跳んで乗るので通す。
+// 未取得のマスは通れる扱い(チャンク境目で止まらない)。
+func (s *session) wallAheadLocked(delta mgl32.Vec3) bool {
+	feet := s.feetLocked()
+	l := float32(math.Hypot(float64(delta[0]), float64(delta[2])))
+	if l == 0 {
+		return false
+	}
+	nx := feet[0] + delta[0] + delta[0]/l*0.3
+	nz := feet[2] + delta[2] + delta[2]/l*0.3
+	bx := int32(math.Floor(float64(nx)))
+	bz := int32(math.Floor(float64(nz)))
+	fy := int32(math.Floor(float64(feet[1])))
+	name, ok := s.world.blockAt(bx, fy+1, bz)
+	return ok && !passableBlocks[name]
+}
+
+// headInWaterLocked は目の位置のブロックが水か。ゲームの溺れ判定も目の位置。
+//
+// 以前は「足元+1 のブロック」で見ていた。水面に浮いているとき、足は水面の
+// ブロックの中にあり、その1つ上(=水面のブロック)は水だが、目(足元+1.62)は
+// 水面より上で息ができている。実測 2026-09-20 18:31、水面で浮いたまま
+// 「頭まで水中」と誤認して脱出目標を 3 秒ごとに立て続け、掘り上がりを潰した。
+func (s *session) headInWaterLocked() bool {
+	name, ok := s.world.blockAt(
+		int32(math.Floor(float64(s.pos[0]))),
+		int32(math.Floor(float64(s.pos[1]))),
+		int32(math.Floor(float64(s.pos[2]))),
+	)
+	return ok && (name == "water" || name == "flowing_water")
+}
+
+// breatheLocked は毎tick呼ばれる。頭まで沈んだまま breathLimit を超えたら、
+// いまの目標を「息が続かない」で失敗させ、いちばん近い空気のある場所へ
+// 向かう目標に置き換える。
+//
+// 経路探索は水面しか泳がないように直したが、復帰先が水没した穴の底である
+// ことがあり(実測 2026-09-20、6分に3回溺死)、そこでは経路の前提が崩れて
+// いる。判断はしない。空気のある方へ動く、だけ。
+func (s *session) breatheLocked() {
+	if s.health <= 0 || !s.headInWaterLocked() {
+		s.submergedSince = time.Time{}
+		s.noAirLogged = false
+		// ここでは息ができている。溺れかけたら、まずここへ戻る。
+		if s.health > 0 {
+			s.lastAirPos = s.pos
+			s.lastAirAt = time.Now()
+		}
+		return
+	}
+	if s.submergedSince.IsZero() {
+		s.submergedSince = time.Now()
+		return
+	}
+	if time.Since(s.submergedSince) < breathLimit {
+		return
+	}
+	// 実際に削られるまでは動かない。溺れ始めると毎秒 2 削られ、最初の1発で
+	// 動けば空気まで 8 秒ある。削られる前に動くと、掘り上がりのように自分で
+	// 空気を作っている途中のスキルの移動を潰す(実測 2026-09-20 18:31、水没した
+	// 縦穴で掘り上がり中の移動を 3 秒ごとに奪い、そのまま溺死)。
+	if time.Since(s.lastHurt) > 2*time.Second {
+		return
+	}
+	if s.escapingWaterLocked() {
+		return
+	}
+	// 直前の脱出が終わった(着いた・時間切れ)のにまだ沈んでいる。すぐ次を
+	// 立てると毎tick目標を作り直してログと result を吐き続けるので、間を置く。
+	if time.Since(s.lastEscapeAt) < escapeRetryGap {
+		return
+	}
+	if s.goal != nil {
+		s.finishGoalLocked(false, fmt.Sprintf(
+			"息が続かない（頭まで水中で %d 秒）。この水路は通れない",
+			int(breathLimit/time.Second)))
+	}
+	s.lastEscapeAt = time.Now()
+	// まず、最後に息ができていた場所へ戻る。写しの上で「空気」に見える
+	// マスは、流れ水の更新が届いていなくて実は水、ということがある。実測
+	// 2026-09-20 17:19、写しが空気と言う (-18,34,40) に着いてそこで溺死した。
+	// 自分が実際に呼吸していた場所は写しに依らない。
+	if !s.lastAirAt.IsZero() && time.Since(s.lastAirAt) < 60*time.Second {
+		d := s.pos.Sub(s.lastAirPos)
+		if dist := math.Hypot(float64(d[0]), float64(d[2])); dist <= 10 && dist >= 0.5 {
+			fmt.Fprintf(os.Stderr, "[sidecar] 息が続かない。最後に息ができた (%.0f,%.0f,%.0f) へ戻る\n",
+				s.lastAirPos[0], s.lastAirPos[1]-eyeHeight, s.lastAirPos[2])
+			s.goal = &target{
+				id: escapeGoalID, x: s.lastAirPos[0], z: s.lastAirPos[2],
+				y: s.lastAirPos[1] - eyeHeight, hasY: true, noDig: true, tolerance: 0.8,
+				deadline: time.Now().Add(10 * time.Second),
+				lastPos:  s.pos,
+			}
+			return
+		}
+	}
+	air, ok := s.nearestAirLocked()
+	if !ok {
+		if !s.noAirLogged {
+			fmt.Fprintf(os.Stderr, "[sidecar] 頭まで水中だが %d ブロック以内に空気が無い\n", airSearchRadius)
+			s.noAirLogged = true
+		}
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[sidecar] 息が続かない。空気のある (%d,%d,%d) へ泳ぐ\n", air.X, air.Y, air.Z)
+	s.goal = &target{
+		id: escapeGoalID, x: float32(air.X) + 0.5, z: float32(air.Z) + 0.5,
+		y: float32(air.Y), hasY: true, noDig: true, tolerance: 0.8,
+		deadline: time.Now().Add(10 * time.Second),
+		lastPos:  s.pos,
+	}
+}
+
+// nearestAirLocked は、水と空気だけを通って行ける範囲で、頭の位置に空気が
+// ある一番近いマスを返す。足元は水でも床でもよい(浮けるか立てるか)。
+func (s *session) nearestAirLocked() (blockPos, bool) {
+	feet := s.feetLocked()
+	start := blockPos{
+		int32(math.Floor(float64(feet[0]))),
+		int32(math.Floor(float64(feet[1]))),
+		int32(math.Floor(float64(feet[2]))),
+	}
+	w := s.world
+	type item struct {
+		p blockPos
+		d int
+	}
+	seen := map[blockPos]bool{start: true}
+	queue := []item{{start, 0}}
+	dirs := []blockPos{{1, 0, 0}, {-1, 0, 0}, {0, 0, 1}, {0, 0, -1}, {0, 1, 0}, {0, -1, 0}}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		head := blockPos{cur.p.X, cur.p.Y + 1, cur.p.Z}
+		if cur.d > 0 && w.passable(head) && !w.inWater(head) {
+			// 足元が空気なら、その下に床か水が要る(空中には浮けない)。
+			below := blockPos{cur.p.X, cur.p.Y - 1, cur.p.Z}
+			if w.inWater(cur.p) || w.solidFloor(below) || w.inWater(below) {
+				return cur.p, true
+			}
+		}
+		if cur.d >= airSearchRadius {
+			continue
+		}
+		for _, d := range dirs {
+			next := blockPos{cur.p.X + d.X, cur.p.Y + d.Y, cur.p.Z + d.Z}
+			if seen[next] || !w.passable(next) {
+				continue
+			}
+			seen[next] = true
+			queue = append(queue, item{next, cur.d + 1})
+		}
+	}
+	return blockPos{}, false
+}
+
+// noteRevivedLocked は体力が戻ったかを見る。死んだあと初めて正になった
+// ときだけ true。サーバーの Respawn(ReadyToSpawn) は届かないことがあり
+// (実測 2026-09-20、7回死んで一度も来なかった)、それを復帰の合図にすると
+// 呼び出し側は復帰を知れない。
+func (s *session) noteRevivedLocked() bool {
+	if !s.dead || s.health <= 0 {
+		return false
+	}
+	s.dead = false
+	s.submergedSince = time.Time{}
+	return true
+}
+
+// emitRespawn は復帰を知らせる。位置は今いる所。
+func (s *session) emitRespawn() {
+	s.mu.Lock()
+	pos := s.pos
+	s.mu.Unlock()
+	emit(event{Event: "respawn", Data: map[string]any{
+		"position": []float32{pos[0], pos[1], pos[2]},
+	}})
+}
+
 // containerIDFor はコンテナの種類から、スロットを指すときの ContainerID を返す。
 // 種類ごとに枠の意味が違うので、どれも同じ ID で指すことはできない。
 func containerIDFor(containerType byte) byte {
@@ -4127,6 +4412,15 @@ func isPlaceableName(name string) bool {
 		"_pickaxe", "_axe", "_shovel", "_hoe", "_sword", "_helmet", "_chestplate",
 		"_leggings", "_boots", "bucket", "_seeds", "_ingot", "_nugget", "coal",
 		"stick", "string", "bone", "gunpowder", "arrow", "bread", "apple",
+		// 置いても足場にならない物。clay_ball を 64 個「足場」に数え、柱を
+		// 積むときにそれを握って何も置けずにいた(実測 2026-09-20、足場112で
+		// 一度も上がれず)。素材・食べ物・苗・松明はここで外す。
+		"ball", "flesh", "feather", "leather", "egg", "beef", "porkchop", "mutton",
+		"chicken", "cod", "salmon", "rabbit", "sapling", "torch", "_dye", "bowl",
+		"flint", "paper", "book", "wheat", "sugar", "kelp", "bamboo", "_berries",
+		"carrot", "potato", "beetroot", "_slice", "_pearl", "_rod", "_tear",
+		"shears", "compass", "clock", "bed", "shield", "_door", "_sign", "_boat",
+		"rail", "_shulker_shell", "_horn", "_disc", "_bottle", "_powder", "_fragment",
 	} {
 		if strings.HasSuffix(name, suffix) || name == suffix {
 			return false

@@ -125,6 +125,13 @@ async function main() {
 	// BedrockX は接続断を必ずしもイベントで教えてくれないため、
 	// Driver 側の無通信監視も含めてここで受ける。
 	driver.on("end", (reason: string) => {
+		// 自分から席を譲って切った場合は、その終了コード(EXIT_YIELDED)で終える。
+		// disconnect() の途中でここが先に走り、code=1 で「異常終了」扱いになって
+		// 30秒で戻っていた(実測 2026-09-20 21:27)。譲ったのなら2分置く。
+		if (yielding) {
+			console.log(`[bedrock] 席を譲って切断した: ${reason}`);
+			process.exit(EXIT_YIELDED);
+		}
 		console.log(`[bedrock] 切断されました: ${reason}`);
 		console.log("[bedrock] 直近に受信したパケット:");
 		for (const line of driver.recentPackets.slice(-25)) console.log(`  ${line}`);

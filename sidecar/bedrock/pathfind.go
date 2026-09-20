@@ -117,7 +117,15 @@ func (w *world) inWater(p blockPos) bool {
 
 // standable はそこに立てるか。足元と頭上が空いていて、その下が足場であること。
 func (w *world) standable(p blockPos) bool {
-	if !w.passable(p) || !w.passable(blockPos{p.X, p.Y + 1, p.Z}) {
+	head := blockPos{p.X, p.Y + 1, p.Z}
+	if !w.passable(p) || !w.passable(head) {
+		return false
+	}
+	// 頭まで水に沈む場所は「立てる」に数えない。水は通れるので、以前は
+	// 水底の床を普通の地面として歩かせていた。息は十数秒しか続かないのに、
+	// 経路は水底を何手も通す。実測 2026-09-20、復帰先のクレーター底(水没)
+	// で 6 分に 3 回溺死、8.6 時間で溺死 7 件。腰までの水(頭は空気)は歩ける。
+	if w.inWater(head) {
 		return false
 	}
 	return w.solidFloor(blockPos{p.X, p.Y - 1, p.Z})
@@ -281,8 +289,10 @@ func (w *world) moves(p blockPos, c caps) []move {
 			continue
 		}
 
-		// 水の中は足場が無くても進める。泳いで渡る。
-		if w.inWater(foot) && w.passable(head) {
+		// 水の中は足場が無くても進める。泳いで渡る。ただし水面だけ。
+		// 頭まで沈んだまま横へ進む手は引かない(息が続かない)。潜った所からは
+		// 真上へ浮く手(stepSwimUp)で水面に出てから渡る。
+		if w.inWater(foot) && w.passable(head) && !w.inWater(head) {
 			out = append(out, move{step{Pos: foot, Action: stepSwim}, costSwim})
 			continue
 		}
@@ -390,24 +400,14 @@ func (w *world) moves(p blockPos, c caps) []move {
 		}
 	}
 
-	// 柱を積んで真上へ上がる。
+	// 柱を積んで真上へ上がる手(stepTower)は 2026-09-20 に外した。
 	//
-	// 掘るだけでは登れない。頭上を壊しても縦穴が伸びるだけで、ボットは底に
-	// 残る。実測で100回掘って高さが1も変わらなかった。実プレイヤーと同じく、
-	// 跳んで足元にブロックを置いて上がる。
-	//
-	// mineflayer-pathfinder の allow1by1towers と同じ手。あちらも経路探索の
-	// move として持っており、スキル側に専用処理は置いていない。
-	if c.Blocks > 0 {
-		up := blockPos{p.X, p.Y + 1, p.Z}
-		head := blockPos{p.X, p.Y + 2, p.Z}
-		if w.passable(up) && w.passable(head) {
-			out = append(out, move{
-				step{Pos: up, Action: stepTower, Fill: p},
-				costJump + costBridge,
-			})
-		}
-	}
+	// mineflayer-pathfinder の allow1by1towers に倣って入れていたが、統合版では
+	// 「跳んでいる数tickの間に足元へ置く」が入力予測と噛み合わず、全ログ
+	// (run-bedrock-1xx)で下ごしらえを 203 回諦め、上がれた記録は無い。
+	// 経路に入ると 12 秒待って諦めるのを繰り返すだけなので、手として出さない。
+	// 上がる手は階段(stepDigUp)と浮上(stepSwimUp)。実行側(stepTower の
+	// prepare)は残してあるが、ここから出さない限り使われない。
 
 	// 真下を掘って降りる。縦穴を掘るときに要る。
 	if c.CanDig {

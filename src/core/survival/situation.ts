@@ -25,12 +25,14 @@ export interface SituationExtras {
 	hazardExit?: { x: number; z: number } | null;
 	/** 落とし物の場所が、さっき殺された場所の近くか。 */
 	lootNearRecentDeath?: boolean;
-	/** かまどを持っているか。生肉を焼けるかどうかの材料。 */
-	hasFurnace?: boolean;
-	/** ツルハシを持っているか。丸石を得られるかどうかの材料。 */
-	hasPickaxe?: boolean;
-	/** 丸石の所持数。かまどは8個で作れる。 */
-	cobblestone?: number;
+	/** 直近の死のうち、夜に地上で死んだ数と総数。夜に歩く判断の材料。 */
+	nightSurfaceDeaths?: { night: number; total: number };
+	/** 直近の高さの推移。地下で行き来しているだけかを見せる。 */
+	heightTrend?: { minutes: number; from: number; to: number; low: number; high: number } | null;
+	/** 腐った肉の所持数。食べれば +4、80% で短い空腹効果。 */
+	rottenFlesh?: number;
+	/** 近くに落ちている物。"rotten_flesh(3m)" の形。 */
+	droppedItems?: string[];
 	/** 羊毛の所持数(色を問わず合計)。ベッドは同じ色3枚。 */
 	wool?: number;
 	/** 同じ色の羊毛が3枚そろっているか。 */
@@ -92,7 +94,7 @@ export function describeSituation(s: SurvivalSnapshot, x: SituationExtras = {}):
 	// 危険域。出口の座標を添える。「出ろ」だけでは goto.coords の引数が決まらない。
 	if (s.insideHazard) {
 		const exit = x.hazardExit
-			? ` Nearest way out on the surface: walk to (${x.hazardExit.x}, ${x.hazardExit.z}).`
+			? ` Nearest way out on the surface: x=${x.hazardExit.x}, z=${x.hazardExit.z} — call goto.coords(x: ${x.hazardExit.x}, z: ${x.hazardExit.z}) with no y.`
 			: "";
 		lines.push(
 			`You are INSIDE a dug-out hazard zone (cratered ground full of vertical shafts). Falling and getting buried happen here.${exit}`,
@@ -120,22 +122,21 @@ export function describeSituation(s: SurvivalSnapshot, x: SituationExtras = {}):
 	if (s.edible) {
 		lines.push(`You carry food you can eat now: ${s.edible}.`);
 	} else if (s.cookable) {
-		if (x.hasFurnace) {
-			lines.push(`You carry raw ${s.cookable} and a furnace: cooking it makes it edible.`);
-		} else {
-			const cobble = x.cobblestone ?? 0;
-			const pick = x.hasPickaxe
-				? "you have a pickaxe"
-				: "you have NO pickaxe, so you cannot mine stone yet";
-			lines.push(
-				`You carry raw ${s.cookable} but NO furnace. A furnace needs 8 cobblestone (you have ${cobble}; ${pick}) and a crafting table.`,
-			);
-		}
-		// 生のまま食べるかどうかは判断。事実(回復量とリスク)だけ渡す。
+		// 焼く手段(かまど・精錬)は 2026-09-20 に外した。70 時間でかまどを一度も
+		// 確保できていない。生で食べるのが唯一の道なので、そう言う。
+		lines.push(`You carry raw ${s.cookable}. You have no way to cook it.`);
+		// 事実(回復量とリスク)だけ渡す。
 		lines.push(
 			s.cookable === "chicken"
 				? "Raw chicken can be eaten as-is via survival.eat: +2 hunger, 30% chance of a short Hunger effect (not lethal). Cooked chicken gives +6."
 				: `Raw ${s.cookable} can be eaten as-is via survival.eat for roughly half the hunger of cooked.`,
+		);
+	} else if ((x.rottenFlesh ?? 0) > 0) {
+		// 腐った肉は食べ物に数えていない(反射の eat は避ける)が、食べれば戻る。
+		// ゾンビが落とし、夜明けに日光で焼けたゾンビの分が地面に残る(オーナー
+		// の知識 2026-09-20)。判断は LLM。
+		lines.push(
+			`You have no proper food, but you carry ${x.rottenFlesh} rotten flesh: eating it via survival.eat(item: rotten_flesh) restores +4 hunger, with an 80% chance of a short Hunger effect (not lethal).`,
 		);
 	} else {
 		lines.push("You have no food and nothing to cook.");
@@ -146,6 +147,29 @@ export function describeSituation(s: SurvivalSnapshot, x: SituationExtras = {}):
 			// (実測 2026-09-20、collecting.hunting 33回中32回が「いない」で失敗)。
 			lines.push("No huntable animal is in sight; hunting requires moving somewhere else first.");
 		}
+	}
+
+	// 高さの推移。地下にいるときだけ。「登っている」と「行き来している」は
+	// 数字を見なければ区別できない(実測 2026-09-20 23:00、12分間 Y=18〜24 を往復)。
+	const trend = x.heightTrend;
+	if (trend && (s.depthBelowSurface ?? 0) > 3) {
+		const net = trend.to - trend.from;
+		lines.push(
+			`Over the last ${trend.minutes} minutes your height went from Y=${trend.from} to Y=${trend.to} (net ${net >= 0 ? "+" : ""}${net}, ranging Y=${trend.low}..${trend.high}). Cutting stairs gains about 1 block per 40 seconds only while goto.surface keeps running; every switch to another skill drops what it was doing.`,
+		);
+	}
+
+	// 落ちている物。統合版は近づけば拾える。
+	if (x.droppedItems && x.droppedItems.length > 0) {
+		lines.push(
+			`Items lying on the ground nearby: ${x.droppedItems.slice(0, 6).join(", ")}. collecting.pickup walks over and picks them up.`,
+		);
+	}
+	// 夜明け直後は、日光に当たったゾンビが燃えて腐った肉を落とす。
+	if (!s.night && s.timeOfDay % TICKS_PER_DAY < 1500 && (s.depthBelowSurface ?? 0) <= 2) {
+		lines.push(
+			"It is just after dawn: zombies caught in sunlight burn and drop rotten flesh where they stood. Rotten flesh is edible (+4 hunger).",
+		);
 	}
 
 	// 復帰地点。死ぬたびにどこから始まるかは、他の全部の前提になる。
@@ -193,6 +217,17 @@ export function describeSituation(s: SurvivalSnapshot, x: SituationExtras = {}):
 
 	if (s.recentDeaths > 0) {
 		lines.push(`You died ${s.recentDeaths} time(s) in the last 10 minutes.`);
+	}
+	// 夜に地上で死んだ回数。夜に歩くかどうかは LLM が決めるが、自分の死因の
+	// 偏りは知っていないと決められない。剣を持っていても書く(剣を持って夜に
+	// 探索して殺された実測がある)。
+	const nsd = x.nightSurfaceDeaths;
+	if (nsd && nsd.night > 0) {
+		lines.push(
+			`Of your last ${nsd.total} death(s), ${nsd.night} happened at NIGHT on the SURFACE (mobs and skeleton arrows)${
+				s.night ? " — it is night now" : ""
+			}.${s.armed ? " A wooden sword has not changed that." : ""}`,
+		);
 	}
 
 	return lines;

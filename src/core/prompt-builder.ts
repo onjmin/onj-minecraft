@@ -97,6 +97,8 @@ export interface ThinkingState {
 	stance?: "auto" | "flee" | "fight";
 	/** 夜の籠り反射を LLM がいま断っているか。Hide 欄の現在値として見せる。 */
 	hideDeclined?: boolean;
+	/** 夜の籠りを保持中か。この間 Hide: no は無視される。 */
+	hideHeld?: boolean;
 	/**
 	 * 人から受けた作業の依頼。返答そのものは conversation が担当するので、
 	 * ここでは「何を頼まれたか」だけを渡し、行動に落とさせる。
@@ -162,7 +164,7 @@ Prefer the task that unblocks the most other tasks. With empty hands that is usu
 
 Order matters for survival. Once you have wood, craft a SWORD before anything else. Unarmed you cannot fight back, so you spend the whole time running or hiding and lose everything you carry each time you die. A wooden sword is cheap and changes that.
 
-Exception: when you are starving (hunger 6 or less) and SITUATION shows a way to a meal you already carry (food, or raw meat plus the means to build a furnace), take that path first. Health does not regenerate while starving, so wood and swords come after the meal.
+Exception: when you are starving (hunger 6 or less) and you carry anything edible (cooked or raw — survival.eat eats raw meat too), eat first. Health does not regenerate while starving, so wood and swords come after the meal.
 
 Never repeat a skill that failed twice in the same environment unless the environment has changed.
 
@@ -255,10 +257,7 @@ ${strategyText}
 === RECENT ACHIEVEMENTS (Max 3) ===
 ${achievementText}
 
-Known Bases:
-${formatList(state.bases)}
-
-Man-made structures you have seen (someone's base — go here instead of wandering):
+Man-made structures you have seen (use goto.coords to reach one if it is on the surface and outside the hazard zone):
 ${formatList(state.landmarks)}
 
 Respawn point registered at: ${state.spawnBed ?? "None (you will respawn at world spawn if you die)"}
@@ -345,7 +344,7 @@ function buildOutputFormatSection(state: ThinkingState): string {
 		"Achievement: (optional, if something was completed)",
 		"Skill: (exact name)",
 		`Stance: (auto, flee or fight) — how your per-tick combat reflex treats nearby hostiles. auto (default): flee when unarmed, low on health or facing a creeper, otherwise fight. flee: always run, even armed. fight: engage even bare-handed (still flees when health is critical). Current: ${state.stance ?? "auto"}. Omit to keep it.`,
-		`Hide: (yes or no) — whether your night reflex may dig you in and hide underground until dawn. Current: ${state.hideDeclined ? "no" : "yes"}. Say no when you have a better plan for the night (digging up to the surface, staying in a sealed room you already have). Keep answering the same way each thought while the plan stands; flipping between yes and no every thought hands control back and forth and wastes the night.`,
+		`Hide: (yes or no) — whether your night reflex may dig you in and hide underground until dawn. At night, "no" is honored only when you carry BOTH a sword and armor; without armor the reflex hides you regardless (walking the surface at night unarmored has killed you every time). Current: ${state.hideHeld ? "yes — HELD: you are hidden for the night; no is ignored until dawn or until you take damage" : state.hideDeclined ? "no" : "yes"}. Say no when you have a better plan for the night (digging up to the surface, staying in a sealed room you already have). Keep answering the same way each thought while the plan stands; flipping between yes and no every thought hands control back and forth and wastes the night.`,
 	];
 
 	// Chat 欄は、その出力を実際に使うときだけ出す。

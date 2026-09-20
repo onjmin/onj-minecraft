@@ -90,8 +90,15 @@ export interface SurvivalRule {
 }
 
 /** 装備が揃っているか。片方でもあれば夜歩きに耐える。 */
+/**
+ * 夜を歩けるだけの装備か。剣と防具の両方。
+ *
+ * 以前は「剣か防具のどちらか」だった。実測 2026-09-20、木の剣を作った直後に
+ * 夜の地上を歩いて死ぬのが 3 件(17:35、17:51、他)。14:05 以降の夜の死 12 件で
+ * 生き残った例は無い。剣だけでは夜は歩けない。
+ */
 function equipped(s: SurvivalSnapshot): boolean {
-	return s.armed || s.armored;
+	return s.armed && s.armored;
 }
 
 /** 死に続けているか。 */
@@ -198,14 +205,32 @@ export const SURVIVAL_RULES: readonly SurvivalRule[] = [
 					: "Reflex shelter: night and unarmed, hid underground until morning.",
 		when: (s) => {
 			if (!s.ready || s.health <= 0) return false;
-			if (s.depthBelowSurface !== null && s.depthBelowSurface > DEEP_UNDERGROUND_GAP) return false;
+			// 地下深くでは担当しない。ただし今夜すでに籠って保持しているなら
+			// 手放さない。潜った足元が洞窟に抜けて深くなった瞬間に手放すと、
+			// LLM が夜の探索を始めて死ぬ(実測 2026-09-20 21:21、潜った22秒後に
+			// 「前提が消えた」→探索→ドラウンドに殺された)。深いところでは
+			// 掘り進まずその場で待つ(shelterNow 側)。
+			if (
+				s.depthBelowSurface !== null &&
+				s.depthBelowSurface > DEEP_UNDERGROUND_GAP &&
+				!(s.shelterHeld && s.night)
+			) {
+				return false;
+			}
 			const hurt = isHurtAndCanWait(s);
 			const dying = isDying(s);
 			if (!s.night && !hurt && !dying) return false;
 			// 頼まれた直後は出る。瀕死のときだけは、頼まれごとより先に死ぬので譲らない。
-			if (s.humanRequestFresh && !hurt) return false;
-			// LLM が籠らないと決めたなら従う。瀕死・死に続けのときだけは譲らない。
-			if (s.shelterDeclined && !hurt && !dying) return false;
+			// 防具の無い夜も出ない。実測 2026-09-20 21:42、他プレイヤー同士の雑談から
+			// 「洞窟で迷子の救援」を依頼と取り、夜の籠りを解いて探索に出て死亡。
+			// 夜に丸腰で出ても助けには行けない。朝になってから応じる。
+			if (s.humanRequestFresh && !hurt && (!s.night || equipped(s))) return false;
+			// LLM が籠らないと決めたなら従う。ただし夜は、剣と防具が揃っている
+			// ときだけ。防具の無い夜に Hide: no を通した結果が、14:05 以降の
+			// 夜の死 12 件のうち 10 件(直前の答えが no)。事実は渡しても 24B は
+			// 「計画がある」と no を出し続けたので、ここで受け付けない
+			// (2026-09-20、オーナー承認)。昼の傷・死に続けは従来どおり譲らない。
+			if (s.shelterDeclined && !hurt && !dying && (!s.night || equipped(s))) return false;
 			// 装備が揃っていて無傷なら、夜でも歩ける。
 			if (!hurt && !dying && equipped(s)) return false;
 			return true;

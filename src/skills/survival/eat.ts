@@ -39,7 +39,10 @@ export const survivalEatSkill = createSkill<{ item?: string }, { item: string; h
 		if (!names.includes(item)) {
 			return skillResult.fail(`You do not carry any ${item}.`);
 		}
-		if (want && ["rotten_flesh", "pufferfish", "poisonous_potato", "spider_eye"].includes(want)) {
+		// 腐った肉はここに入れない。満腹度 +4 が戻り、80% で短い空腹効果が付くだけで
+		// 致死ではない(オーナー確認 2026-09-20)。以前は「毒で戻らない」と誤って
+		// 断っていた。食べるかどうかは LLM の判断。
+		if (want && ["pufferfish", "poisonous_potato", "spider_eye"].includes(want)) {
 			// 毒物は食べても満腹度が戻らず体力を削る。これは判断ではなく事実。
 			return skillResult.fail(`${want} poisons you and does not restore hunger. Not eating it.`);
 		}
