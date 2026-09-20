@@ -7,7 +7,8 @@ import { createSkill, type SkillResponse, skillResult } from "../types";
 export const stealFromChestSkill = createSkill<void, { itemsCount: number; containerType: string }>(
 	{
 		name: "collecting.stealing",
-		description: "Finds a nearby chest or barrel, opens it, and takes all items inside.",
+		description:
+			"Finds a nearby chest or barrel within 16 blocks, walks to it, and takes everything inside. Generated chests (the bonus chest at spawn, shipwrecks, villages, mineshafts) already hold tools, food and iron - taking them is far faster than gathering from scratch.",
 		inputSchema: {} as any,
 		handler: async ({
 			agent,

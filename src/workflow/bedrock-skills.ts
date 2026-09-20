@@ -23,6 +23,7 @@
 import { buildBedSkill } from "../skills/building/bed";
 import { huntAnimalsSkill } from "../skills/collecting/hunting";
 import { pickupItemsSkill } from "../skills/collecting/pickup";
+import { stealFromChestSkill } from "../skills/collecting/stealing";
 import { collectStoneSkill } from "../skills/collecting/stone";
 import { collectWoodSkill } from "../skills/collecting/wood";
 import { craftToolSkill } from "../skills/crafting/tool";
@@ -38,8 +39,13 @@ import { survivalEatSkill } from "../skills/survival/eat";
 // 統合版でもスキルは一通り動く。Driver 層が Java 版との差を吸収しているので
 // skills/ 側は共通のものをそのまま使う。
 //
-// collecting.stealing は外している。中身を漁るのは他プレイヤーのチェストで、
-// 本番の Realm では壊してよいものの範囲外だから。破壊や設置は許可されている。
+// collecting.stealing は 2026-09-20 に戻した。外していた理由は「中身を漁るのは
+// 他プレイヤーのチェスト」だったが、実際に近くにあるチェストの大半は世界が
+// 生成したもの(ボーナスチェスト・難破船・村・廃坑)で、これは拾ってよい物が
+// 最初から入っている唯一の供給源だった。外している間は目の前のボーナス
+// チェストを開けないまま素手で木を殴り続けることになっていた。
+// 他人の拠点のチェストを開けるかどうかは LLM の判断に任せる(コードで
+// 分岐を足さない: judgment-belongs-to-llm-not-code)。
 export const bedrockSkills = [
 	// 死んだ場所へ戻る。統合版は死ぬと持ち物が全部その場に
 	// 落ち、5分ほどで消える。取りに戻らないと何を積んでも残らない。
@@ -53,6 +59,9 @@ export const bedrockSkills = [
 	huntAnimalsSkill,
 	// 落ちている物を拾う。夜明けに焼けたゾンビの腐った肉、自分の落とし物(2026-09-20)。
 	pickupItemsSkill,
+	// 近くのチェスト・樽の中身を回収する。ボーナスチェストや難破船など、
+	// 世界が置いた物資を取るための唯一の手段。
+	stealFromChestSkill,
 	// 何を食べるかは LLM が決める。反射の eat が外す生の鶏肉も、LLM が選べば食べる。
 	survivalEatSkill,
 	craftToolSkill,
