@@ -62,7 +62,19 @@ export type MoveGoal =
 	 * 実測 2026-09-13、地下27メートルからの復帰が「経路 0手」で止まり続けた。
 	 * 頭上が岩なので、掘る手を外した経路探索では一手も選べない。
 	 */
-	| { kind: "near"; position: Position; distance: number; dig?: boolean }
+	| {
+			kind: "near";
+			position: Position;
+			distance: number;
+			dig?: boolean;
+			/**
+			 * 高さを厳密に合わせる(±0.5)。既定は1段(±1.5)まで許す。
+			 *
+			 * 穴の底に落ちた物を拾うとき、既定だと穴の縁で「着いた」になる。
+			 * 統合版の自動回収は縦に0.5ほどしか届かないので、縁からは拾えない。
+			 */
+			exactHeight?: boolean;
+	  }
 	/** 指定ブロックにぴったり乗る（GoalBlock 相当） */
 	| { kind: "block"; position: Position }
 	/** 指定ブロックを操作できる隣接位置まで行く（GoalGetToBlock 相当） */
@@ -201,6 +213,13 @@ export interface BotDriver {
 	): Promise<void>;
 	clearControlStates(): void;
 	lookAt(position: Position): Promise<void>;
+	/**
+	 * 敵が近いときの構えを決める。毎tickの反射(逃げるか殴るか)がこれを読む。
+	 *
+	 * auto: 武器の有無・体力・クリーパーで決める(既定)。flee: 武器があっても
+	 * 逃げる。fight: 素手でも殴る(瀕死のときだけ逃げる)。決めるのは LLM。
+	 */
+	setStance(stance: "auto" | "flee" | "fight"): Promise<void>;
 
 	/**
 	 * 位置で指定する。BlockInfo ではなく Position を受けるのは、
@@ -243,7 +262,13 @@ export interface BotDriver {
 	 *
 	 * 何を食べるかは実装側が選ぶ（腐肉やフグのような不利益のあるものは避ける）。
 	 */
-	eat(signal: AbortSignal): Promise<boolean>;
+	/**
+	 * 食べる。item を省けば pickFood の優先順位で選ぶ。
+	 *
+	 * item を渡せば、その名前の物を食べる。生の鶏肉のように pickFood が
+	 * 外しているものも、LLM が選んだなら食べる(survival.eat)。
+	 */
+	eat(signal: AbortSignal, item?: string): Promise<boolean>;
 
 	/**
 	 * 持ち物のアイテムを地面に落とす。

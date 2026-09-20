@@ -73,6 +73,14 @@ export interface SurvivalSnapshot {
 	readonly sleepRequested: boolean;
 	/** 人から頼まれた直後か。生存が懸かっていない限り譲る。 */
 	readonly humanRequestFresh: boolean;
+	/**
+	 * LLM が「今夜は籠らない」と言っているか。
+	 *
+	 * 反射 shelter は4本の中で唯一、分単位で担当を握る。LLM が地上へ掘り
+	 * 上がると決めているのに、その足元を掘って潜らせては判断の意味が無い。
+	 * LLM が出力の Hide 欄で断ったら、瀕死・死に続けの場合を除いて籠らない。
+	 */
+	readonly shelterDeclined: boolean;
 }
 
 /** 満腹度がこれ以上あるときだけ体力は自然に戻る。 */
@@ -143,6 +151,7 @@ export function emptySnapshot(over: Partial<SurvivalSnapshot> = {}): SurvivalSna
 		insideHazard: false,
 		sleepRequested: false,
 		humanRequestFresh: false,
+		shelterDeclined: false,
 		...over,
 	};
 }

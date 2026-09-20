@@ -266,7 +266,30 @@ func buildRecipe(id uint32, block string, input []protocol.ItemDescriptorCount, 
 // 素材の消費では、そのスロットの StackNetworkID を正しく載せないと弾かれる。
 // 戻り値の []craftInput は、タグを実際の素材に解決したあとの素材表。
 // 呼び出し側が「何が減るか」を予測するのに使う。タグのままでは減らせない。
-func (s *session) craftRequestLocked(rec craftRecipe, requestID int32) (*protocol.ItemStackRequest, []craftInput, error) {
+// craftPlan は要求を組んだときに決めた、素材の取り出し元と出来上がりの行き先。
+//
+// 応答が来たときの写しの更新は、これと同じ枠を使わなければならない。
+// 以前は名前だけを渡し、写しの側で「同じ名前の最初の山」から減らし、
+// 「同じ名前の山があればそこへ足す」としていた。要求の側は素材を
+// rawSlots の走査順(map なので不定)で取り、出来上がりは識別子の分かる山か
+// 空き枠を選ぶので、両者は食い違う。実測 2026-09-19 22:08(wood-tool)、
+// 拾った棒(識別子 0)があるとき、棒のクラフトは空き枠 S2 へ入ったが写しは
+// 拾った山へ足していた。写しに S2 の記録が無いので次の作業台の出来上がりの
+// 行き先に S2 を選び、サーバーには埋まっているので
+// FailedToValidateDstSlot(50) で7回続けて拒否された。作業台が無いので
+// ツルハシも剣もできない。本番でも棒や道具で同じ拒否が出ている。
+type craftPlan struct {
+	// タグを解決したあとの素材表。
+	Inputs []craftInput
+
+	// 持ち物の枠ごとに、この要求で取り出す個数。
+	Spent map[int]int
+
+	// 出来上がりを入れる持ち物の枠。
+	Dest int
+}
+
+func (s *session) craftRequestLocked(rec craftRecipe, requestID int32) (*protocol.ItemStackRequest, craftPlan, error) {
 	// タグ指定の素材は、手持ちから実際に使うものを1つ決める。
 	// 「板材ならなんでも」のまま送っても、サーバーには何を消費するのか
 	// 伝わらない。持っている種類のうち数が足りるものを選ぶ。
@@ -292,7 +315,7 @@ func (s *session) craftRequestLocked(rec craftRecipe, requestID int32) (*protoco
 			}
 		}
 		if pick == "" {
-			return nil, nil, fmt.Errorf("%s に使える素材が %d 個ありません", in.Tag, in.Count)
+			return nil, craftPlan{}, fmt.Errorf("%s に使える素材が %d 個ありません", in.Tag, in.Count)
 		}
 		resolved = append(resolved, craftInput{Name: pick, Count: in.Count})
 
@@ -320,7 +343,7 @@ func (s *session) craftRequestLocked(rec craftRecipe, requestID int32) (*protoco
 			}
 		}
 		if have < in.Count {
-			return nil, nil, fmt.Errorf("%s が %d 個足りません", in.Name, in.Count-have)
+			return nil, craftPlan{}, fmt.Errorf("%s が %d 個足りません", in.Name, in.Count-have)
 		}
 	}
 
@@ -408,7 +431,7 @@ func (s *session) craftRequestLocked(rec craftRecipe, requestID int32) (*protoco
 				}
 				dst := base + byte(row*gridWidth+col)
 				if !placeOne(cell, dst) {
-					return nil, nil, fmt.Errorf("枠に置く素材が足りません")
+					return nil, craftPlan{}, fmt.Errorf("枠に置く素材が足りません")
 				}
 			}
 		}
@@ -417,7 +440,7 @@ func (s *session) craftRequestLocked(rec craftRecipe, requestID int32) (*protoco
 		slot := base
 		for _, in := range rec.Inputs {
 			if !placeOne(in, slot) {
-				return nil, nil, fmt.Errorf("枠に置く素材が足りません")
+				return nil, craftPlan{}, fmt.Errorf("枠に置く素材が足りません")
 			}
 			slot++
 		}
@@ -447,7 +470,7 @@ func (s *session) craftRequestLocked(rec craftRecipe, requestID int32) (*protoco
 
 	dest, destStackID, ok := s.outputSlotLocked(rec.Output, spent)
 	if !ok {
-		return nil, nil, fmt.Errorf("持ち物に空きがありません")
+		return nil, craftPlan{}, fmt.Errorf("持ち物に空きがありません")
 	}
 
 	// 出来上がりを持ち物へ移す。
@@ -466,7 +489,8 @@ func (s *session) craftRequestLocked(rec craftRecipe, requestID int32) (*protoco
 	}
 	actions = append(actions, take)
 
-	return &protocol.ItemStackRequest{RequestID: requestID, Actions: actions}, rec.Inputs, nil
+	return &protocol.ItemStackRequest{RequestID: requestID, Actions: actions},
+		craftPlan{Inputs: rec.Inputs, Spent: spent, Dest: dest}, nil
 }
 
 // freeSlotLocked は出来上がりを入れる空きスロットを探す。

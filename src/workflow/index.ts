@@ -2,6 +2,7 @@ import { MinecraftAgent } from "../core/agent";
 import { startUnjRelayPolling } from "../core/utils/unj-relay";
 import { profiles } from "../profiles";
 import { buildingBaseSkill } from "../skills/building/base";
+import { buildBedSkill } from "../skills/building/bed";
 import { collectDirtSkill } from "../skills/collecting/dirt";
 import { huntAnimalsSkill } from "../skills/collecting/hunting";
 import { mineOresSkill } from "../skills/collecting/mining";
@@ -40,6 +41,7 @@ const allSkills = [
 
 	// --- Building Domain ---
 	buildingBaseSkill,
+	buildBedSkill, // 自分のベッドで復帰地点を移す
 
 	// --- Goto Domain ---
 	gotoCoordsSkill, // 座標へ移動

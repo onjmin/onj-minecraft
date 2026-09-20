@@ -108,8 +108,12 @@ export class SurvivalMetrics {
 		if (s.edible !== null || s.cookable !== null) this.haveFoodMs += dt;
 		if (s.armed) this.armedMs += dt;
 		if (s.inventoryCount > 0) this.inventoryMs += dt;
-		if (controlledBy === null) this.idleMs += dt;
-		else this.controlMs.set(controlledBy, (this.controlMs.get(controlledBy) ?? 0) + dt);
+		// "(llm)" 付きは LLM が明示的に許した担当。時間の内訳には残すが、
+		// 「コードが LLM から奪った時間」ではないので idle(スキル可)に数える。
+		if (controlledBy === null || controlledBy.endsWith("(llm)")) this.idleMs += dt;
+		if (controlledBy !== null) {
+			this.controlMs.set(controlledBy, (this.controlMs.get(controlledBy) ?? 0) + dt);
+		}
 
 		const stall = now - this.lastSkillRunAt;
 		if (stall > this.longestStallMs) this.longestStallMs = stall;

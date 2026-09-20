@@ -88,3 +88,16 @@ test("食料や武器を持っていた時間の割合が出る", () => {
 	assert.ok(Math.abs(s.haveFoodRatio - 0.5) < 0.02, `食料保有率 ${s.haveFoodRatio}`);
 	assert.ok(Math.abs(s.armedRatio - 0.5) < 0.02, `武器保有率 ${s.armedRatio}`);
 });
+
+test("LLM が許した籠り(shelter(llm))は内訳に残るが、スキル可の率では idle と数える", () => {
+	const clock = fakeClock(0);
+	const m = new SurvivalMetrics({ now: clock.now });
+	// at:0 は「まだ1回も測っていない」と同じ扱いになるので 1 秒から始める。
+	m.noteTick(emptySnapshot({ at: 1_000 }), null);
+	m.noteTick(emptySnapshot({ at: 11_000 }), "shelter(llm)");
+	m.noteTick(emptySnapshot({ at: 21_000 }), "shelter");
+	const sum = m.summary();
+	assert.equal(sum.controlMsByRule["shelter(llm)"], 10_000);
+	assert.equal(sum.controlMsByRule.shelter, 10_000);
+	assert.equal(sum.skillIdleRatio, 0.5);
+});

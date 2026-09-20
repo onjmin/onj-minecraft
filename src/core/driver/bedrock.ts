@@ -475,6 +475,10 @@ export class BedrockDriver implements BotDriver {
 		try {
 			const r = await this.sidecar.send("recipeNames", {}, 20_000);
 			for (const n of (r.names ?? []) as string[]) this.craftable.add(n);
+			// ベッドが作れるかは復帰地点を動かせるかそのもの。取れた時点で1行残す。
+			console.log(
+				`[bedrock] レシピ ${this.craftable.size} 種 (bed: ${this.craftable.has("bed") ? "あり" : "なし"})`,
+			);
 		} catch {
 			// 取れなくても craft を試せば分かる。canCraft が false 寄りになるだけ。
 		}
@@ -687,6 +691,8 @@ export class BedrockDriver implements BotDriver {
 					// 掘った穴の真上に立った時点で到達扱いになる。
 					y: target.y ?? 0,
 					value: target.y !== undefined,
+					// 高さを厳密に(±0.5)。穴の底の物を縁から「着いた」と言わせない。
+					strict: target.strictY === true,
 					// 掘らずに行きたいときは face に 1 を載せる。専用の欄が
 					// 無いので流用している。
 					face: target.noDig ? 1 : 0,
@@ -706,9 +712,14 @@ export class BedrockDriver implements BotDriver {
 	 * MoveGoal を XZ の目標に落とす。ブロックを見ないと決められない目標
 	 * (getToBlock / lookAtBlock) は、ワールド読み取りが入るまで扱えない。
 	 */
-	private resolveGoal(
-		goal: MoveGoal,
-	): { x: number; z: number; distance: number; y?: number; noDig?: boolean } | null {
+	private resolveGoal(goal: MoveGoal): {
+		x: number;
+		z: number;
+		distance: number;
+		y?: number;
+		noDig?: boolean;
+		strictY?: boolean;
+	} | null {
 		switch (goal.kind) {
 			case "near": {
 				// 目標が固いブロックなら、その中心には立てない。隣の立てる場所を狙う。
@@ -731,6 +742,7 @@ export class BedrockDriver implements BotDriver {
 					// そのために地形を掘るのは無駄で、他人の世界も壊す。
 					// dig:true を渡されたときだけ掘ってよい。
 					noDig: goal.dig !== true,
+					strictY: goal.exactHeight === true,
 				};
 			}
 			case "block":
@@ -820,6 +832,10 @@ export class BedrockDriver implements BotDriver {
 
 	clearControlStates(): void {
 		this.sidecar.fire_and_forget("stop");
+	}
+
+	async setStance(stance: "auto" | "flee" | "fight"): Promise<void> {
+		await this.sidecar.send("stance", { state: stance });
 	}
 
 	async lookAt(position: Position): Promise<void> {
@@ -1043,6 +1059,12 @@ export class BedrockDriver implements BotDriver {
 			slot = moved;
 		}
 		await this.sidecar.send("hold", { count: slot });
+		// サーバーが持ち替えを反映するまで待つ。equip() は待っていたが、こちらは
+		// 待たずに掘り始めていた。統合版は「壊した」をクライアントの言い値で
+		// 受けるので、持ち替えが届く前に壊すと素手で壊した扱いになり、石は
+		// 何も落とさない。実測 2026-09-20 01:59、木のツルハシを持って石を6個
+		// 壊し、丸石0個(落下物も現れず)。
+		await sleep(200);
 		await sleep(150);
 		if (process.env.BEDROCK_TRACE_TOOL === "1") {
 			await this.refresh();
@@ -1058,6 +1080,11 @@ export class BedrockDriver implements BotDriver {
 	 */
 	async pickupNearbyItems(signal: AbortSignal): Promise<void> {
 		const deadline = Date.now() + 15_000;
+		// 1個の落とし物へ歩く上限。期限(15秒)は周の頭でしか見ておらず、中の
+		// goto は既定の30秒まで走る。穴の底に落ちた丸石へ届かないとき、
+		// 3個目まで試して105秒かかっていた(実測 2026-09-19 23:00、raw-food。
+		// 掘り5秒に対して回収105秒)。期限の残りより長くは歩かない。
+		const gotoTimeout = () => Math.max(2_000, Math.min(8_000, deadline - Date.now()));
 		// 掘った直後はまだ落下物が現れていない。少し待ってから探す。
 		await sleep(700);
 		// 取りに行けなかったものを覚えておく。同じものを毎回選び直すと
@@ -1075,11 +1102,18 @@ export class BedrockDriver implements BotDriver {
 				.sort((a, b) => distance(here, a.position) - distance(here, b.position));
 			const target = items[0];
 			if (trace) {
+				const fmt = (p: Position) => `(${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)})`;
 				console.log(
-					`[pickup] ${i}回目: 落下物 ${items.length} 個` +
+					`[pickup] ${i}回目: 自分 ${fmt(here)} 落下物 ${items.length} 個` +
 						(target
-							? ` 最寄り ${target.name} 距離 ${distance(here, target.position).toFixed(1)}`
-							: " なし"),
+							? ` 最寄り ${target.name} ${fmt(target.position)} 距離 ${distance(here, target.position).toFixed(1)}`
+							: " なし") +
+						(items.length > 1
+							? ` 他 ${items
+									.slice(1, 4)
+									.map((e) => `${e.name}${fmt(e.position)}`)
+									.join(" ")}`
+							: ""),
 				);
 			}
 			if (!target || distance(here, target.position) > 24) {
@@ -1102,20 +1136,46 @@ export class BedrockDriver implements BotDriver {
 				// 駄目なら掘ってでも取りに行く。木の下は葉に囲まれていて
 				// 掘らないと寄れず、実測で伐った原木9本が地面に残ったまま
 				// 一つも拾えなかった。
+				// 穴の底に落ちている物は、穴のマスそのものを目標にする。
+				//
+				// 物の座標を距離0.9で狙うと、穴の縁(高さ差0.9、水平0.8)で
+				// 「着いた」になる。統合版の自動回収は縦に0.5ほどしか届かない
+				// ので、縁からは拾えない。実測 2026-09-20 02:16、床の石を7個掘り、
+				// 丸石は全部1段下の穴の中、縁で6回「距離1.2」のまま0個。
+				// 穴のマスの中心を距離0.6で狙えば、縁のマス(中心まで1.0)では
+				// 届かず、経路探索が1段降りる歩(stepFall)を出す。
+				const inHole = target.position.y < here.y - 0.5;
+				const goalPos = inHole
+					? {
+							x: Math.floor(target.position.x) + 0.5,
+							y: Math.floor(target.position.y),
+							z: Math.floor(target.position.z) + 0.5,
+						}
+					: target.position;
 				try {
-					await this.goto(signal, {
-						kind: "near",
-						position: target.position,
-						distance: 0.9,
-					});
+					await this.goto(
+						signal,
+						{
+							kind: "near",
+							position: goalPos,
+							distance: inHole ? 0.6 : 0.9,
+							// 穴の縁(高さ差1.0)で止まらせない。降りて初めて到達。
+							exactHeight: inHole,
+						},
+						{ timeoutMs: gotoTimeout() },
+					);
 				} catch {
 					if (signal.aborted) throw new Error("中断された");
-					await this.goto(signal, {
-						kind: "xz",
-						x: target.position.x,
-						z: target.position.z,
-						distance: 0.9,
-					});
+					await this.goto(
+						signal,
+						{
+							kind: "xz",
+							x: target.position.x,
+							z: target.position.z,
+							distance: 0.9,
+						},
+						{ timeoutMs: gotoTimeout() },
+					);
 				}
 			} catch (e) {
 				// 届かないものは飛ばして次を取りに行く。ここで return すると
@@ -1129,9 +1189,10 @@ export class BedrockDriver implements BotDriver {
 		}
 	}
 
-	async eat(_signal: AbortSignal): Promise<boolean> {
+	async eat(_signal: AbortSignal, item?: string): Promise<boolean> {
 		await this.refresh();
-		const food = pickFood(this.inventory.items().map((i) => i.name));
+		const names = this.inventory.items().map((i) => i.name);
+		const food = item ? (names.includes(item) ? item : null) : pickFood(names);
 		if (!food) return false;
 
 		const before = this.state.food;

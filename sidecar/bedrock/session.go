@@ -49,6 +49,8 @@ type command struct {
 	Count int      `json:"count"`
 	// 設置する面。-1 ならプレイヤー側の面を自動で選ぶ。
 	Face int32 `json:"face"`
+	// goto: 高さを厳密(±0.5)に合わせる。穴の底の物を縁から「着いた」と言わせない。
+	Strict bool `json:"strict"`
 }
 
 // 統合版のプレイヤー座標は「足元 + 目線の高さ」で送られてくる。
@@ -164,6 +166,8 @@ type target struct {
 	// ままいくら待っても拾えなかった。
 	y    float32
 	hasY bool
+	// strictY なら高さの許容は ±0.5。既定(false)は1段(±1.5)。
+	strictY bool
 	// noDig なら掘って進む手を使わない。落ちている物を拾いに行くだけの
 	// ために地形を掘るのは無駄で、他人の世界も壊す。
 	// mineflayer-pathfinder の回収も canDig=false で引いている。
@@ -212,6 +216,15 @@ type session struct {
 	worldTick int32
 	// doDaylightCycle が切られているか。切られている世界では時刻が進まない。
 	dayCycleStopped bool
+	// LLM が決めた構え。"" か "auto" なら従来の判断(武器の有無・体力・
+	// クリーパー)。"flee" なら武器があっても逃げる。"fight" なら素手でも
+	// 殴り合う(体力が defendFleeHealth 以下のときだけは逃げる)。
+	//
+	// 逃げるか殴るかを毎tick決めるのはここでよい(LLM を待てない)。だが
+	// その方針まで定数で固定すると、LLM は自分が丸腰で逃げ回っている理由も、
+	// それを変える手段も持たない。mindcraft の cowardice / self_defense の
+	// オンオフに相当する経路。
+	stance string
 	// 最後に殴った tick。連打を防ぐ。0 なら戦っていない。
 	fighting uint64
 	// 逃げ始めた tick と、逃げ終えた tick。走りっぱなしを防ぐ。
@@ -764,8 +777,16 @@ func (s *session) handle(pk packet.Packet) {
 		if v.SubChunkCount == 0 {
 			// 座標が確定する前に要求すると、存在しない高さを取りに行くことになる。
 			// 列を覚えておいて、要求は別のループに任せる。
+			//
+			// 既に取った列について LevelChunk が再び届いたら、その列が書き
+			// 換わった(まとめて置き換えられた)合図と見て、要求済みの記録を消す。
+			// 消さないと requestNearby は「高さが動くまで取り直さない」ので、
+			// 写しが古いまま残る。実測 2026-09-19、/fill で建てた石室が写しに
+			// 無く、壁の中を歩き抜けて「地表にいる」と読んでいた。
+			key := [2]int32{v.Position.X(), v.Position.Z()}
 			s.mu.Lock()
-			s.known[[2]int32{v.Position.X(), v.Position.Z()}] = v.Dimension
+			s.known[key] = v.Dimension
+			delete(s.requested, key)
 			s.mu.Unlock()
 			return
 		}
@@ -795,6 +816,23 @@ func (s *session) handle(pk packet.Packet) {
 		}
 		s.mu.Lock()
 		s.world.setBlock(int32(v.Position[0]), int32(v.Position[1]), int32(v.Position[2]), name)
+		s.mu.Unlock()
+
+	case *packet.UpdateSubChunkBlocks:
+		// まとめて書き換わったブロック(/fill、爆発、他人の大きな建築)はこちらで
+		// 届く。UpdateBlock しか見ていなかったので、こうした変化は自分が上下に
+		// 動いてサブチャンクを取り直すまで写しに反映されなかった。実測
+		// 2026-09-19、ローカルの採点で /fill した20マスの石の天井が写しに無く、
+		// 「地表は2マス上」と読んで籠り続けた。レイヤー0(Blocks)だけ見る。
+		// Extra は第2層(水没など)なので、通常ブロックの判定には使わない。
+		s.mu.Lock()
+		for _, e := range v.Blocks {
+			name, ok := blockNameFor(int32(e.BlockRuntimeID))
+			if !ok {
+				continue
+			}
+			s.world.setBlock(int32(e.BlockPos[0]), int32(e.BlockPos[1]), int32(e.BlockPos[2]), name)
+		}
 		s.mu.Unlock()
 
 	case *packet.ContainerOpen:
@@ -1331,7 +1369,11 @@ func (s *session) steerLocked(n uint64) {
 	// 高さを指定されているなら、そこも合わせる。1段ぶんは許す。
 	heightOK := true
 	if g.hasY {
-		heightOK = math.Abs(float64(s.feetLocked()[1]-g.y)) <= 1.5
+		limit := 1.5
+		if g.strictY {
+			limit = 0.5
+		}
+		heightOK = math.Abs(float64(s.feetLocked()[1]-g.y)) <= limit
 	}
 	if dist <= g.tolerance && heightOK {
 		s.finishGoalLocked(true, "")
@@ -1695,6 +1737,13 @@ func (s *session) defendLocked(n uint64) bool {
 	flee := !s.hasWeaponLocked() ||
 		s.health <= defendFleeHealth ||
 		strings.Contains(target.Name, "creeper")
+	// LLM の構えが優先。fight は瀕死のときだけ従来判断に戻す(死ぬのは早い)。
+	switch s.stance {
+	case "flee":
+		flee = true
+	case "fight":
+		flee = s.health <= defendFleeHealth
+	}
 
 	dx := target.Pos[0] - s.pos[0]
 	dz := target.Pos[2] - s.pos[2]
@@ -2170,7 +2219,7 @@ func (s *session) dispatch(c command) {
 		}
 		s.goal = &target{
 			id: c.ID, x: c.X, z: c.Z, tolerance: tol,
-			y: c.Y, hasY: c.Value, noDig: c.Face == 1,
+			y: c.Y, hasY: c.Value, noDig: c.Face == 1, strictY: c.Strict,
 			deadline: time.Now().Add(time.Duration(timeout) * time.Millisecond),
 			lastPos:  s.pos,
 		}
@@ -2232,6 +2281,18 @@ func (s *session) dispatch(c command) {
 		s.lookAtLocked(c.X, c.Y, c.Z)
 		s.mu.Unlock()
 		s.reply(c.ID, true, "", nil)
+
+	case "stance":
+		// LLM が決めた構え(auto / flee / fight)。毎tickの防衛判断が読む。
+		switch c.State {
+		case "auto", "flee", "fight", "":
+			s.mu.Lock()
+			s.stance = c.State
+			s.mu.Unlock()
+			s.reply(c.ID, true, "", map[string]any{"stance": c.State})
+		default:
+			s.reply(c.ID, false, "stance は auto / flee / fight のどれか", nil)
+		}
 
 	case "chat":
 		err := s.conn.WritePacket(&packet.Text{
@@ -3130,7 +3191,7 @@ func (s *session) dispatch(c command) {
 		var chosen *craftRecipe
 		var lastErr error
 		var req *protocol.ItemStackRequest
-		var usedInputs []craftInput
+		var plan craftPlan
 		for i := range list {
 			if list[i].NeedsTable && !c.Value {
 				lastErr = fmt.Errorf("%s は作業台が要ります", want)
@@ -3139,7 +3200,7 @@ func (s *session) dispatch(c command) {
 			// クライアントが出すリクエストIDは負の奇数を順に減らしていく。
 			// 正の値を出すと "expected a valid ItemStackRequestId" で弾かれる。
 			s.craftReqID -= 2
-			r, used, err := s.craftRequestLocked(list[i], s.craftReqID)
+			r, p, err := s.craftRequestLocked(list[i], s.craftReqID)
 			if err != nil {
 				// 素材不足はレシピの亜種ごとに必ず出る(別の木のレシピなど)。
 				// それで上書きすると、本当の失敗理由が最後の亜種の
@@ -3150,8 +3211,8 @@ func (s *session) dispatch(c command) {
 				continue
 			}
 			chosen = &list[i]
-			// タグを解決したあとの素材表。何が減るかの予測にはこちらを使う。
-			usedInputs = used
+			// 取り出し元と行き先。応答が来たときの写しの更新はこれに従う。
+			plan = p
 			req = r
 			break
 		}
@@ -3168,7 +3229,9 @@ func (s *session) dispatch(c command) {
 		s.craftEffect[req.RequestID] = craftOutcome{
 			Output:      chosen.Output,
 			OutputCount: chosen.OutputCount,
-			Inputs:      usedInputs,
+			Inputs:      plan.Inputs,
+			Spent:       plan.Spent,
+			Dest:        plan.Dest,
 		}
 		s.mu.Unlock()
 
@@ -4298,6 +4361,10 @@ type craftOutcome struct {
 	Output      string
 	OutputCount int
 	Inputs      []craftInput
+
+	// 要求で指した取り出し元(枠→個数)と行き先の枠。
+	Spent map[int]int
+	Dest  int
 }
 
 // applyCraftLocked はクラフトの結果を持ち物の写しに反映する。
@@ -4305,71 +4372,50 @@ type craftOutcome struct {
 // 入っていない。何を作ったかはこちらが知っているので自前で当てる。
 // 呼び出し側が mu を持つこと。
 func (s *session) applyCraftLocked(eff craftOutcome) {
-	// 素材を減らす。
-	for _, in := range eff.Inputs {
-		remaining := in.Count
-		for i := range s.slots {
-			if remaining <= 0 {
-				break
-			}
-			if s.slots[i].Name != in.Name {
-				continue
-			}
-			take := s.slots[i].Count
-			if take > remaining {
-				take = remaining
-			}
-			s.slots[i].Count -= take
-			remaining -= take
+	// 素材を減らす。要求で実際に指した枠から、指した数だけ引く。
+	// 名前で「最初の山」から引いてはいけない。要求は rawSlots の走査順で
+	// 取るので、同じ物が2山あるとき写しとサーバーで減る山が食い違う。
+	for slot, n := range eff.Spent {
+		raw, ok := s.rawSlots[slot]
+		if !ok {
+			continue
 		}
-	}
-	kept := s.slots[:0]
-	for _, it := range s.slots {
-		if it.Count > 0 {
-			// 生の写しの数も合わせる。ここがずれると、持ち替えが
-			// 空のスロットを指して「手に何も持っていません」になる。
-			if raw, ok := s.rawSlots[it.Slot]; ok {
-				raw.Stack.Count = uint16(it.Count)
-				s.rawSlots[it.Slot] = raw
-			}
-			kept = append(kept, it)
-		} else {
-			delete(s.rawSlots, it.Slot)
+		if int(raw.Stack.Count) <= n {
+			delete(s.rawSlots, slot)
+			s.syncSlotLocked(slot, protocol.ItemInstance{})
+			continue
 		}
+		raw.Stack.Count -= uint16(n)
+		s.rawSlots[slot] = raw
+		s.syncSlotLocked(slot, raw)
 	}
-	s.slots = kept
 
-	// 出来上がりを足す。同じ物があればまとめる。
-	for i := range s.slots {
-		if s.slots[i].Name == eff.Output {
-			s.slots[i].Count += eff.OutputCount
-			if raw, ok := s.rawSlots[s.slots[i].Slot]; ok {
-				raw.Stack.Count = uint16(s.slots[i].Count)
-				s.rawSlots[s.slots[i].Slot] = raw
-			}
-			return
-		}
+	// 出来上がりは要求で指した行き先へ。既にある山ならそこへ足し、空き枠なら
+	// 新しく作る。同じ名前の別の山へ足すと、サーバー側で埋まった枠を写しが
+	// 空きだと思い続け、次の出来上がりの行き先に選んで
+	// FailedToValidateDstSlot(50) で拒否される。
+	if raw, ok := s.rawSlots[eff.Dest]; ok && raw.Stack.Count > 0 {
+		raw.Stack.Count += uint16(eff.OutputCount)
+		s.rawSlots[eff.Dest] = raw
+		s.syncSlotLocked(eff.Dest, raw)
+		return
 	}
-	slot := 0
-	for ; slot < 36; slot++ {
-		if _, used := s.rawSlots[slot]; !used {
-			break
-		}
-	}
-	s.slots = append(s.slots, invSlot{Slot: slot, Name: eff.Output, Count: eff.OutputCount})
 	// 生の写しにも入れる。持ち替え・設置・次のクラフトは全てこちらを見る。
 	// ここを書かないと、作った物を手に持てない。作業台を作った直後の設置が
 	// 「手に何も持っていません」で失敗していた。
 	if id, ok := s.networkIDForLocked(eff.Output); ok {
-		s.rawSlots[slot] = protocol.ItemInstance{
+		item := protocol.ItemInstance{
 			// サーバーが割り当てた識別子は分からない。0 のままにしておき、
-			// 重ねる先には選ばない(outputSlotLocked が弾く)。
+			// 重ねる先には選ばない(outputSlotLocked が弾く)。応答の
+			// ContainerInfo に載っていれば、呼び出し側がこのあと取り込む。
 			StackNetworkID: 0,
 			Stack: protocol.ItemStack{
 				ItemType: protocol.ItemType{NetworkID: id},
 				Count:    uint16(eff.OutputCount),
 			},
 		}
+		s.rawSlots[eff.Dest] = item
+		s.syncSlotLocked(eff.Dest, item)
 	}
 }
 

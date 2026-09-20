@@ -144,9 +144,12 @@ export class BedrockSidecar {
 		//
 		// Windows の環境変数は wsl 経由では引き継がれない。攻撃の送り方を
 		// 切り替えて実測するのに、その都度ビルドし直すのは無駄なので、
-		// ONJ_ で始まるものだけを明示的に渡す。
+		// ONJ_ で始まるものと、サイドカーの追跡出力(BEDROCK_TRACE_*)だけを
+		// 明示的に渡す。追跡は WSL 経由のローカル採点でも要る。実測 2026-09-19、
+		// 作業台のクラフトが status=50 で7回続けて拒否されたが、送った要求と
+		// 持ち物の写しが出ておらず、どの枠を指したのかが読めなかった。
 		const passthrough = Object.entries(process.env)
-			.filter(([k, v]) => k.startsWith("ONJ_") && v)
+			.filter(([k, v]) => (k.startsWith("ONJ_") || k.startsWith("BEDROCK_TRACE_")) && v)
 			.map(([k, v]) => `${k}=${v}`);
 		const [file, spawnArgs] = viaWsl
 			? [

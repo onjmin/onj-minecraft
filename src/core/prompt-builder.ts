@@ -72,6 +72,32 @@ export interface ThinkingState {
 	 */
 	stallNotes?: string[];
 	/**
+	 * いまの状況を、判断に使える文にしたもの(situation.ts)。
+	 *
+	 * 地下にいる・危険域の中・生肉はあるがかまどが無い、といった事実。
+	 * 以前はこれらをコード側が読んで「surface が担当」「secure_food が担当」
+	 * と決めていた。決めるのは LLM で、ここはその材料を渡す。
+	 */
+	situation?: string[];
+	/**
+	 * 反射が前の思考以降にしたこと(reflex-log.ts)。
+	 *
+	 * 反射は LLM を待てない場面のためにあるが、何をしたか・何に失敗したかを
+	 * LLM が知らなければ、同じ失敗を横で眺めるだけになる。
+	 */
+	reflexLog?: string[];
+	/**
+	 * いま走っている行動と、その経過。
+	 *
+	 * 以前は「担当してから60秒未満なら乗り換えを却下」というコード側の判断で
+	 * 長い行動を守っていた。いまは経過を渡して、続けるか替えるかを LLM が言う。
+	 */
+	currentAction?: string;
+	/** いまの構え(auto / flee / fight)。LLM が Stance 欄で変える。 */
+	stance?: "auto" | "flee" | "fight";
+	/** 夜の籠り反射を LLM がいま断っているか。Hide 欄の現在値として見せる。 */
+	hideDeclined?: boolean;
+	/**
 	 * 人から受けた作業の依頼。返答そのものは conversation が担当するので、
 	 * ここでは「何を頼まれたか」だけを渡し、行動に落とさせる。
 	 */
@@ -88,8 +114,11 @@ export function buildThinkingPrompt(state: ThinkingState): string {
 	sections.push(buildIdentitySection(state));
 	sections.push(buildAgentRulesSection());
 	sections.push(buildEnvironmentSection(state));
+	sections.push(buildSituationSection(state));
 	sections.push(buildInventorySection(state));
 	sections.push(buildStrategicSection(state));
+	sections.push(buildCurrentActionSection(state));
+	sections.push(buildReflexSection(state));
 	sections.push(buildStallSection(state));
 	sections.push(buildSkillSection(state));
 	sections.push(buildMemorySection(state));
@@ -133,7 +162,35 @@ Prefer the task that unblocks the most other tasks. With empty hands that is usu
 
 Order matters for survival. Once you have wood, craft a SWORD before anything else. Unarmed you cannot fight back, so you spend the whole time running or hiding and lose everything you carry each time you die. A wooden sword is cheap and changes that.
 
+Exception: when you are starving (hunger 6 or less) and SITUATION shows a way to a meal you already carry (food, or raw meat plus the means to build a furnace), take that path first. Health does not regenerate while starving, so wood and swords come after the meal.
+
 Never repeat a skill that failed twice in the same environment unless the environment has changed.
+
+You have a small set of reflexes that act without you: digging out when boxed in, eating when hungry and safe, joining others in bed, hiding underground at night when unarmed, and a per-tick combat reflex that runs from or fights nearby hostiles. The hiding reflex is the only one that holds you for minutes; you can switch it off with "Hide: no". The combat reflex follows your "Stance". Everything else is YOUR decision: getting back to the surface, securing food, crafting weapons, walking out of hazard zones, recovering dropped items. Nobody will do these for you. Read SITUATION and decide.
+`.trim();
+}
+
+function buildSituationSection(state: ThinkingState): string {
+	if (!state.situation || state.situation.length === 0) return "";
+	return `
+=== SITUATION (facts derived from the world — act on these) ===
+${state.situation.map((n) => `- ${n}`).join("\n")}
+`.trim();
+}
+
+function buildCurrentActionSection(state: ThinkingState): string {
+	if (!state.currentAction) return "";
+	return `
+=== CURRENT ACTION ===
+${state.currentAction}
+`.trim();
+}
+
+function buildReflexSection(state: ThinkingState): string {
+	if (!state.reflexLog || state.reflexLog.length === 0) return "";
+	return `
+=== WHAT YOUR REFLEXES DID SINCE YOUR LAST THOUGHT ===
+${state.reflexLog.map((n) => `- ${n}`).join("\n")}
 `.trim();
 }
 
@@ -238,6 +295,7 @@ function buildSkillSection(state: ThinkingState): string {
 
 	return `
 === AVAILABLE SKILLS ===
+Skills marked [PRECONDITION UNMET: ...] will fail right now for the stated reason. They are listed so you know they exist and what would make them possible; pick something else unless you are fixing that precondition.
 ${skillText}
 `.trim();
 }
@@ -286,6 +344,8 @@ function buildOutputFormatSection(state: ThinkingState): string {
 		"Strategy: (optional, update or keep current)",
 		"Achievement: (optional, if something was completed)",
 		"Skill: (exact name)",
+		`Stance: (auto, flee or fight) — how your per-tick combat reflex treats nearby hostiles. auto (default): flee when unarmed, low on health or facing a creeper, otherwise fight. flee: always run, even armed. fight: engage even bare-handed (still flees when health is critical). Current: ${state.stance ?? "auto"}. Omit to keep it.`,
+		`Hide: (yes or no) — whether your night reflex may dig you in and hide underground until dawn. Current: ${state.hideDeclined ? "no" : "yes"}. Say no when you have a better plan for the night (digging up to the surface, staying in a sealed room you already have). Keep answering the same way each thought while the plan stands; flipping between yes and no every thought hands control back and forth and wastes the night.`,
 	];
 
 	// Chat 欄は、その出力を実際に使うときだけ出す。

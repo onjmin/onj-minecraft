@@ -92,11 +92,7 @@ async function main() {
 			.find((e) => e.kind === "player" && e.username === from);
 		const me = driver.getState().position;
 		const speakerDistance = speaker
-			? Math.hypot(
-					speaker.position.x - me.x,
-					speaker.position.y - me.y,
-					speaker.position.z - me.z,
-				)
+			? Math.hypot(speaker.position.x - me.x, speaker.position.y - me.y, speaker.position.z - me.z)
 			: null;
 		const addressed = isAddressedToBot(message, {
 			selfName: driver.getState().username,

@@ -11,6 +11,13 @@ export interface SkillField {
 	type: "string" | "number" | "boolean";
 	description: string;
 	isRawData?: true; // STEP 2で隠蔽し、STEP 3で注入するフラグ
+	/**
+	 * 省いてよい引数。
+	 *
+	 * agent は「引数の要るスキルを引数無しで選ばれた」と見ると選び直させる。
+	 * 省いてよい引数しか無いスキルは、引数無しでも動かしてよい。
+	 */
+	optional?: true;
 }
 
 // 成功時と失敗時を型レベルで分離する

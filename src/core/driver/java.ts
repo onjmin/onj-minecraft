@@ -244,6 +244,10 @@ export class JavaDriver implements BotDriver {
 		this.bot.clearControlStates();
 	}
 
+	async setStance(_stance: "auto" | "flee" | "fight"): Promise<void> {
+		// Java 版の戦闘は mineflayer-pvp に任せていて、構えの経路は無い。
+	}
+
 	async lookAt(position: Position): Promise<void> {
 		await this.bot.lookAt(toVec3(position));
 	}
@@ -322,8 +326,9 @@ export class JavaDriver implements BotDriver {
 		await this.agent.pickupNearbyItems(signal);
 	}
 
-	async eat(_signal: AbortSignal): Promise<boolean> {
-		const food = pickFood(this.bot.inventory.items().map((i) => i.name));
+	async eat(_signal: AbortSignal, item?: string): Promise<boolean> {
+		const names = this.bot.inventory.items().map((i) => i.name);
+		const food = item ? (names.includes(item) ? item : null) : pickFood(names);
 		if (!food) return false;
 		try {
 			await this.equip(food, "hand");

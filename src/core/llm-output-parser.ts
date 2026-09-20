@@ -1,6 +1,6 @@
 export function parseSections(rawContent: string) {
 	// 見出しのリスト（必要ならここに新しいセクション名を追加）
-	const headers = ["Rationale", "Chat", "Skill", "Strategy", "Achievement"];
+	const headers = ["Rationale", "Chat", "Skill", "Strategy", "Achievement", "Hide", "Stance"];
 
 	const headerPattern = headers.join("|");
 
@@ -202,6 +202,21 @@ export interface ParsedThought {
 	/** Achievement セクションの中身。扱いは strategy と同じ。 */
 	achievement?: string[];
 	memory?: string;
+	/**
+	 * 夜の籠り(反射 shelter)を許すか。
+	 *
+	 * 明示的に断った(no/off/skip/false)ときだけ false。書かれていなければ
+	 * undefined で、既定(許す)のまま。mindcraft の !setMode に相当する、
+	 * LLM が反射を切る唯一の経路。
+	 */
+	hide?: boolean;
+	/**
+	 * 敵が近いときの構え。書かれていなければ undefined(変えない)。
+	 *
+	 * サイドカーは毎tick「逃げるか殴るか」を決めるが、その方針(素手なら逃げる、
+	 * 武器があれば殴る)は定数だった。LLM が変えられる経路がここ。
+	 */
+	stance?: "auto" | "flee" | "fight";
 }
 
 /**
@@ -258,6 +273,30 @@ export function parseLlmOutput(rawContent: string): ParsedThought {
 	const strategy = splitListLines(sections.strategy);
 	const achievement = splitListLines(sections.achievement);
 	if (strategy.length > 0) result.strategy = strategy;
+
+	// ⑤ Hide → hide。先頭の1語だけ見る。"no, I will dig up" のような続きは無視。
+	const hideWord = (sections.hide ?? "")
+		.trim()
+		.toLowerCase()
+		.replace(/^[("'[]+/, "")
+		.split(/[\s,.;:!)]+/)[0];
+	// ⑥ Stance → stance。auto / flee / fight の先頭1語だけ見る。
+	const stanceWord = (sections.stance ?? "")
+		.trim()
+		.toLowerCase()
+		.replace(/^[("'[]+/, "")
+		.split(/[\s,.;:!)]+/)[0];
+	if (stanceWord === "flee" || stanceWord === "run" || stanceWord === "avoid")
+		result.stance = "flee";
+	else if (stanceWord === "fight" || stanceWord === "attack" || stanceWord === "engage")
+		result.stance = "fight";
+	else if (stanceWord === "auto" || stanceWord === "default") result.stance = "auto";
+
+	if (["no", "off", "skip", "false", "never", "dont", "don't"].includes(hideWord)) {
+		result.hide = false;
+	} else if (["yes", "on", "true", "ok", "allow"].includes(hideWord)) {
+		result.hide = true;
+	}
 	if (achievement.length > 0) result.achievement = achievement;
 
 	const memoryChunks: string[] = [];

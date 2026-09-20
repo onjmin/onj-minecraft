@@ -1,20 +1,26 @@
 /**
- * 生存のルール表。上にあるものほど優先される。
+ * 反射のルール表。上にあるものほど優先される。
  *
- * これまで生存判断は15個の反射メソッドとして reflexSurvival に並んでいた。
- * それぞれが「自分が担当したら true を返して他を黙らせる」拒否権を持ち、
- * `sheltering` や `currentTaskName` のような共有フィールドを書き換えて
- * 隣に合図していた。1つ足すたびに、既存14個が作りうる状態すべてとの
- * 噛み合わせを確かめる必要があり、しかもその確認は本番8時間で1標本しか
- * 得られなかった。増える速さが確かめる速さを上回るので、5日間で死亡率は
- * 5.5〜5.9回/時から動いていない。
+ * ここに置いてよいのは「LLM の判断を待つと手遅れになるもの」だけである。
+ * 状況を読んで何をするか決めるのは LLM の仕事で、この表はその代わりを
+ * しない。2026-09-19 までは、地上へ出る・食料を確保する・武器を作る・
+ * 危険域から出る・落とし物を取りに行く、という分単位の計画がここに並び、
+ * LLM が選んだ行動を止め、失敗しても LLM に理由を返さなかった。3週間半で
+ * 判断コードは3倍に増え、死亡率は動かなかった。そこで計画をここから外し、
+ * 事実は situation.ts が LLM に渡し、選ぶのは LLM に戻した。
  *
- * ここでは各ルールが
+ * ルールを1つ足そうとしたら、まず問うこと。
+ *   - LLM はこの状況を見えていたか。見えていないなら、渡すべきは事実(situation)。
+ *   - 見えていて選べなかったなら、足りないのはスキルか、その説明。
+ *   - 秒未満で判断が要らず、待てば死ぬ。それだけがここに入る資格を持つ。
+ *
+ * 各ルールは
  *   - when: 純粋な前提条件。世界のコピーだけを見る。副作用も Date.now() も無い
  *   - run:  行動。他のルールを黙らせる手段は持たない
+ *   - report: LLM に何をしたか報告する1行(英語)
  * だけを持つ。誰が担当するかは裁定者(arbiter.ts)が1箇所で決め、掴み続けて
- * よい時間も裁定者が握る。ルールを1つ足すコストは「表に1行入れて、その順位が
- * 正しいかを見る」だけになり、既存との組み合わせを数える必要が無くなる。
+ * よい時間も裁定者が握る。行動が失敗したら、裁定者が担当を手放して理由を
+ * LLM に渡す。同じ失敗を繰り返すのは、ここの仕事ではない。
  */
 import { EAT_BELOW_FOOD } from "../driver/food";
 import { envNum } from "../utils/env";
@@ -40,22 +46,12 @@ export interface SurvivalActions {
 	log(message: string): void;
 	/** 持ち物から食べる。食べられたら true。 */
 	eat(signal: AbortSignal): Promise<boolean>;
-	/** 狩る・焼く。食料が増えたら true。 */
-	secureFood(signal: AbortSignal): Promise<boolean>;
 	/** 寝床へ戻るか、その場に潜る。 */
 	shelter(signal: AbortSignal): Promise<void>;
-	/** 地上へ1歩ぶん近づく。 */
-	goToSurface(signal: AbortSignal): Promise<void>;
 	/** 四方を塞がれているとき、1マス掘って出口を作る。 */
 	escapeBoxedIn(signal: AbortSignal): Promise<void>;
-	/** 落とし物を取りに行く。 */
-	recoverLoot(signal: AbortSignal): Promise<void>;
 	/** ベッドに入る。入れたら true。 */
 	sleep(signal: AbortSignal): Promise<boolean>;
-	/** 手元の材料で武器を作る。 */
-	armSelf(signal: AbortSignal): Promise<void>;
-	/** 掘り荒らされた区域から、掘らずに歩いて出る。 */
-	leaveHazard(signal: AbortSignal): Promise<void>;
 }
 
 export interface SurvivalRule {
@@ -63,6 +59,13 @@ export interface SurvivalRule {
 	readonly name: string;
 	/** なぜ担当したのかを1行で。ログにはこれだけが出る。 */
 	readonly why: (s: SurvivalSnapshot) => string;
+	/**
+	 * LLM への報告(英語)。担当を取ったとき・取り上げられたときに渡る。
+	 *
+	 * 思考プロンプトは英語だけで書く決まりなので、日本語の why とは別に持つ。
+	 * 混ぜると出力まで日本語に引きずられる。
+	 */
+	readonly report: (s: SurvivalSnapshot) => string;
 	/** 前提条件。純粋であること（driver も Date.now() も触らない）。 */
 	readonly when: (s: SurvivalSnapshot) => boolean;
 	/**
@@ -101,13 +104,13 @@ export function isDying(s: SurvivalSnapshot): boolean {
  *
  * 満腹度が足りないときを外すのが要点。統合版の自然回復は満腹度18以上で
  * しか起きないので、それ未満で「回復を待つ」のは待ちぼうけにしかならない。
- * 待てないなら、待つより食べに行く方が近い(secureFood の担当になる)。
+ * 待てないなら、食べに行くのが先で、それは LLM が選ぶ。
  */
 export function isHurtAndCanWait(s: SurvivalSnapshot): boolean {
 	return s.health <= SHELTER_HEALTH && canRegenerate(s) && s.hostilesNear > 0;
 }
 
-/** 埋まっているか。 */
+/** 埋まっているか。situation が LLM に伝えるときにも使う。 */
 export function isBuried(s: SurvivalSnapshot): boolean {
 	return (
 		s.solidAbove >= BURIED_THICKNESS ||
@@ -118,32 +121,29 @@ export function isBuried(s: SurvivalSnapshot): boolean {
 /**
  * 優先順位表。上から順に、前提が成立した最初の1つだけが担当する。
  *
- * 並べ替えるときは、その理由をここに書くこと。順位そのものが仕様になる。
+ * 4本しかないのは意図である。並べ替えるときは、その理由をここに書くこと。
  */
 export const SURVIVAL_RULES: readonly SurvivalRule[] = [
 	{
-		// 出口が無いと他のルールは全部空振りする。食べるにも狩るにも
-		// 地上へ出るにも、まず動ける形にする必要がある。
+		// 出口が無いと他の何も始まらない。掘るのは一瞬で、判断は要らない。
 		//
-		// 潜っている最中(籠りが担当している間)は裁定者が他を走らせないので、
-		// 自分で塞いだ蓋をここが掘り返すことはない。以前はこれが
-		// 「潜る→掘り返す→また潜る」の往復になり、一晩で86回殺されていた。
-		name: "escape_boxed_in",
-		why: () => "四方を塞がれている。掘って出口を作る",
 		// 夜に自分で潜って塞がっているのは「閉じ込められている」ではない。
 		// ここを見落とすと、籠りが担当を取る前(再接続や死亡直後)に、
 		// 自分で塞いだ蓋を掘り返して夜の地上へ出てしまう。
+		name: "escape_boxed_in",
+		why: () => "四方を塞がれている。掘って出口を作る",
+		report: () => "Reflex escape_boxed_in: you were boxed in, dug one block to make an exit.",
 		when: (s) => s.ready && s.health > 0 && s.boxedIn && !(s.night && s.sheltered),
-		// 短く持つ。掘るのは一瞬なので、長く握ってもスキル層を止めるだけ。
 		holdMs: envNum("ESCAPE_HOLD_MS", 10_000),
 		cooldownMs: envNum("ESCAPE_COOLDOWN_MS", 10_000),
 		run: (a, signal) => a.escapeBoxedIn(signal),
 	},
 	{
-		// 食事は籠りより先。満腹度が足りなければ籠っても体力は戻らない。
-		// 敵が至近にいるときはやらない。食事中は動けない。
+		// 持っている物を食べるのは判断ではない。敵が至近にいるときはやらない。
+		// 食事中は動けない。
 		name: "eat",
 		why: (s) => `満腹度 ${s.food}。${s.edible} を食べる`,
+		report: (s) => `Reflex eat: hunger was ${s.food}, ate ${s.edible}.`,
 		when: (s) =>
 			s.ready &&
 			s.health > 0 &&
@@ -153,31 +153,36 @@ export const SURVIVAL_RULES: readonly SurvivalRule[] = [
 		holdMs: 15_000,
 		cooldownMs: 5_000,
 		run: async (a, signal) => {
-			await a.eat(signal);
+			// 食べたつもりで増えていないのは失敗。裁定者が手放して LLM に返す。
+			if (!(await a.eat(signal))) throw new Error("ate nothing (hunger did not rise).");
 		},
 	},
 	{
 		// 統合版は全員が寝ないと夜を飛ばせない。起きているのがボット1体でも
 		// 他の人が朝を迎えられないので、こちらの都合より優先する。
+		// 相手を待たせる時間を考えると LLM の1周(30秒)は長い。
 		name: "sleep",
 		why: () => "誰かが寝ている。ベッドへ向かう",
+		report: () => "Reflex sleep: another player went to bed, so you headed for a bed too.",
 		when: (s) => s.ready && s.health > 0 && s.sleepRequested,
 		holdMs: 60_000,
 		cooldownMs: 30_000,
 		run: async (a, signal) => {
-			await a.sleep(signal);
+			if (!(await a.sleep(signal))) throw new Error("no reachable bed to sleep in.");
 		},
 	},
 	{
 		// 夜の地上を丸腰で歩かない。実測、これを入れる前は8分で13回死に、
 		// 大半が death.attack.mob だった。
 		//
-		// 待ってよいのは「待てば戻る」ときだけ。満腹度が足りないときは
-		// isHurtAndCanWait が false になり、下の secure_food が担当する。
+		// これは4本の中で唯一、分単位で担当を握るルールである。だから
+		// LLM が切れるようにしてある。出力の Hide 欄で断られたら(shelterDeclined)、
+		// 瀕死か死に続けているときを除いて担当を取らない。判断は LLM、ここは
+		// LLM が何も言わないときの既定にすぎない。
 		//
 		// 地下深くでは潜らない。潜る動作は足元を掘るので、地下では
-		// 「隠れる」ではなく「深くなる」でしかない。実測 2026-09-16、
-		// 8時間で43回死に、一度も地表(Y=55〜66)に出ていない。
+		// 「隠れる」ではなく「深くなる」でしかない。地下から出るかどうかは
+		// LLM が situation を読んで決める。
 		name: "shelter",
 		why: (s) =>
 			isDying(s)
@@ -185,6 +190,12 @@ export const SURVIVAL_RULES: readonly SurvivalRule[] = [
 				: isHurtAndCanWait(s)
 					? `体力 ${s.health}。退いて回復を待つ`
 					: "夜で装備が無い。退いてやり過ごす",
+		report: (s) =>
+			isDying(s)
+				? `Reflex shelter: you died ${s.recentDeaths} times in a short span, so you hid and waited.`
+				: isHurtAndCanWait(s)
+					? `Reflex shelter: health ${s.health}, hid to regenerate.`
+					: "Reflex shelter: night and unarmed, hid underground until morning.",
 		when: (s) => {
 			if (!s.ready || s.health <= 0) return false;
 			if (s.depthBelowSurface !== null && s.depthBelowSurface > DEEP_UNDERGROUND_GAP) return false;
@@ -193,6 +204,8 @@ export const SURVIVAL_RULES: readonly SurvivalRule[] = [
 			if (!s.night && !hurt && !dying) return false;
 			// 頼まれた直後は出る。瀕死のときだけは、頼まれごとより先に死ぬので譲らない。
 			if (s.humanRequestFresh && !hurt) return false;
+			// LLM が籠らないと決めたなら従う。瀕死・死に続けのときだけは譲らない。
+			if (s.shelterDeclined && !hurt && !dying) return false;
 			// 装備が揃っていて無傷なら、夜でも歩ける。
 			if (!hurt && !dying && equipped(s)) return false;
 			return true;
@@ -204,99 +217,5 @@ export const SURVIVAL_RULES: readonly SurvivalRule[] = [
 		// 昼だけ上限を効かせる。夜は朝まで掴んでよい。
 		capWhen: (s) => !s.night,
 		run: (a, signal) => a.shelter(signal),
-	},
-	{
-		// 丸腰なら剣。食料の確保より先に置く。
-		//
-		// 素手の攻撃力は1で、牛・豚・羊の体力は10。木の剣なら4なので3発で
-		// 済む。素手で狩りに出るのは、当たったとしても割に合わない。実測
-		// 2026-09-18 12:28、素手で20秒に35回殴って倒せていない。
-		// 材料があるなら、先に剣を作ってから獲物へ行く。
-		// 材料があるのに素手で探索を続けていた実測がある。
-		// 敵が近いときはやらない。クラフト中は無防備で、作りかけで
-		// 殺されると材料ごと落とす。
-		name: "arm",
-		why: () => "丸腰。手元の材料で武器を作る",
-		when: (s) =>
-			s.ready && s.health > 0 && !s.armed && s.craftableWeapon && s.hostilesNear === 0 && !s.night,
-		holdMs: 60_000,
-		cooldownMs: 60_000,
-		run: (a, signal) => a.armSelf(signal),
-	},
-	{
-		// 食料の確保。ここが生存の鎖の1本目で、ずっと抜けていた。
-		//
-		// 食料 → 自然回復 → 夜を越す → 持ち物を保つ → 道具、という鎖の
-		// 最初が繋がっていないため、何を積んでも死ぬたびに全部落ちて
-		// 毎回ゼロから始まっていた。全ログ通算で食事は23回しかない。
-		//
-		// 夜は出ない。ただし満腹度0で敵もいないなら、待っていても
-		// 餓死するだけなので近くの獲物には行く。
-		name: "secure_food",
-		why: (s) => `満腹度 ${s.food} で食べ物が無い。${s.cookable ? "焼く" : "狩る"}`,
-		when: (s) => {
-			if (!s.ready || s.health <= 0) return false;
-			if (s.food >= EAT_BELOW_FOOD) return false;
-			if (s.edible !== null) return false; // 食べる方が先
-			// 焼けば食べられるなら、獲物がいなくても仕事がある。
-			if (s.cookable !== null) return !s.night || s.sheltered;
-			if (s.preyDistance === null || s.preyDistance > HUNT_RANGE) return false;
-			// 素手では狩りに行かない。
-			//
-			// 武器を作れるなら、上の arm が先に担当する。作れないなら、
-			// 木を集めるところから始めるのが筋で、それは思考側の仕事。
-			// ただし本当に飢えているときだけは、割が悪くても行かせる。
-			// 待っていても減るだけなので、可能性のある方を選ぶ。
-			if (!s.armed && s.food > STARVING_FOOD) return false;
-			if (s.night) return s.food <= STARVING_FOOD && s.hostilesNear === 0;
-			return true;
-		},
-		holdMs: envNum("SECURE_FOOD_HOLD_MS", 3 * 60_000),
-		cooldownMs: envNum("SECURE_FOOD_COOLDOWN_MS", 60_000),
-		run: async (a, signal) => {
-			await a.secureFood(signal);
-		},
-	},
-	{
-		// 地上へ戻るのは判断ではなく前提。木も動物も地上にあるので、
-		// 地下にいる限り何も進まない。
-		name: "surface",
-		why: (s) => `地表は ${s.depthBelowSurface ?? "?"} マス上。先に地上へ出る`,
-		when: (s) => s.ready && s.health > 0 && isBuried(s),
-		holdMs: envNum("SURFACE_HOLD_MS", 3 * 60_000),
-		cooldownMs: envNum("SURFACE_COOLDOWN_MS", 60_000),
-		run: (a, signal) => a.goToSurface(signal),
-	},
-	{
-		// 穴だらけの区域から出る。地上に出た後、落とし物より先。
-		//
-		// 初期リスの周りは自分で掘った穴の集まりで、実測 2026-09-19 は
-		// 時間の 90% を地表より下で過ごし、落下死は全部その真下だった。
-		// 探索も採集も、そこにいる限り穴の底で終わる。上の surface が
-		// 先に地上へ出し、ここは地上を歩いて縁の外まで出る。掘らない。
-		//
-		// 夜で装備が無いときは shelter が上で担当する。装備があるなら
-		// 夜でも出る。穴の縁で夜を待つ方が危ない。
-		name: "leave_hazard",
-		why: () => "掘り荒らされた区域にいる。歩いて外へ出る",
-		when: (s) => s.ready && s.health > 0 && s.insideHazard && !isBuried(s),
-		holdMs: envNum("LEAVE_HAZARD_HOLD_MS", 3 * 60_000),
-		cooldownMs: envNum("LEAVE_HAZARD_COOLDOWN_MS", 2 * 60_000),
-		run: (a, signal) => a.leaveHazard(signal),
-	},
-	{
-		// 落とし物の回収。安全なときだけ。
-		name: "recover_loot",
-		why: () => "落とし物を取りに戻る",
-		when: (s) =>
-			s.ready &&
-			s.health > 0 &&
-			s.deathPoint !== null &&
-			!s.night &&
-			s.hostilesNear === 0 &&
-			!isDying(s),
-		holdMs: envNum("RECOVER_HOLD_MS", 2 * 60_000),
-		cooldownMs: envNum("RECOVER_COOLDOWN_MS", 60_000),
-		run: (a, signal) => a.recoverLoot(signal),
 	},
 ];

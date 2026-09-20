@@ -28,12 +28,13 @@ export const gotoCoordsSkill = createSkill<
 			);
 		}
 
-		// 掘り荒らされた区域の中は行き先にしない。実測 2026-09-19、このスキルが
-		// 58回選ばれ、ほぼ全部が初期リスの穴の中の作業台に向いていた。
+		// 危険域の中を行き先にするかは LLM が決める。SITUATION と hazard zone の
+		// 一覧に「中にいる／縁から何ブロック」が出ているので、知った上で選んだ
+		// なら行く。以前はここで拒否していた(実測 2026-09-19、58回のうち大半が
+		// 穴の中の作業台向き)が、それは LLM に見せる情報が無かったからで、
+		// 拒否はコード側の判断だった。ログには残す。
 		if (agent.isInHazard({ x, z })) {
-			return skillResult.fail(
-				`(${x}, ${y}, ${z}) is inside a dug-out hazard zone (cratered ground). Do not go there; explore new terrain on the surface instead.`,
-			);
+			agent.log(`[goto.coords] (${x}, ${z}) は危険域の中。LLM の選択なので向かう`);
 		}
 
 		agent.log(`[goto.coords] Moving to (${x}, ${y}, ${z})`);

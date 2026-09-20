@@ -5,6 +5,7 @@
  * 別々に持つと「手元では通ったのに本番では別の一覧だった」が起きる。
  */
 import { buildingBaseSkill } from "../skills/building/base";
+import { buildBedSkill } from "../skills/building/bed";
 import { collectDirtSkill } from "../skills/collecting/dirt";
 import { huntAnimalsSkill } from "../skills/collecting/hunting";
 import { mineOresSkill } from "../skills/collecting/mining";
@@ -22,7 +23,9 @@ import { gotoLandmarkSkill } from "../skills/goto/landmark";
 import { gotoPlayerSkill } from "../skills/goto/player";
 import { gotoSurfaceSkill } from "../skills/goto/surface";
 import { giveItemSkill } from "../skills/social/give";
+import { survivalEatSkill } from "../skills/survival/eat";
 import { secureFoodSkill } from "../skills/survival/food";
+import { survivalHideSkill } from "../skills/survival/hide";
 
 // 統合版でもスキルは一通り動く。Driver 層が Java 版との差を吸収しているので
 // skills/ 側は共通のものをそのまま使う。
@@ -49,10 +52,17 @@ export const bedrockSkills = [
 	// 狩る→焼く→食べるを一続きで行う。満腹度18を切ると体力が自然回復
 	// しないので、これが通らない限り他の何をしても積み上がらない。
 	secureFoodSkill,
+	// 何を食べるかは LLM が決める。反射の eat が外す生の鶏肉も、LLM が選べば食べる。
+	survivalEatSkill,
+	// 隠れるのも LLM が選べる。反射は既定でしか籠らない。
+	survivalHideSkill,
 	craftToolSkill,
 	craftWeaponSkill,
 	craftTorchSkill,
 	craftSmeltingSkill,
 	buildingBaseSkill,
+	// 復帰地点を動かす唯一のチート無しの手段。死亡30回中14回が復帰地点の
+	// 真下のクレーターだった(2026-09-20)。
+	buildBedSkill,
 	giveItemSkill,
 ];
