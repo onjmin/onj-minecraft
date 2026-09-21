@@ -4,6 +4,7 @@ import mineflayer, { type ControlState } from "mineflayer";
 import { goals, Movements, pathfinder } from "mineflayer-pathfinder";
 import type { AgentProfile } from "../profiles/types";
 import { BED_WOOL_COUNT, pickBedWool, totalWool } from "../skills/building/bed";
+import { craftingManager } from "../skills/crafting/weapon";
 import { exploreLandSkill } from "../skills/exploring/land";
 import { gotoDeathPointSkill } from "../skills/goto/death";
 import { gainedSince, snapshotInventory, totalGain } from "../skills/inventory-delta";
@@ -33,9 +34,11 @@ import {
 	BURIED_THICKNESS,
 	DEATH_STORM_LIMIT,
 	DEEP_UNDERGROUND_GAP,
+	DAWN_HOSTILE_HOLD_TICK,
 	HUNT_RANGE,
 	SHELTER_HEALTH,
 	type SurvivalActions,
+	shelterBlocker,
 } from "./survival/rules";
 import { describeSituation } from "./survival/situation";
 import type { SurvivalSnapshot } from "./survival/snapshot";
@@ -109,7 +112,34 @@ const PLAYER_HOSTILITY_MS = envNum("PLAYER_HOSTILITY_MS", 120_000);
 /** 一度の反射で振る回数。振り続けて本来の行動を止めない程度に。 */
 const _ATTACK_SWINGS = 4;
 /** 頭上の蓋に使える物。何でもよいが、貴重な物を使わないよう絞る。 */
-const PLACEABLE_COVER = ["dirt", "cobblestone", "stone", "_planks", "gravel", "sand", "netherrack"];
+/**
+ * 蓋や支えに使えるブロック。末尾一致。
+ *
+ * 石系の加工品(polished_diorite など)や原木も置ける。実測 2026-09-21 07:01、
+ * coarse_dirt x2 を選んで支えに使い切り、polished_diorite x5 と原木 x8 を
+ * 持ったまま「手に何も持っていません」で蓋を諦めて矢で死んだ。
+ */
+const PLACEABLE_COVER = [
+	"dirt",
+	"cobblestone",
+	"stone",
+	"_planks",
+	"_log",
+	"_wood",
+	"gravel",
+	"sand",
+	"sandstone",
+	"netherrack",
+	"diorite",
+	"granite",
+	"andesite",
+	"deepslate",
+	"tuff",
+	"_bricks",
+	"terracotta",
+	"mud",
+	"moss_block",
+];
 /** 防具かどうかの判定に使う。 */
 const ARMOR_SUFFIXES = ["_helmet", "_chestplate", "_leggings", "_boots"];
 /**
@@ -138,8 +168,21 @@ function isTreeBlockName(name: string): boolean {
 	return /_leaves$|_log$|_wood$|_stem$|^leaves/.test(name);
 }
 
+/**
+ * 夜明け後も「夜」として扱う猶予(tick)。日が出ても undead はすぐには燃え尽きず、
+ * スケルトンは 1 分ほど撃ち続ける。実測 2026-09-21 09:45、時刻 23860 で籠りを
+ * 解いて蓋を壊し、時刻 484 に矢で死亡。
+ */
+const DAWN_SAFE_TICK = envNum("DAWN_SAFE_TICK", 1200);
+/**
+ * 夜の始まり。13000 だと遅い。地上の明るさは 12500 過ぎから落ち、実測 2026-09-21
+ * 10:30、時刻 12733 で明るさ 0、12900 頃にスケルトンの矢で死亡(籠りは 13000 から)。
+ * 25 秒ぶんの昼を捨てて先に潜る。
+ */
+const NIGHT_START_TICK = envNum("NIGHT_START_TICK", 12500);
 function isNightTime(timeOfDay: number): boolean {
-	return timeOfDay >= 13000 && timeOfDay <= 23000;
+	const t = ((timeOfDay % 24000) + 24000) % 24000;
+	return t >= NIGHT_START_TICK || t < DAWN_SAFE_TICK;
 }
 /** 一度潜ったら、次に潜り直すまで置く間隔。掘り進み続けないための歯止め。 */
 const BURROW_COOLDOWN_MS = envNum("BURROW_COOLDOWN_MS", 60_000);
@@ -534,6 +577,24 @@ const MAX_STRATEGIES = 3;
  * 安全な場所を、こちらの都合で忘れてよい理由は無い。
  */
 const HOME_FILE = "logs/home.json";
+/** 訪れた格子の控え。 */
+const VISITS_FILE = "logs/visited.json";
+/** 訪問を数える格子の一辺。 */
+const VISIT_CELL = 32;
+/** 初期リス(危険域の種)。未踏の遠さを測る原点。 */
+const SPAWN_X = 6;
+const SPAWN_Z = 66;
+/**
+ * 未踏の方向を測る設定。初期リスを中心に 8 方位を見て、その扇形(半径 64 より
+ * 外)への訪問が一番少ない方位を「未踏」とし、目標点は「これまでの最大到達距離
+ * + FRONTIER_STEP」の先に置く。行けば行くほど輪が広がる。固定座標ではない
+ * (「±300 は一例」オーナー 2026-09-21)。
+ */
+const FRONTIER_DIRECTIONS = 8;
+const FRONTIER_STEP = 150;
+const FRONTIER_MIN_RADIUS = 200;
+const FRONTIER_MAX_RADIUS = 800;
+const FRONTIER_NEAR_IGNORE = 64;
 /**
  * 掘り荒らされた区域の控え。中身と計算は survival/hazard.ts。
  *
@@ -831,6 +892,14 @@ export class MinecraftAgent {
 	private deathZones: { pos: Position; at: number; count: number }[] = [];
 	/** 最後に潜った時刻。掘り進み続けるのを止めるために見る。 */
 	private lastBurrowAt = 0;
+	/** 最後に蓋を置こうとした時刻。置けない場所で毎周試さないため。 */
+	private lastCapAt = 0;
+	/** この籠りで蓋に失敗した回数。3 回で諦める(夜明けか死亡で戻る)。 */
+	private capFailures = 0;
+	/** 今夜潜った回数。同じ場所で 2 回まで(縦穴にしない)。場所が変われば数え直す。 */
+	private burrowsThisNight = 0;
+	private lastBurrowPos: Position | null = null;
+	private lastShelterDiagAt = 0;
 	/** 自分の列の地表までの高さ。surfaceScan はサイドカーへの往復なので控えておく。 */
 	private surfaceProbe: { at: number; depth: number | null } | null = null;
 	/** 「地下では潜らない」と最後に言った時刻。毎周は言わない。 */
@@ -927,6 +996,16 @@ export class MinecraftAgent {
 	private heightSamples: { at: number; y: number }[] = [];
 	/** いまのスキルを担当し始めたときの高さ。登坂の進みを CURRENT ACTION に出す。 */
 	private currentTaskStartY: number | null = null;
+	/**
+	 * 訪れた場所(32 ブロック格子)と回数。どこが未踏かを LLM に見せるため。
+	 *
+	 * 実測 2026-09-20〜21、位置の 87% が初期リスから 100 ブロック以内、200 を
+	 * 超えた記録は無い。羊に出会えないのは範囲が狭いから、というオーナーの
+	 * 指摘(300,±300 の四隅に資源がありそう)を受けて入れた。
+	 */
+	private visitCells = new Map<string, number>();
+	private visitsDirty = false;
+	private lastVisitSaveAt = 0;
 
 	private bases: {
 		id: string;
@@ -985,6 +1064,7 @@ export class MinecraftAgent {
 			// 危険域を先に読む。寝床が危険域の中なら捨てるので、順が逆だと通らない。
 			this.loadHazards();
 			this.loadHome();
+			this.loadVisits();
 			// 他プレイヤーとの意思疎通のため、発言の受信だけは共通で購読する
 			this.driver.on("chat", (username: string, message: string) =>
 				this.handleIncomingChat(username, message),
@@ -2298,6 +2378,32 @@ export class MinecraftAgent {
 			case "collecting.pickup":
 				// 落ちている物が無いときは載せない。対象そのものが無い。
 				return this.driver.nearbyEntities(24).some((e) => e.kind === "item");
+			case "collecting.stealing":
+				// チェストが無いときは載せない(実測 2026-09-20 23:56、無いのに3連続で選んだ)。
+				return this.driver.world.findBlock(["chest", "barrel", "trapped_chest"], 16) !== null;
+			case "crafting.weapon":
+				// 作れる装備が無いときは載せない。木の剣を持ち、丸石も鉄も革も無い状態で
+				// 「もう最高品質」と 12 回失敗していた(2026-09-21 02:08〜02:34)。盾は
+				// 統合版では鉄が要る。
+				return craftingManager.determineNextWeapon(this) !== null;
+			case "building.bed": {
+				// 羊毛 3 枚(同色)かベッドを持っていないときは載せない。注記では止まらず、
+				// 羊毛 0 で選ばれた(2026-09-21 01:57)。作り方は SITUATION に書いてある。
+				const items = this.driver.inventory.items();
+				return (
+					items.some((i) => i.name === "bed" || i.name.endsWith("_bed")) ||
+					pickBedWool(items) !== null
+				);
+			}
+			case "survival.eat": {
+				// 食べる物が無いときは載せない。前提未達の注記では止まらなかった
+				// (実測 2026-09-21 00:52〜00:59、昼の判断 13 回中 13 回が eat で全部失敗)。
+				// 満腹のときも載せない。「満腹です」で即失敗する手を 37 回選んでいた
+				// (全ログ集計 2026-09-21)。前提未達の注記があっても選ぶ。
+				if (this.driver.getState().food >= 20) return false;
+				const names = this.driver.inventory.items().map((i) => i.name);
+				return pickFood(names) !== null || names.includes("rotten_flesh");
+			}
 			case "social.give":
 				return (
 					this.driver.nearbyEntities(64).some((e) => e.kind === "player") &&
@@ -2989,6 +3095,14 @@ export class MinecraftAgent {
 				wool: totalWool(items),
 				bedWoolReady: pickBedWool(items) !== null,
 				heightTrend: this.heightTrend(),
+				frontier: (() => {
+					const f = this.explorationFrontier();
+					if (!f) return null;
+					return {
+						...f,
+						distance: Math.round(Math.hypot(f.target.x - pos.x, f.target.z - pos.z)),
+					};
+				})(),
 				rottenFlesh: items
 					.filter((i) => i.name === "rotten_flesh")
 					.reduce((n, i) => n + i.count, 0),
@@ -3042,16 +3156,113 @@ export class MinecraftAgent {
 		return `${this.currentTaskName} — you have been on it for ${owned}s (${state}).${climb} Choosing it again lets it continue; choosing anything else interrupts it. Long actions (climbing out, walking somewhere) need more than one thought to finish.`;
 	}
 
-	/** 高さを控える。15分ぶん持つ。 */
+	/** 高さを控える。15分ぶん持つ。あわせて訪れた格子も数える。 */
 	private sampleHeight(): void {
 		const state = this.driver.getState();
 		if (!state.isReady) return;
 		const now = Date.now();
+		this.noteVisit(state.position, now);
 		this.heightSamples.push({ at: now, y: Math.floor(state.position.y) });
 		const cutoff = now - 15 * 60_000;
 		while (this.heightSamples.length > 0 && this.heightSamples[0].at < cutoff) {
 			this.heightSamples.shift();
 		}
+	}
+
+	/** 訪れた格子を数える。60 秒ごとにディスクへ控える(再起動しても未踏の判断が続く)。 */
+	private noteVisit(pos: Position, now: number): void {
+		const key = `${Math.floor(pos.x / VISIT_CELL)},${Math.floor(pos.z / VISIT_CELL)}`;
+		this.visitCells.set(key, (this.visitCells.get(key) ?? 0) + 1);
+		this.visitsDirty = true;
+		if (now - this.lastVisitSaveAt > 60_000) {
+			this.lastVisitSaveAt = now;
+			this.saveVisits();
+		}
+	}
+
+	private saveVisits(): void {
+		if (!this.visitsDirty) return;
+		this.visitsDirty = false;
+		try {
+			const file = path.join(process.cwd(), VISITS_FILE);
+			fs.mkdirSync(path.dirname(file), { recursive: true });
+			fs.writeFileSync(file, JSON.stringify({ cell: VISIT_CELL, visits: [...this.visitCells] }));
+		} catch {
+			// 書けなくても行動は続く。
+		}
+	}
+
+	private loadVisits(): void {
+		try {
+			const file = path.join(process.cwd(), VISITS_FILE);
+			if (!fs.existsSync(file)) return;
+			const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+			if (raw?.cell !== VISIT_CELL || !Array.isArray(raw.visits)) return;
+			for (const [k, n] of raw.visits) {
+				if (typeof k === "string" && typeof n === "number") this.visitCells.set(k, n);
+			}
+		} catch {
+			// 壊れていたら無かったことにする。
+		}
+	}
+
+	/**
+	 * 未踏の方向と、そこに置く目標点。初期リスから見た 8 方位のうち、扇形
+	 * (半径 64 より外)への訪問が一番少ないものを選び、目標点は最大到達距離
+	 * + 150 の先(200〜800 に収める)。同数なら今いる場所から近い方。スキル
+	 * (explore の向き)と SITUATION の両方が使う。
+	 */
+	public explorationFrontier(): {
+		target: { x: number; z: number };
+		visitsNear: number;
+		farthest: number;
+	} | null {
+		if (this.visitCells.size === 0) return null;
+		const cells = [...this.visitCells].map(([k, n]) => {
+			const [cx, cz] = k.split(",").map(Number);
+			return { x: cx * VISIT_CELL + VISIT_CELL / 2, z: cz * VISIT_CELL + VISIT_CELL / 2, n };
+		});
+		let farthest = 0;
+		for (const c of cells) {
+			farthest = Math.max(farthest, Math.hypot(c.x - SPAWN_X, c.z - SPAWN_Z));
+		}
+		const radius = Math.min(
+			FRONTIER_MAX_RADIUS,
+			Math.max(FRONTIER_MIN_RADIUS, Math.round(farthest + FRONTIER_STEP)),
+		);
+		const here = this.driver.getState().position;
+		const sector = (2 * Math.PI) / FRONTIER_DIRECTIONS;
+		let best: { target: { x: number; z: number }; visitsNear: number; near: number } | null = null;
+		for (let i = 0; i < FRONTIER_DIRECTIONS; i++) {
+			const angle = i * sector;
+			const target = {
+				x: Math.round(SPAWN_X + Math.cos(angle) * radius),
+				z: Math.round(SPAWN_Z + Math.sin(angle) * radius),
+			};
+			// この方位の扇形にどれだけ行ったか。初期リスのすぐ周りは全方位に
+			// 数えられてしまうので、半径 64 より外だけ見る。
+			let visitsNear = 0;
+			for (const c of cells) {
+				const dx = c.x - SPAWN_X;
+				const dz = c.z - SPAWN_Z;
+				if (Math.hypot(dx, dz) <= FRONTIER_NEAR_IGNORE) continue;
+				let diff = Math.atan2(dz, dx) - angle;
+				while (diff > Math.PI) diff -= 2 * Math.PI;
+				while (diff < -Math.PI) diff += 2 * Math.PI;
+				if (Math.abs(diff) <= sector / 2) visitsNear += c.n;
+			}
+			const near = Math.hypot(target.x - here.x, target.z - here.z);
+			if (
+				!best ||
+				visitsNear < best.visitsNear ||
+				(visitsNear === best.visitsNear && near < best.near)
+			) {
+				best = { target, visitsNear, near };
+			}
+		}
+		return best
+			? { target: best.target, visitsNear: best.visitsNear, farthest: Math.round(farthest) }
+			: null;
 	}
 
 	/** 直近の高さの推移。地下で行き来しているかを LLM に見せる材料。 */
@@ -3163,6 +3374,28 @@ export class MinecraftAgent {
 			}
 		}
 
+		if (
+			foundSkillName &&
+			this.skills.has(foundSkillName) &&
+			!this.skillIsWorthOffering(foundSkillName) &&
+			this.currentTaskName !== foundSkillName
+		) {
+			// 候補から外したスキルでも、LLM は SITUATION や履歴から名前を拾って
+			// 選ぶ(実測 2026-09-21 09:14、満腹 20/20 で survival.eat を 10 秒に 3 回)。
+			// 走らせても即失敗するだけなので、理由を履歴に載せて返す。
+			const reason =
+				this.skillPrecondition(foundSkillName) ??
+				"its target is not present right now (nothing to act on)";
+			this.log(`[思考] いま成立しない ${foundSkillName} を選んだ: ${reason}`);
+			this.pushHistory({
+				action: foundSkillName,
+				rationale,
+				result: "Fail",
+				message: `Not available right now: ${reason}. Pick another skill.`,
+			});
+			return;
+		}
+
 		if (foundSkillName && this.skills.has(foundSkillName)) {
 			// 同じスキルを同じ引数で選び直しただけなら、実行中のものを続けさせる。
 			// 無条件に中断すると、思考ループの間隔(30秒)より長くかかる行動が
@@ -3237,6 +3470,24 @@ export class MinecraftAgent {
 					);
 				}
 			}
+		} else if (foundSkillName) {
+			// 無いスキルを選んだ。黙って前の行動を続けると、LLM は失敗を知らずに
+			// 同じ名前を選び続ける(実測 2026-09-21 07:35〜07:40、crafting.helmet を
+			// 29 回の思考のうち 16 回。木の防具は存在しないし、防具を作るスキルも
+			// 無い)。失敗として履歴に載せ、呼べる名前を返す。
+			const names = [...this.skills.keys()].join(", ");
+			const armor = /armor|helmet|chestplate|leggings|boots/i.test(foundSkillName);
+			this.log(`[思考] 存在しないスキル ${foundSkillName} を選んだ`);
+			this.pushHistory({
+				action: foundSkillName,
+				rationale,
+				result: "Fail",
+				message: `No such skill. The only skills you can call are: ${names}.${
+					armor
+						? " None of them crafts armor (and wooden armor does not exist in Minecraft); do not plan around armor."
+						: ""
+				}`,
+			});
 		}
 	}
 
@@ -3795,6 +4046,10 @@ export class MinecraftAgent {
 			this.survivalHolding = true;
 			const decision = await this.arbiter.tick(snapshot, this.survivalActions, signal);
 			this.survivalHolding = decision.rule !== null;
+			// 籠りが手放した理由を残す。「前提が消えた」だけでは直せない。
+			if (decision.kind === "release" && decision.released === "shelter") {
+				this.log(`[反射] shelter が手放した理由: ${shelterBlocker(snapshot) ?? "(none)"}`);
+			}
 			// 反射が失敗して手放したなら、待たずに考え直させる。理由は
 			// reflexLog に入っていて、次のプロンプトに載る。
 			if (decision.kind === "yield") this.requestImmediateThink();
@@ -3994,7 +4249,21 @@ export class MinecraftAgent {
 		return { sheltered: this.isSheltered(foot) || this.solidAboveCount(foot) >= BURIED_THICKNESS };
 	}
 
+	/** 剣と防具が揃っているか。snapshot の armed && armored と同じ判定。 */
+	private isEquippedNow(): boolean {
+		const names = this.driver.inventory.items().map((i) => i.name);
+		const armored =
+			this.driver.inventory.armor().some((i) => i !== null) ||
+			names.some((n) => ARMOR_SUFFIXES.some((suf) => n.endsWith(suf)));
+		return this.hasWeapon() && armored;
+	}
+
 	private async shelterNow(signal: AbortSignal): Promise<void> {
+		// 保持は「籠り始めた」時点で立てる。「籠れた」を待つと、蓋が置けない間に
+		// 深さの読みが揺れて手放し、夜の地上を歩き出す(実測 2026-09-21 01:41、
+		// 潜り始めて 14 秒後に「地下17で保持なし」で手放し、矢で死亡。実際の
+		// 位置は地上 Y=65)。籠り方は shelterNow が続けて試す。
+		this.latchNightShelter();
 		if (await this.retreatToHome(signal)) {
 			this.latchNightShelter();
 			return;
@@ -4003,22 +4272,84 @@ export class MinecraftAgent {
 		const foot = { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) };
 		if (this.isSheltered(foot) || this.solidAboveCount(foot) >= BURIED_THICKNESS) {
 			this.latchNightShelter();
+			// 四方が塞がっているだけで蓋が無いなら、蓋を置く。矢は上から来る。
+			// 実測 2026-09-21 02:39〜02:41、四方が塞がった窪みを「籠れた」として
+			// 80 秒立ち尽くし、スケルトンに撃たれて死亡。
+			const above = this.driver.world.blockAt({ ...foot, y: foot.y + 2 });
+			const lidded = !!above && above.name !== "air" && !isTreeBlockName(above.name);
+			if (this.resealRequested && Date.now() - this.lastSealAt > 15_000) {
+				// 削られた直後。蓋より先に横を塞ぐ(矢は横から来ている)。
+				this.resealRequested = false;
+				this.lastSealAt = Date.now();
+				await this.sealSides(signal);
+			}
+			if (!lidded && this.capFailures < 3 && Date.now() - this.lastCapAt > 15_000) {
+				this.lastCapAt = Date.now();
+				await this.capHead(signal);
+			} else if (!this.shelteredStayLogged) {
+				// 何もしない分岐は一晩に一度だけ書く。実測 2026-09-21 10:50〜10:57、
+				// 籠りに入ってから 7 分間ログが無いまま削られ、どの分岐で待っていた
+				// のか分からなかった。
+				this.shelteredStayLogged = true;
+				this.log(
+					`[反射] 囲まれているのでここで待つ(頭上 ${above?.name ?? "?"}、四方 ${BOX_DIRECTIONS.map(
+						(d) =>
+							this.driver.world.blockAt({ x: foot.x + d.x, y: foot.y, z: foot.z + d.z })?.solid
+								? "■"
+								: "□",
+					).join("")}、蓋 ${lidded ? "あり" : `なし(失敗 ${this.capFailures})`})`,
+				);
+			}
 			return;
 		}
 		// 地下深くでは掘らない。潜るのは足元を掘ることで、地下では「深くなる」
 		// だけ。保持中にここへ来るのは、潜った先が洞窟に抜けたとき。動かずに
 		// 夜明けを待つ(担当は shelter が持ち続けるので LLM のスキルは動かない)。
+		//
+		// ただし丸腰の夜は別。穴の中で日没を迎えたときに何もしないと、暗い穴を
+		// 歩いて死ぬ(実測 2026-09-21 08:59)。足元を 2 マス掘って蓋をするだけなら
+		// 「深くなる」うちに入らない(洞窟・水は burrow 側が断る)。
 		{
 			const depth = this.lastKnownDepth();
-			if (depth !== null && depth > DEEP_UNDERGROUND_GAP) return;
+			const bareNight = isNightTime(this.driver.getState().timeOfDay) && !this.isEquippedNow();
+			if (depth !== null && depth > DEEP_UNDERGROUND_GAP && !bareNight) return;
 		}
 		// 掘り進み続けないための歯止め。ただし敵が目の前にいるときは待たない。
 		const threatened = this.driver
 			.nearbyEntities(HOME_THREAT_RADIUS)
 			.some((e) => isHostileMob(e.name));
 		if (!threatened && Date.now() - this.lastBurrowAt < BURROW_COOLDOWN_MS) return;
+		// 一晩に潜るのは 2 回まで(最大 4 マス)。敵が近いと冷却を飛ばして毎周潜り、
+		// 蓋をしては掘り下げる、を繰り返して縦穴になっていた(実測 2026-09-21
+		// 04:19〜04:21、3 回で Y=68→65、蓋は毎回置き直し)。それ以上は動かずに待つ。
+		// 場所が変わっていれば数え直す。上限は「同じ場所で掘り下げ続けない」ため
+		// のもので、逃げて別の場所に立っているなら潜り直してよい(実測 2026-09-21
+		// 04:41、上限に当たった時点で頭上は空気、四方は 1 面しか塞がっておらず、
+		// 夜の地上に立ったまま動かなかった)。
+		if (
+			this.lastBurrowPos &&
+			Math.hypot(foot.x - this.lastBurrowPos.x, foot.z - this.lastBurrowPos.z) > 1.5
+		) {
+			this.burrowsThisNight = 0;
+		}
+		if (this.burrowsThisNight >= 2) {
+			if (Date.now() - this.lastShelterDiagAt > 30_000) {
+				this.lastShelterDiagAt = Date.now();
+				const above = this.driver.world.blockAt({ ...foot, y: foot.y + 2 });
+				const sides = BOX_DIRECTIONS.map((d) =>
+					this.driver.world.blockAt({ x: foot.x + d.x, y: foot.y, z: foot.z + d.z }),
+				);
+				this.log(
+					`[反射] もう潜らない(今夜 ${this.burrowsThisNight} 回)。頭上 ${above?.name ?? "?"}、足元の四方 ${sides.map((b) => (b?.solid ? "■" : "□")).join("")}`,
+				);
+			}
+			return;
+		}
+		this.lastBurrowPos = { x: foot.x, y: foot.y, z: foot.z };
 		this.lastBurrowAt = Date.now();
-		await this.burrow(signal);
+		// 実際に潜れた回だけ数える。掘れなかった・落ちなかった回で上限に達すると、
+		// 平地に立ったまま「もう潜らない」になる(実測 2026-09-21 05:42)。
+		if (await this.burrow(signal)) this.burrowsThisNight++;
 	}
 
 	/** 夜に籠れた。夜明けか被弾まで Hide: no を受け付けない。 */
@@ -4027,8 +4358,21 @@ export class MinecraftAgent {
 		if (!isNightTime(state.timeOfDay) || this.shelterLatch) return;
 		if (Date.now() < this.shelterLatchBlockedUntil) return;
 		this.shelterLatch = { health: state.health };
+		this.capFailures = 0;
+		this.burrowsThisNight = 0;
+		this.homeUnroofedLogged = false;
+		this.homeStayLogged = false;
+		this.shelteredStayLogged = false;
 		this.log("[反射] 夜の籠りに入った。夜明けか被弾まで Hide: no は無視する");
 	}
+
+	private dawnHoldLogged = false;
+	private homeUnroofedLogged = false;
+	private homeStayLogged = false;
+	private shelteredStayLogged = false;
+	/** 籠っているのに削られた。次の籠り処理で横を塞ぐ。 */
+	private resealRequested = false;
+	private lastSealAt = 0;
 
 	/** 籠りの保持を解く条件を毎周見る。夜明け・被弾・死亡。 */
 	private releaseShelterLatchIfDue(): void {
@@ -4039,6 +4383,17 @@ export class MinecraftAgent {
 			return;
 		}
 		if (!isNightTime(state.timeOfDay)) {
+			// 丸腰で敵が至近なら、明けても少し待つ(rules.ts の shelterBlocker と同じ)。
+			const t = ((state.timeOfDay % 24000) + 24000) % 24000;
+			const hostileClose = this.driver.nearbyEntities(6).some((e) => isHostileMob(e.name));
+			if (t < DAWN_HOSTILE_HOLD_TICK && hostileClose && !this.isEquippedNow()) {
+				if (!this.dawnHoldLogged) {
+					this.dawnHoldLogged = true;
+					this.log("[反射] 夜は明けたが敵が至近。離れるまで籠りを続ける");
+				}
+				return;
+			}
+			this.dawnHoldLogged = false;
 			this.shelterLatch = null;
 			this.log("[反射] 夜が明けた。籠りの保持を解く");
 			return;
@@ -4051,16 +4406,17 @@ export class MinecraftAgent {
 			const attacked = this.driver
 				.nearbyEntities(HOME_THREAT_RADIUS)
 				.some((e) => isHostileMob(e.name));
-			if (!attacked) {
-				this.shelterLatch.health = state.health;
-				return;
-			}
-			this.shelterLatch = null;
+			// 敵に削られても保持は解かない。解いて LLM に返した結果は 3 回とも
+			// 1 分以内の死だった(2026-09-20 17:10 夜に作業台を置いて死亡、20:44
+			// スケルトン、00:20 ゾンビ)。敵が目の前にいるときに歩き出す判断は、
+			// 何を選んでも夜の地上を歩くことになる。逃げる・殴るは毎tickの戦闘
+			// 反射(サイドカー)がやる。ここは籠りを続け、潜り直す。
+			this.shelterLatch.health = state.health;
 			this.log(
-				`[反射] 籠っているのに敵に削られた(体力 ${state.health})。保持を解き、Hide の判断を LLM に返す`,
+				`[反射] 籠っているのに削られた(体力 ${state.health}${attacked ? "、敵が近い" : ""})。保持は続ける`,
 			);
-			this.shelterLatchBlockedUntil = Date.now() + SHELTER_DECLINE_TTL_MS;
-			this.requestImmediateThink();
+			// 穴の中で削られたなら、どこかが開いている。次の籠り処理で横を塞ぐ。
+			this.resealRequested = true;
 		}
 	}
 
@@ -4303,13 +4659,19 @@ export class MinecraftAgent {
 		this.log("[反射] 誰かが寝ている。ベッドへ向かう");
 		try {
 			await this.driver.goto(signal, { kind: "getToBlock", position: bed.position });
-			await this.driver.activateBlock(bed.position);
+			await this.holdToolForInteraction();
+			const r = await this.driver.useBed(bed.position);
 			this.lastBedActivatedAt = Date.now();
 			// 寝た時点でリスポーン地点もそこへ移る。登録し直す反射
 			// (registerSpawnAtBed)が同じベッドへもう一度歩かないよう控える。
-			this.spawnBed = { ...bed.position };
-			this.lastSpawnBedAt = Date.now();
-			this.saveHome();
+			// ただしサーバーの応答が無い(叩けていない)ときは覚えない。
+			if (r !== "none") {
+				this.spawnBed = { ...bed.position };
+				this.lastSpawnBedAt = Date.now();
+				this.saveHome();
+			} else {
+				this.log("[反射] ベッドを叩いたが応答が無い");
+			}
 		} catch (e) {
 			if (!signal.aborted) this.log(`ベッドに入れなかった: ${e}`);
 			// 一度失敗したら諦める。夜が明けるまで往復し続ける方が邪魔になる。
@@ -4377,10 +4739,15 @@ export class MinecraftAgent {
 		);
 		try {
 			await this.driver.goto(signal, { kind: "getToBlock", position: bed.position });
-			await this.activateBedWithRetry(signal, bed.position);
+			if (!(await this.activateBedWithRetry(signal, bed.position))) {
+				// 登録できていないのに覚えると、死んだ後の判断が全部ずれる。
+				// 少し置いてもう一度試す。
+				this.lastSpawnBedAt = Date.now() - SPAWN_BED_COOLDOWN_MS + SPAWN_BED_RETRY_MS;
+				return;
+			}
 			this.spawnBed = { ...bed.position };
 			this.saveHome();
-			this.log("[反射] リスポーン地点を登録した");
+			this.log("[反射] リスポーン地点を登録した(サーバー応答あり)");
 		} catch (e) {
 			if (!signal.aborted) {
 				this.log(`リスポーン地点を登録できなかった: ${e}`);
@@ -4701,6 +5068,21 @@ export class MinecraftAgent {
 				return false;
 			}
 
+			// 寝床の周りに屋根が無いなら「屋内」ではない。人の家の外や、
+			// 屋外に置かれたベッドの脇で 7 分立ち尽くして削られた(実測
+			// 2026-09-21 10:50〜10:57、蓋も潜りも無し)。潜る判断に譲る。
+			const feet = { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) };
+			if (this.solidAboveCount(feet) === 0 && !this.isSheltered(feet)) {
+				if (!this.homeUnroofedLogged) {
+					this.homeUnroofedLogged = true;
+					this.log("[反射] 寝床の上に屋根が無い。ここでは夜を越せないので潜る");
+				}
+				return false;
+			}
+			if (!this.homeStayLogged) {
+				this.homeStayLogged = true;
+				this.log("[反射] 寝床に着いた。屋根の下でここから動かない");
+			}
 			// もう寝床にいる。ここから動かない。寝られるなら寝る。
 			await this.sleepAtHome(home);
 			return true;
@@ -4748,16 +5130,51 @@ export class MinecraftAgent {
 	 * 6.1 ブロック手前で「遠すぎて届きません」と返っていた。ここで諦めると
 	 * 次の登録まで 20分 空くので、その場で寄り直す。
 	 */
-	private async activateBedWithRetry(signal: AbortSignal, at: Position): Promise<void> {
+	/**
+	 * ブロックを「使う」前に、置けない物(道具・武器)を手に持つ。
+	 *
+	 * サイドカーの activate は設置と同じ ClickBlock で、手に土や丸石を持ったまま
+	 * ベッドを叩くとサーバーは設置を優先する(sidecar の注記どおり)。実測
+	 * 2026-09-21 06:55、土を持ったままベッドを叩いて「登録した」と記録したが、
+	 * サーバーからの「Respawn point set」は来ず、死後は初期リスに戻された。
+	 */
+	public async holdToolForInteraction(): Promise<void> {
+		const items = this.driver.inventory.items();
+		const tool = items.find((i) => /_(sword|pickaxe|axe|shovel|hoe)$|^bow$|^stick$/.test(i.name));
+		if (!tool) return;
 		try {
-			await this.driver.activateBlock(at);
-			return;
+			await this.driver.equip(tool.name, "hand");
+		} catch {
+			// 持ち替えられなくても叩いてみる。
+		}
+	}
+
+	/**
+	 * ベッドを叩いて復帰地点を移す。サーバーの応答が無ければ一度だけ叩き直す。
+	 * 戻り値はサーバーが認めたか(respawnSet か、既に登録済みの応答)。
+	 */
+	private async activateBedWithRetry(signal: AbortSignal, at: Position): Promise<boolean> {
+		await this.holdToolForInteraction();
+		let result: "set" | "ack" | "none";
+		try {
+			result = await this.driver.useBed(at);
 		} catch (e) {
 			if (signal.aborted) throw e;
 			this.log(`[反射] ベッドに届かない。寄り直す: ${e}`);
+			await this.driver.goto(signal, { kind: "near", position: at, distance: 1 });
+			await this.holdToolForInteraction();
+			result = await this.driver.useBed(at);
 		}
-		await this.driver.goto(signal, { kind: "near", position: at, distance: 1 });
-		await this.driver.activateBlock(at);
+		if (result === "none") {
+			// 叩けていない。持ち替えが遅れた等。一度だけ叩き直す。
+			await this.holdToolForInteraction();
+			result = await this.driver.useBed(at);
+		}
+		if (result === "none") {
+			this.log("[反射] ベッドを叩いたがサーバーから応答が無い(登録されていない)");
+			return false;
+		}
+		return true;
 	}
 
 	/**
@@ -4913,13 +5330,16 @@ export class MinecraftAgent {
 		if (!block || !BED_NAMES.includes(block.name)) return;
 
 		try {
-			await this.driver.activateBlock(home);
+			await this.holdToolForInteraction();
+			const r = await this.driver.useBed(home);
 			this.lastBedActivatedAt = Date.now();
-			// 統合版はベッドを叩いた時点でリスポーン地点が移る。ここで
-			// 登録できたことになるので、帰る先として覚え直す。
-			this.spawnBed = { ...home };
-			this.saveHome();
-			this.log("[反射] 寝床に入る");
+			// 統合版はベッドを叩いた時点でリスポーン地点が移る。サーバーの
+			// 応答があったときだけ、帰る先として覚え直す。
+			if (r !== "none") {
+				this.spawnBed = { ...home };
+				this.saveHome();
+			}
+			this.log(`[反射] 寝床に入る(応答: ${r})`);
 		} catch {
 			// 入れなくても、屋内にいるだけで夜はしのげる。
 		}
@@ -4962,15 +5382,15 @@ export class MinecraftAgent {
 	 * 装備が無いうちは走って逃げても追いつかれる。1マス潜って蓋をすれば
 	 * 地上の敵はまず届かない。塞ぐ物が無ければ潜るだけでも当たりにくくなる。
 	 */
-	private async burrow(signal: AbortSignal): Promise<void> {
+	private async burrow(signal: AbortSignal): Promise<boolean> {
 		const { driver } = this;
 		const pos = driver.getState().position;
 		const foot = { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) };
 		const below = { x: foot.x, y: foot.y - 1, z: foot.z };
 		const block = driver.world.blockAt(below);
-		if (!block || !block.diggable || block.name === "air") return;
+		if (!block || !block.diggable || block.name === "air") return false;
 		// 水や溶岩は掘っても穴にならない。流れ込むか、落ちて死ぬ。
-		if (block.name === "water" || block.name === "lava") return;
+		if (block.name === "water" || block.name === "lava") return false;
 
 		// 掘った先が空洞なら潜らない。
 		//
@@ -4981,35 +5401,263 @@ export class MinecraftAgent {
 		const unsafe = this.burrowHazardBelow(below);
 		if (unsafe) {
 			this.log(`[反射] 潜るのをやめる（${unsafe}）`);
-			return;
+			return false;
+		}
+		// 隣が水なら掘らない。掘った穴に水が流れ込み、蓋の下で溺れる(実測
+		// 2026-09-21 02:00、クレーターの水際で潜って溺死)。足元の高さと、
+		// 掘る先の高さの四方を見る。
+		for (const d of BOX_DIRECTIONS) {
+			for (const y of [foot.y, below.y]) {
+				const side = driver.world.blockAt({ x: foot.x + d.x, y, z: foot.z + d.z });
+				if (side && (side.name === "water" || side.name === "flowing_water")) {
+					this.log("[反射] 潜るのをやめる（隣に水。掘れば流れ込む）");
+					return false;
+				}
+			}
 		}
 
 		this.log("[反射] 潜って身を隠す");
 		try {
+			// マスの中央に寄ってから掘る。体の幅は 0.6 あり、マスの端に立っている
+			// と足元を掘っても隣のブロックに乗ったまま落ちない(実測 2026-09-21
+			// 06:00、「掘ったが落ちていない(足元 air)」)。
+			try {
+				await driver.goto(
+					signal,
+					{ kind: "xz", x: foot.x + 0.5, z: foot.z + 0.5, distance: 0.25 },
+					{ timeoutMs: 3_000 },
+				);
+			} catch (e) {
+				// 寄れないまま掘ると、縁に立ったまま足場だけが消える。斜面では
+				// そこから滑り落ちる(実測 2026-09-21 09:19、Y=83 の山頂で
+				// 「掘ったが落ちていない(足元 air)」の 6 秒後に落死)。掘らない。
+				if (!signal.aborted) this.log(`[反射] マスの中央に寄れないので掘らない: ${e}`);
+				return false;
+			}
 			await driver.equipBestTool(below);
 			await driver.dig(signal, below);
-			// 掘った穴へ落ちるのを待つ。
-			await new Promise((r) => setTimeout(r, 600));
-		} catch {
-			return;
+			// 掘った穴へ落ちるのを待つ。落ちたかは足の高さで確かめる。掘れて
+			// いない・落ちていないのに蓋を試すと「四方すべて空気」で失敗する
+			// (実測 2026-09-21 05:40、平地に立ったまま 2 回「潜った」ことになった)。
+			let dropped = false;
+			for (let i = 0; i < 4; i++) {
+				await new Promise((r) => setTimeout(r, 500));
+				if (Math.floor(driver.getState().position.y) < foot.y) {
+					dropped = true;
+					break;
+				}
+			}
+			if (!dropped) {
+				const b = driver.world.blockAt(below);
+				this.log(
+					`[反射] 掘ったが落ちていない(足元 ${b?.name ?? "?"}、Y=${Math.floor(driver.getState().position.y)})`,
+				);
+				return false;
+			}
+		} catch (e) {
+			// 黙って諦めると「潜って身を隠す」が毎分並ぶだけで何も分からない
+			// (実測 2026-09-21 08:21〜08:23、4 回並んで蓋の記録が無いまま矢で死亡)。
+			if (!signal.aborted) this.log(`[反射] 潜れなかった: ${e}`);
+			return false;
+		}
+
+		// 2 マス目。1 マスだけでは頭が地上に出ていて、ゾンビの手が届き、蓋の支えも
+		// 無い(実測 2026-09-21 03:19〜03:20、1 マスの穴で蓋が置けず、ゾンビに殺された)。
+		// 2 マス潜れば頭が地面の高さに入り、蓋は地面に 1 個積んだ支えで置ける。
+		{
+			const p2 = driver.getState().position;
+			const foot2 = { x: Math.floor(p2.x), y: Math.floor(p2.y), z: Math.floor(p2.z) };
+			const below2 = { x: foot2.x, y: foot2.y - 1, z: foot2.z };
+			const b2 = driver.world.blockAt(below2);
+			const wet = BOX_DIRECTIONS.some((d) => {
+				const s = driver.world.blockAt({ x: foot2.x + d.x, y: below2.y, z: foot2.z + d.z });
+				return !!s && (s.name === "water" || s.name === "flowing_water");
+			});
+			if (
+				foot2.y < foot.y &&
+				b2 &&
+				b2.diggable &&
+				b2.name !== "air" &&
+				b2.name !== "water" &&
+				b2.name !== "lava" &&
+				!wet &&
+				!this.burrowHazardBelow(below2)
+			) {
+				try {
+					await driver.equipBestTool(below2);
+					await driver.dig(signal, below2);
+					await new Promise((r) => setTimeout(r, 600));
+				} catch {
+					// 1 マスのままでも蓋は試す。
+				}
+			}
 		}
 
 		// 頭上に蓋をする。置ける物が無ければ潜っただけで済ませる。
-		const cover = driver.inventory
+		await this.capHead(signal);
+		return true;
+	}
+
+	/**
+	 * 蓋や壁に使う物を手に持つ。一番多く持っている物を選ぶ。支えを積むと
+	 * 2〜3 個使うので、少ない山を選ぶと蓋の前に尽きる。置くたびに持ち直し、
+	 * 尽きたら次の山へ移る。無ければ false。
+	 */
+	private async holdCover(): Promise<boolean> {
+		const cover = this.driver.inventory
 			.items()
-			.find((i) => i.slot >= 0 && i.slot <= 8 && PLACEABLE_COVER.some((n) => i.name.endsWith(n)));
-		if (!cover) return;
+			.filter((i) => PLACEABLE_COVER.some((n) => i.name.endsWith(n)))
+			.sort((a, b) => b.count - a.count)[0];
+		if (!cover) return false;
+		await this.driver.equip(cover.name, "hand");
+		return true;
+	}
+
+	/** 持ち直してから置く。置ける物が無ければ投げる。 */
+	private async placeCover(signal: AbortSignal, at: Position, face: Position): Promise<void> {
+		if (!(await this.holdCover())) throw new Error("置ける物が尽きた");
+		await this.driver.placeBlock(signal, at, face);
+	}
+
+	/**
+	 * 足の高さと頭の高さの四方で、空いているマスを塞ぐ。
+	 *
+	 * 蓋があっても横が開いていれば矢は入る。実測 2026-09-21 11:00、支えを積んで
+	 * 蓋を置いた穴の中で、夜明け前にスケルトンに 3 発撃たれて死亡(体力 9→5→1)。
+	 * 07:01 と 08:23 の矢の死も「籠っているのに削られた」の後。置く先は、その
+	 * マスの下(固い床の上)か、その奥(こちら向きの面)。塞げた数を返す。
+	 */
+	private async sealSides(signal: AbortSignal): Promise<number> {
+		const { driver } = this;
+		if (!(await this.holdCover())) return 0;
+		const pos = driver.getState().position;
+		const foot = { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) };
+		let sealed = 0;
+		const open: string[] = [];
+		for (const d of BOX_DIRECTIONS) {
+			for (const y of [foot.y, foot.y + 1]) {
+				const cell = { x: foot.x + d.x, y, z: foot.z + d.z };
+				const b = driver.world.blockAt(cell);
+				if (!b || b.solid) continue;
+				if (b.name === "water" || b.name === "lava") continue;
+				try {
+					const below = driver.world.blockAt({ ...cell, y: y - 1 });
+					const beyond = driver.world.blockAt({ x: cell.x + d.x, y, z: cell.z + d.z });
+					if (below?.solid) {
+						await this.placeCover(signal, { ...cell, y: y - 1 }, { x: 0, y: 1, z: 0 });
+					} else if (beyond?.solid) {
+						await this.placeCover(
+							signal,
+							beyond.position ?? { x: cell.x + d.x, y, z: cell.z + d.z },
+							{
+								x: -d.x,
+								y: 0,
+								z: -d.z,
+							},
+						);
+					} else {
+						open.push(`${d.x},${d.z}@${y - foot.y}`);
+						continue;
+					}
+					await new Promise((r) => setTimeout(r, 300));
+					if (driver.world.blockAt(cell)?.solid) sealed++;
+					else open.push(`${d.x},${d.z}@${y - foot.y}`);
+				} catch (e) {
+					this.log(`[反射] 横を塞げなかった: ${e}`);
+					return sealed;
+				}
+			}
+		}
+		if (sealed > 0 || open.length > 0) {
+			this.log(
+				`[反射] 横を ${sealed} マス塞いだ${open.length > 0 ? `。塞げない: ${open.join(" ")}` : ""}`,
+			);
+		}
+		return sealed;
+	}
+
+	/**
+	 * 頭の上に蓋を置く。窪みや穴の中で、上だけが空いているときに使う。
+	 *
+	 * ホットバーに限らない。土 39 個を持っていても 9 番以降に入っていれば
+	 * 「置ける物が無い」になり、蓋の無い穴に立ったまま矢で死んだ(実測
+	 * 2026-09-21 01:41)。equip は奥の枠からでも持ち替える。支えは四方を見る。
+	 */
+	private async capHead(signal: AbortSignal): Promise<void> {
+		const { driver } = this;
+		if (!(await this.holdCover())) return;
+		const place = (at: Position, face: Position) => this.placeCover(signal, at, face);
 		try {
-			await driver.equip(cover.name, "hand");
-			// 自分がいるマスの上に、その隣を支えにして置く。
+			// 蓋は頭の 1 つ上(lid)。支えは lid と同じ高さの隣。以前は頭と同じ高さの
+			// 隣を支えにして「自分の頭のマス」へ置こうとしていて、置けるはずが
+			// なかった(実測 2026-09-21 02:59〜03:20、写しに出ない/支えが無いの連発)。
 			const here = driver.getState().position;
 			const head = { x: Math.floor(here.x), y: Math.floor(here.y) + 1, z: Math.floor(here.z) };
-			const support = { x: head.x + 1, y: head.y, z: head.z };
-			if (driver.world.blockAt(support)?.solid) {
-				await driver.placeBlock(signal, support, { x: -1, y: 0, z: 0 });
+			const lidPos = { x: head.x, y: head.y + 1, z: head.z };
+			const settle = () => new Promise((r) => setTimeout(r, 400));
+			const lidOk = () => {
+				const lid = driver.world.blockAt(lidPos);
+				return !!lid && lid.name !== "air";
+			};
+			// 1 段目: lid の高さに固い隣があれば、その側面に置く。
+			for (const d of BOX_DIRECTIONS) {
+				const support = { x: lidPos.x + d.x, y: lidPos.y, z: lidPos.z + d.z };
+				if (driver.world.blockAt(support)?.solid) {
+					await place(support, { x: -d.x, y: 0, z: -d.z });
+					await settle();
+					if (lidOk()) {
+						this.log("[反射] 頭上に蓋を置いた");
+						this.capFailures = 0;
+						return;
+					}
+				}
 			}
-		} catch {
-			// 蓋ができなくても、潜っただけで当たりにくくはなっている。
+			// 2 段目: lid の高さに支えが無い。隣の列で、足元の高さから lid の 1 つ下
+			// までにある一番上の固いブロックの上に積み上げて、lid の高さまで支えを
+			// 作り、その側面に蓋を置く。1 マスの穴なら 2 個、2 マスの穴なら 1 個積む。
+			const foot = { x: head.x, y: head.y - 1, z: head.z };
+			for (const d of BOX_DIRECTIONS) {
+				const cx = head.x + d.x;
+				const cz = head.z + d.z;
+				let top: number | null = null;
+				for (let y = lidPos.y - 1; y >= foot.y - 1; y--) {
+					if (driver.world.blockAt({ x: cx, y, z: cz })?.solid) {
+						top = y;
+						break;
+					}
+				}
+				if (top === null) continue;
+				let ok = true;
+				for (let y = top + 1; y <= lidPos.y; y++) {
+					if (driver.world.blockAt({ x: cx, y, z: cz })?.solid) continue;
+					await place({ x: cx, y: y - 1, z: cz }, { x: 0, y: 1, z: 0 });
+					await settle();
+					if (!driver.world.blockAt({ x: cx, y, z: cz })?.solid) {
+						ok = false;
+						break;
+					}
+				}
+				if (!ok) continue;
+				await place({ x: cx, y: lidPos.y, z: cz }, { x: -d.x, y: 0, z: -d.z });
+				await settle();
+				if (lidOk()) {
+					this.log("[反射] 頭上に蓋を置いた(支えを積んで)");
+					this.capFailures = 0;
+					return;
+				}
+			}
+			this.capFailures++;
+			const around = BOX_DIRECTIONS.map((d) => {
+				const g = driver.world.blockAt({ x: head.x + d.x, y: head.y, z: head.z + d.z });
+				const l = driver.world.blockAt({ x: head.x + d.x, y: lidPos.y, z: head.z + d.z });
+				return `${d.x},${d.z}:${g?.name ?? "?"}/${l?.name ?? "?"}`;
+			}).join(" ");
+			this.log(
+				`[反射] 蓋を置けなかった(${this.capFailures}回目、支えも作れない) 頭の高さ/蓋の高さの隣: ${around}`,
+			);
+		} catch (e) {
+			this.capFailures++;
+			this.log(`[反射] 蓋を置けなかった(${this.capFailures}回目): ${e}`);
 		}
 	}
 

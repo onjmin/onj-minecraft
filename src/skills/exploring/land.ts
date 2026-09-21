@@ -45,7 +45,14 @@ export const exploreLandSkill = createSkill<void, { x: number; z: number }>({
 		let baseAngle = yaw;
 		let spread = Math.PI; // ±90度
 		let heading = "forward";
-		const landmark = agent.getKnownLandmarks()[0];
+		// 自分の残骸(作業台・かまど・板)は行き先にしない。剣を作るたびに作業台を
+		// 置き捨てるので、初期リス周辺はそれで埋まっている。実測 2026-09-21
+		// 00:52〜00:59、探索 13 回のうち 7 回が「作業台へ」でクレーターの縁を
+		// 離れられず、日没にそこで死んだ。人の拠点の目印(松明・ベッド・チェスト・
+		// 扉・ガラス)は残す。
+		const landmark = agent
+			.getKnownLandmarks()
+			.find((l) => !/^(crafting_table|furnace|blast_furnace|smoker)$|_planks$/.test(l.name));
 		const zone = agent
 			.getHazardZones()
 			.find((z) => Math.hypot(z.x - currentPos.x, z.z - currentPos.z) <= z.radius + 8);
@@ -71,6 +78,21 @@ export const exploreLandSkill = createSkill<void, { x: number; z: number }>({
 			baseAngle = Math.atan2(-vx, -vz);
 			spread = Math.PI / 2;
 			heading = "away from hazard zone";
+		} else {
+			// 引かれる物が無いときの既定は「前方」ではなく「未踏の遠い方」。
+			// 前方だと来た道を戻ることも多く、位置の 87% が初期リスから 100 以内
+			// に留まっていた(2026-09-21、オーナーの指摘で変更)。
+			const frontier = agent.explorationFrontier();
+			if (
+				frontier &&
+				Math.hypot(frontier.target.x - currentPos.x, frontier.target.z - currentPos.z) > 64
+			) {
+				const vx = frontier.target.x - currentPos.x;
+				const vz = frontier.target.z - currentPos.z;
+				baseAngle = Math.atan2(-vx, -vz);
+				spread = Math.PI / 2;
+				heading = `toward unexplored (${frontier.target.x}, ${frontier.target.z})`;
+			}
 		}
 
 		// 周りの地表を読む。遠い目標は blockAt では見えない。

@@ -71,9 +71,11 @@ test("夜なら夜明けまで、昼なら日没までの残りを言う", () =>
 });
 
 test("夜明け・日没までの tick", () => {
-	assert.equal(ticksUntilNightChange(18000), 5000);
-	assert.equal(ticksUntilNightChange(1000), 12000);
-	assert.equal(ticksUntilNightChange(23500), 13500);
+	// 夜は日の出(0)の後も 1200 tick 続くものとして数える(スケルトンが撃ち続ける)。
+	assert.equal(ticksUntilNightChange(18000), 7200);
+	assert.equal(ticksUntilNightChange(1000), 200);
+	assert.equal(ticksUntilNightChange(23500), 1700);
+	assert.equal(ticksUntilNightChange(3000), 9500);
 });
 
 test("満腹度が18未満なら、自然回復が止まっていることを言う", () => {
@@ -170,4 +172,21 @@ test("地下では高さの推移を言う。往復しているだけかが読�
 		}),
 	);
 	assert.doesNotMatch(surface, /your height went from/);
+});
+
+test("昼の地上では、未踏の遠い方向と最大到達距離を言う", () => {
+	const text = joined(
+		describeSituation(emptySnapshot({ night: false, depthBelowSurface: 0 }), {
+			frontier: { target: { x: 300, z: 300 }, visitsNear: 0, farthest: 190, distance: 410 },
+		}),
+	);
+	assert.match(text, /never been more than 190 blocks from spawn/);
+	assert.match(text, /x=300, z=300 \(410 blocks from you, never visited\)/);
+	assert.match(text, /goto\.coords\(x: 300, z: 300\)/);
+	const night = joined(
+		describeSituation(emptySnapshot({ night: true, timeOfDay: 15000 }), {
+			frontier: { target: { x: 300, z: 300 }, visitsNear: 0, farthest: 190, distance: 410 },
+		}),
+	);
+	assert.doesNotMatch(night, /never been more than/);
 });

@@ -121,7 +121,14 @@ export const buildBedSkill = createSkill<void, { position: { x: number; y: numbe
 		// 既に自分のベッドが目の前にあるなら、作らずに登録し直すだけ。
 		const existing = driver.world.findBlock(BED_BLOCK_NAMES, 3);
 		if (existing) {
-			await driver.activateBlock(existing.position);
+			// 置ける物を持ったまま叩くと設置になる。道具に持ち替える。
+			await agent.holdToolForInteraction();
+			const r = await driver.useBed(existing.position);
+			if (r === "none") {
+				return skillResult.fail(
+					`Used the bed at (${existing.position.x}, ${existing.position.y}, ${existing.position.z}) but the server did not acknowledge it; the respawn point did NOT move. Stand right next to the bed and try again.`,
+				);
+			}
 			agent.noteOwnBed(existing.position);
 			return skillResult.ok(
 				`Respawn point set at the bed at (${existing.position.x}, ${existing.position.y}, ${existing.position.z}).`,
@@ -183,10 +190,22 @@ export const buildBedSkill = createSkill<void, { position: { x: number; y: numbe
 		}
 
 		// 叩いて復帰地点を移す。昼は「今は寝られません」と返るが地点は移る。
+		// 直前までベッドを手に持っているので、道具に持ち替えてから叩く。
+		let ack: "set" | "ack" | "none" = "none";
 		try {
-			await driver.activateBlock(block.position);
+			await agent.holdToolForInteraction();
+			ack = await driver.useBed(block.position);
+			if (ack === "none") {
+				await agent.holdToolForInteraction();
+				ack = await driver.useBed(block.position);
+			}
 		} catch (err) {
 			agent.log(`[building.bed] ベッドを叩けなかった: ${err}`);
+		}
+		if (ack === "none") {
+			return skillResult.fail(
+				`Placed the bed at (${block.position.x}, ${block.position.y}, ${block.position.z}) but the server did not acknowledge using it, so the respawn point did NOT move yet. Call building.bed again while standing next to it.`,
+			);
 		}
 		agent.noteOwnBed(block.position);
 		return skillResult.ok(

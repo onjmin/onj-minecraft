@@ -16,8 +16,13 @@ import { REGEN_FOOD } from "./snapshot";
 
 /** 統合版の1日は 24000 tick、1 tick は 50ms。 */
 const TICKS_PER_DAY = 24000;
-const NIGHT_START = 13000;
-const NIGHT_END = 23000;
+/** 夜の始まり。agent.ts の NIGHT_START_TICK と同じ値(明るさは 12500 過ぎから落ちる)。 */
+const NIGHT_START = 12500;
+/**
+ * 夜の終わり。日の出(0)の後も undead が燃え尽きるまで 1200 tick は「夜」に数える
+ * (agent.ts の DAWN_SAFE_TICK と同じ値)。
+ */
+const DAWN_SAFE_TICK = 1200;
 const MS_PER_TICK = 50;
 
 export interface SituationExtras {
@@ -27,6 +32,13 @@ export interface SituationExtras {
 	lootNearRecentDeath?: boolean;
 	/** 直近の死のうち、夜に地上で死んだ数と総数。夜に歩く判断の材料。 */
 	nightSurfaceDeaths?: { night: number; total: number };
+	/** 未踏の遠い候補と、これまでの最大到達距離。範囲が狭いことを見せる。 */
+	frontier?: {
+		target: { x: number; z: number };
+		visitsNear: number;
+		farthest: number;
+		distance: number;
+	} | null;
 	/** 直近の高さの推移。地下で行き来しているだけかを見せる。 */
 	heightTrend?: { minutes: number; from: number; to: number; low: number; high: number } | null;
 	/** 腐った肉の所持数。食べれば +4、80% で短い空腹効果。 */
@@ -52,8 +64,9 @@ function minutes(ticks: number): string {
 /** 夜までの残り、または夜明けまでの残りを tick で返す。 */
 export function ticksUntilNightChange(timeOfDay: number): number {
 	const t = ((timeOfDay % TICKS_PER_DAY) + TICKS_PER_DAY) % TICKS_PER_DAY;
-	if (t >= NIGHT_START && t <= NIGHT_END) return NIGHT_END - t;
-	return t < NIGHT_START ? NIGHT_START - t : NIGHT_START + TICKS_PER_DAY - t;
+	if (t >= NIGHT_START) return TICKS_PER_DAY - t + DAWN_SAFE_TICK;
+	if (t < DAWN_SAFE_TICK) return DAWN_SAFE_TICK - t;
+	return NIGHT_START - t;
 }
 
 export function describeSituation(s: SurvivalSnapshot, x: SituationExtras = {}): string[] {
@@ -62,7 +75,12 @@ export function describeSituation(s: SurvivalSnapshot, x: SituationExtras = {}):
 	// 時刻。夜は「あと何分で明けるか」、昼は「あと何分で暮れるか」。
 	// 夜に地下から掘り上がるか朝を待つかは、この数字で決まる。
 	const left = ticksUntilNightChange(s.timeOfDay);
-	if (s.night) {
+	if (s.night && s.timeOfDay % TICKS_PER_DAY < NIGHT_START) {
+		// 日は出たが、undead はまだ燃え尽きていない。
+		lines.push(
+			`The sun is rising (time ${s.timeOfDay}) but skeletons and zombies from the night are still around and burning; they keep shooting for another ${minutes(left)}. Stay sheltered until then.`,
+		);
+	} else if (s.night) {
 		lines.push(
 			`It is NIGHT (time ${s.timeOfDay}). Hostile mobs spawn in the dark. Dawn in ${minutes(left)}.`,
 		);
@@ -159,6 +177,16 @@ export function describeSituation(s: SurvivalSnapshot, x: SituationExtras = {}):
 		);
 	}
 
+	// 未踏の方向。地上で昼のときだけ(夜や地下では行けない)。
+	// 実測 2026-09-20〜21、位置の 87% が初期リスから 100 ブロック以内で、
+	// 200 を超えた記録は無い。羊も村も、回っている範囲の外にある。
+	const fr = x.frontier;
+	if (fr && !s.night && (s.depthBelowSurface ?? 0) <= 3) {
+		lines.push(
+			`You have never been more than ${fr.farthest} blocks from spawn; everything within that circle has already been searched (no sheep). The least-visited far area is around x=${fr.target.x}, z=${fr.target.z} (${fr.distance} blocks from you${fr.visitsNear === 0 ? ", never visited" : ""}). Reaching it takes several goto.coords(x: ${fr.target.x}, z: ${fr.target.z}) calls in a row (each walks up to ~40 blocks); exploring.explore_land also heads that way when nothing else pulls it.`,
+		);
+	}
+
 	// 落ちている物。統合版は近づけば拾える。
 	if (x.droppedItems && x.droppedItems.length > 0) {
 		lines.push(
@@ -166,7 +194,7 @@ export function describeSituation(s: SurvivalSnapshot, x: SituationExtras = {}):
 		);
 	}
 	// 夜明け直後は、日光に当たったゾンビが燃えて腐った肉を落とす。
-	if (!s.night && s.timeOfDay % TICKS_PER_DAY < 1500 && (s.depthBelowSurface ?? 0) <= 2) {
+	if (s.timeOfDay % TICKS_PER_DAY < 1500 && (s.depthBelowSurface ?? 0) <= 2) {
 		lines.push(
 			"It is just after dawn: zombies caught in sunlight burn and drop rotten flesh where they stood. Rotten flesh is edible (+4 hunger).",
 		);
@@ -211,7 +239,7 @@ export function describeSituation(s: SurvivalSnapshot, x: SituationExtras = {}):
 					: "";
 		const warn = x.lootNearRecentDeath ? " You were killed near there very recently." : "";
 		lines.push(
-			`Your dropped items lie at (${s.deathPoint.x}, ${s.deathPoint.y}, ${s.deathPoint.z}), ${horizontal} blocks away horizontally${vertical}. They vanish about 5 minutes after death.${warn}`,
+			`Your dropped items lie at (${Math.round(s.deathPoint.x)}, ${Math.round(s.deathPoint.y)}, ${Math.round(s.deathPoint.z)}), ${horizontal} blocks away horizontally${vertical}. They vanish about 5 minutes after death.${warn}`,
 		);
 	}
 

@@ -302,6 +302,19 @@ export class JavaDriver implements BotDriver {
 		await this.bot.activateBlock(block);
 	}
 
+	async useBed(position: Position): Promise<"set" | "ack" | "none"> {
+		// Java版は寝られたかで判定する。昼は sleep が拒否されるが、統合版と違い
+		// 復帰地点は寝て初めて移るので、寝られなければ移っていない。
+		const block = this.bot.blockAt(toVec3(position));
+		if (!block) throw new Error(`No block at ${position.x},${position.y},${position.z}`);
+		try {
+			await this.bot.sleep(block);
+			return "set";
+		} catch {
+			return "ack";
+		}
+	}
+
 	async attack(signal: AbortSignal, entityId: number): Promise<void> {
 		const target = this.bot.entities[entityId];
 		if (!target) throw new Error(`Entity ${entityId} not found`);

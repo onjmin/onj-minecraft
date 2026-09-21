@@ -86,9 +86,27 @@ test("夜でも装備が揃っていて無傷なら退かない", () => {
 	assert.notEqual(decision.rule?.name, "shelter");
 });
 
-test("地下深くでは潜らない。地上へ出るかどうかは LLM が決める", () => {
+test("地下深くでは潜らない。地上へ出るかどうかは LLM が決める(昼、または装備あり)", () => {
 	const arbiter = new SurvivalArbiter();
-	const decision = arbiter.select(
+	// 昼の地下は LLM に任せる。
+	const day = arbiter.select(
+		emptySnapshot({ night: false, depthBelowSurface: 25, edible: null, food: 20 }),
+	);
+	assert.equal(day.kind, "idle");
+	// 装備が揃った夜の地下も LLM に任せる。
+	const equippedNight = new SurvivalArbiter().select(
+		emptySnapshot({
+			night: true,
+			armed: true,
+			armored: true,
+			depthBelowSurface: 25,
+			edible: null,
+			food: 20,
+		}),
+	);
+	assert.equal(equippedNight.kind, "idle");
+	// 丸腰の夜だけは、深くても shelter が担当する(2026-09-21 08:59、穴の中で日没→死亡)。
+	const bareNight = new SurvivalArbiter().select(
 		emptySnapshot({
 			night: true,
 			armed: false,
@@ -98,7 +116,7 @@ test("地下深くでは潜らない。地上へ出るかどうかは LLM が決
 			food: 20,
 		}),
 	);
-	assert.equal(decision.kind, "idle");
+	assert.equal(bareNight.rule?.name, "shelter");
 });
 
 test("担当は常に1つだけ。上位の前提が立っている間は下位が割り込まない", () => {
@@ -401,6 +419,56 @@ test("担当の取得と取り上げも LLM に報告する", () => {
 	assert.ok(reports.some((r) => r.includes("forced to stop")));
 });
 
+test("夜明け直後、丸腰で敵が至近なら shelter は手放さない。装備があれば手放す", () => {
+	// 実測 2026-09-21 10:21、解除の 46 秒後にクモに殺された。
+	const held = new SurvivalArbiter().select(
+		emptySnapshot({
+			night: false,
+			timeOfDay: 1500,
+			hostilesNear: 1,
+			hostilesClose: 1,
+			armed: false,
+			armored: false,
+		}),
+	);
+	assert.equal(held.rule?.name, "shelter");
+	const equipped = new SurvivalArbiter().select(
+		emptySnapshot({ night: false, timeOfDay: 1500, hostilesNear: 1, hostilesClose: 1 }),
+	);
+	assert.notEqual(equipped.rule?.name, "shelter");
+	// 昼が進めば敵がいても出る(LLM の判断に戻す)。
+	const later = new SurvivalArbiter().select(
+		emptySnapshot({
+			night: false,
+			timeOfDay: 6000,
+			hostilesNear: 1,
+			hostilesClose: 1,
+			armed: false,
+			armored: false,
+		}),
+	);
+	assert.notEqual(later.rule?.name, "shelter");
+});
+
+test("丸腰の夜は地下深くでも shelter が担当する。昼の地下は担当しない", () => {
+	// 穴の中で日没を迎えた(実測 2026-09-21 08:59、深さの条項で誰も担当せず
+	// 暗い穴を歩いてゾンビに殺された)。
+	const deepNight = new SurvivalArbiter().select(
+		emptySnapshot({ night: true, armed: false, armored: false, depthBelowSurface: 10 }),
+	);
+	assert.equal(deepNight.rule?.name, "shelter");
+	// 装備が揃っていれば夜でも地下は LLM に任せる。
+	const deepNightEquipped = new SurvivalArbiter().select(
+		emptySnapshot({ night: true, armed: true, armored: true, depthBelowSurface: 10 }),
+	);
+	assert.notEqual(deepNightEquipped.rule?.name, "shelter");
+	// 昼の地下は従来どおり担当しない(掘り上がるのは LLM の仕事)。
+	const deepDay = new SurvivalArbiter().select(
+		emptySnapshot({ night: false, health: 6, hostilesNear: 1, food: 20, depthBelowSurface: 10 }),
+	);
+	assert.notEqual(deepDay.rule?.name, "shelter");
+});
+
 test("LLM が籠りを断っても、防具の無い夜は shelter が担当する。剣と防具が揃えば従う", () => {
 	const arbiter = new SurvivalArbiter();
 	const night = { night: true, armed: false, armored: false, edible: null as string | null };
@@ -435,9 +503,15 @@ test("LLM が籠りを断っても、防具の無い夜は shelter が担当す�
 
 test("夜に籠って保持中なら、潜った先が深くても shelter は手放さない", () => {
 	const night = { night: true, armed: false, armored: false, edible: null as string | null };
-	// 保持していないなら、地下深くでは担当しない(従来どおり)。
+	// 装備が揃っていて保持していないなら、地下深くでは担当しない。
 	const loose = new SurvivalArbiter().select(
-		emptySnapshot({ ...night, depthBelowSurface: 12, shelterHeld: false }),
+		emptySnapshot({
+			...night,
+			armed: true,
+			armored: true,
+			depthBelowSurface: 12,
+			shelterHeld: false,
+		}),
 	);
 	assert.notEqual(loose.rule?.name, "shelter");
 	// 保持中は深くても持ち続ける(2026-09-20 21:21、潜った先が洞窟に抜けて手放し、探索して死亡)。

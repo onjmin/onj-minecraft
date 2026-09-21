@@ -321,6 +321,9 @@ type session struct {
 	safeSpots []safeSpot
 	// 次の tick で送る設置。統合版の設置は player_auth_input に載せる。
 	pendingPlace *protocol.UseItemTransactionData
+	// 次の PlayerAuthInput に「使い始めた」(InputFlagStartUsingItem)を立てる。
+	// 食べ始めの合図。1tick だけ。
+	startUsingItem bool
 	// pendingAttack は次の tick で送る攻撃。
 	//
 	// 設置と同じく、入力と同じ tick の流れに載せる。コマンドの goroutine から
@@ -1383,6 +1386,10 @@ func (s *session) buildInput(n uint64) *packet.PlayerAuthInput {
 		flags.Set(packet.InputFlagPerformItemInteraction)
 		pk.ItemInteractionData = protocol.Option(*p)
 		s.pendingPlace = nil
+	}
+	if s.startUsingItem {
+		flags.Set(packet.InputFlagStartUsingItem)
+		s.startUsingItem = false
 	}
 
 	slot := n % uint64(len(s.history))
@@ -2605,10 +2612,16 @@ func (s *session) dispatch(c command) {
 	case "eat":
 		// 手に持っている食べ物を食べる。何を持つかは呼び出し側("hold")の責任。
 		//
-		// 統合版の消費は2段構え。食べ始めを PlayerAuthInput の ItemInteraction に
-		// 載せ(設置と同じ経路)、食べ終わりを ReleaseItem トランザクションで送る。
-		// 片方だけでは満腹度は戻らない。食べ始めだけでは「口を付けた」状態で
-		// 終わり、食べ終わりだけでは何を食べたのか成立しない。
+		// 統合版の消費は2段構え。食べ始めは InventoryTransaction(UseItem ClickAir)
+		// を単独で送り、同じ tick の PlayerAuthInput に StartUsingItem を立てる。
+		// 食べ終わりは ReleaseItem(Consume) トランザクション。
+		//
+		// 以前は食べ始めを PlayerAuthInput の ItemInteraction に載せていた(設置と
+		// 同じ経路)。それだと満腹度は一度も戻らなかった(2026-09-01 の実装から
+		// 全ログで成功 0 / 失敗 63)。ItemInteraction は「ブロックに対する使用」
+		// の経路で、空を右クリックする ClickAir は素の InventoryTransaction で
+		// 来るのが本来の形(Dragonfly の handler_player_auth_input は ClickAir を
+		// 未対応として弾き、handler_inventory_transaction 側で受けている)。
 		{
 			s.mu.Lock()
 			held, ok := s.rawSlots[int(s.heldSlot)]
@@ -2618,38 +2631,30 @@ func (s *session) dispatch(c command) {
 				return
 			}
 			slot := s.heldSlot
-			// 空を右クリックする形。食べ物はブロックを指す必要がない。
-			s.pendingPlace = &protocol.UseItemTransactionData{
-				ActionType:       protocol.UseItemActionClickAir,
-				TriggerType:      protocol.TriggerTypePlayerInput,
-				HotBarSlot:       slot,
-				HeldItem:         held,
-				Position:         s.pos,
-				ClientPrediction: protocol.ClientPredictionSuccess,
-			}
-			s.mu.Unlock()
-
-			// 食べ終わるまで待つ。この間も毎tickの入力は送られ続ける。
-			time.Sleep(eatDuration)
-
-			s.mu.Lock()
-			// 持ち物は食べている間に変わりうるので、送る直前のものを載せる。
-			after := s.rawSlots[int(slot)]
-			// s.pos は既に目線の高さ。ここでは足元へ直す必要はない。
-			head := s.pos
-			s.mu.Unlock()
-
-			if err := s.conn.WritePacket(&packet.InventoryTransaction{
-				TransactionData: &protocol.ReleaseItemTransactionData{
-					ActionType:   protocol.ReleaseItemActionConsume,
-					HotBarSlot:   slot,
-					HeldItem:     after,
-					HeadPosition: head,
+			start := &packet.InventoryTransaction{
+				TransactionData: &protocol.UseItemTransactionData{
+					ActionType:       protocol.UseItemActionClickAir,
+					TriggerType:      protocol.TriggerTypePlayerInput,
+					HotBarSlot:       slot,
+					HeldItem:         held,
+					Position:         s.pos,
+					ClientPrediction: protocol.ClientPredictionSuccess,
 				},
-			}); err != nil {
-				s.reply(c.ID, false, fmt.Sprintf("食事の完了を送れない: %v", err), nil)
+			}
+			s.startUsingItem = true
+			s.mu.Unlock()
+			if err := s.conn.WritePacket(start); err != nil {
+				s.reply(c.ID, false, fmt.Sprintf("食べ始めを送れない: %v", err), nil)
 				return
 			}
+
+			// 食べ終わるまで待つ。この間も毎tickの入力は送られ続ける。
+			//
+			// 食べ終わり(ReleaseItem Consume)は送らない。サーバーは使い始めから
+			// 32tick で自ら消費する。以前はその後に ReleaseItem Consume も送って
+			// いて、1回の食事で 2 個減っていた(ローカル実測 2026-09-21 07:50、
+			// 8→6→4。送らなければ 8→7→6 で満腹度も戻る)。
+			time.Sleep(eatDuration)
 			s.reply(c.ID, true, "", nil)
 		}
 
@@ -4016,11 +4021,11 @@ func (s *session) breatheLocked() {
 	}
 	if s.submergedSince.IsZero() {
 		s.submergedSince = time.Now()
-		return
 	}
-	if time.Since(s.submergedSince) < breathLimit {
-		return
-	}
+	// 「沈んで N 秒」は条件にしない。水面で浮き沈みすると目の位置が水と空気を
+	// 行き来して submergedSince が毎回リセットされ、削られているのに一度も
+	// 動かなかった(実測 2026-09-21 02:00、「沈んで 0s」のまま体力 18→4→溺死)。
+	// 削られていること自体が息切れの証拠。
 	// 実際に削られるまでは動かない。溺れ始めると毎秒 2 削られ、最初の1発で
 	// 動けば空気まで 8 秒ある。削られる前に動くと、掘り上がりのように自分で
 	// 空気を作っている途中のスキルの移動を潰す(実測 2026-09-20 18:31、水没した

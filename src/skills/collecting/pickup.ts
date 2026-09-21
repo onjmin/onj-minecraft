@@ -28,6 +28,7 @@ export const pickupItemsSkill = createSkill<void, { picked: string[] }>({
 		for (const i of driver.inventory.items())
 			before.set(i.name, (before.get(i.name) ?? 0) + i.count);
 
+		const beforeIds = new Set(items.map((e) => e.id));
 		await driver.pickupNearbyItems(signal);
 
 		const picked: string[] = [];
@@ -35,6 +36,23 @@ export const pickupItemsSkill = createSkill<void, { picked: string[] }>({
 			const gained = i.count - (before.get(i.name) ?? 0);
 			if (gained > 0) picked.push(`${i.name} x${gained}`);
 			before.set(i.name, 0);
+		}
+		// 持ち物の写しは遅れることがある。落下物が消えたなら拾えている。
+		if (picked.length === 0) {
+			const remaining = new Set(
+				driver
+					.nearbyEntities(PICKUP_RANGE + 8)
+					.filter((e) => e.kind === "item")
+					.map((e) => e.id),
+			);
+			const vanished = items.filter((e) => beforeIds.has(e.id) && !remaining.has(e.id));
+			const names = (driver as unknown as { pickedUpNames?: string[] }).pickedUpNames;
+			if (names && names.length > 0) {
+				picked.push(...names.map((n) => `${n} (inventory copy may lag)`));
+				names.length = 0;
+			} else if (vanished.length > 0) {
+				picked.push(...vanished.map((e) => `${e.name} (inventory copy may lag)`));
+			}
 		}
 		if (picked.length === 0) {
 			const left = driver.nearbyEntities(PICKUP_RANGE).filter((e) => e.kind === "item").length;

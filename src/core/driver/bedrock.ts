@@ -417,6 +417,13 @@ export class BedrockDriver implements BotDriver {
 				// 送信者が無いものはサーバーからの通知。キルログや死亡ログ、
 				// 参加/退出がここに来る。捨てていたので、誰が誰にやられたかを
 				// 一切知らないままだった。
+				// ベッドを叩いた結果はここに来る。tile.bed.respawnSet が復帰地点の
+				// 移動、noSleep/occupied/notSafe/tooFar は叩けたが寝られない。
+				// どれも来なければ叩けていない(手に持った物を置いた等)。
+				if (message.includes("tile.bed.")) {
+					this.lastBedAckAt = Date.now();
+					if (message.includes("tile.bed.respawnSet")) this.lastRespawnSetAt = Date.now();
+				}
 				const args = Array.isArray(d.parameters) ? d.parameters.map(String) : [];
 				// 自分がプレイヤーに倒されたなら、加害者はここに書いてある。
 				// 体力の変化から推測するより確実。
@@ -1086,6 +1093,29 @@ export class BedrockDriver implements BotDriver {
 	 * 落ちているアイテムを拾う。
 	 * 統合版は近づけば勝手に拾うので、落ちている場所へ順に歩くだけでよい。
 	 */
+	/**
+	 * 落下物のすぐ隣(水平 ±1、高さ -1〜0)に溶岩があるか。
+	 *
+	 * 溶岩で死んだ羊の肉と羊毛は溶岩の縁に浮く。距離 0.9 まで寄ると足を出す
+	 * 先が縁になり、実測 2026-09-21 06:29、(125,63,-124) の white_wool と
+	 * cooked_mutton を 4 回狙って「届いているのに拾えない」を繰り返した直後、
+	 * 同じ場所で溶岩死した。溶岩の隣の物は最初から狙わない。
+	 */
+	private nearLava(at: Position): boolean {
+		const bx = Math.floor(at.x);
+		const by = Math.floor(at.y);
+		const bz = Math.floor(at.z);
+		for (let dx = -1; dx <= 1; dx++) {
+			for (let dz = -1; dz <= 1; dz++) {
+				for (let dy = -1; dy <= 0; dy++) {
+					const name = this.blocks.blockAt({ x: bx + dx, y: by + dy, z: bz + dz })?.name;
+					if (name === "lava" || name === "flowing_lava") return true;
+				}
+			}
+		}
+		return false;
+	}
+
 	async pickupNearbyItems(signal: AbortSignal): Promise<void> {
 		const deadline = Date.now() + 15_000;
 		// 1個の落とし物へ歩く上限。期限(15秒)は周の頭でしか見ておらず、中の
@@ -1106,7 +1136,7 @@ export class BedrockDriver implements BotDriver {
 			await this.refresh();
 			const here = this.state.position;
 			const items = this.entities
-				.filter((e) => e.kind === "item" && !unreachable.has(e.id))
+				.filter((e) => e.kind === "item" && !unreachable.has(e.id) && !this.nearLava(e.position))
 				.sort((a, b) => distance(here, a.position) - distance(here, b.position));
 			const target = items[0];
 			if (trace) {
@@ -1194,7 +1224,66 @@ export class BedrockDriver implements BotDriver {
 			}
 			// 拾われるまで少し待つ。判定はサーバー側。
 			await sleep(800);
+			// 届いているのに拾えない物は、次から狙わない。取り除きの通知が来ずに
+			// 写しに残った幽霊や、届かない位置の物が「一番近い」まま居座ると、
+			// その奥の物(羊毛)へ一度も向かわない。実測 2026-09-21 06:16、距離 0.9 の
+			// chicken を 6 回続けて狙い、11 ブロック先の white_wool に触れず終わった。
+			// 拾えたかは「落下物が消えたか」で見る。持ち物の写しは遅れて届く
+			// (実測 2026-09-21 06:29、white_wool を「拾えない」と印を付けた直後の
+			// 一覧から消えていた = 拾えていた)。消えるまで最大 2.5 秒待つ。
+			let gone = false;
+			for (let w = 0; w < 5; w++) {
+				await this.refresh();
+				const still = this.entities.find((e) => e.id === target.id);
+				if (!still) {
+					gone = true;
+					break;
+				}
+				if (distance(this.state.position, still.position) > 1.3) break;
+				await sleep(500);
+			}
+			if (gone) {
+				this.pickedUpNames.push(target.name);
+				if (trace) console.log(`[pickup] ${target.name} を拾った(落下物が消えた)`);
+				continue;
+			}
+			const still = this.entities.find((e) => e.id === target.id);
+			if (still && distance(this.state.position, still.position) <= 1.3) {
+				if (trace) console.log(`[pickup] ${target.name} は届いているのに拾えない。以後は飛ばす`);
+				unreachable.add(target.id);
+			}
 		}
+	}
+
+	/**
+	 * 直近の pickupNearbyItems で消えた落下物の名前。持ち物の写しが遅れても、
+	 * スキル側が「拾えた」と判断できるようにする。呼び出し側が読んだら空にする。
+	 */
+	public pickedUpNames: string[] = [];
+	/** 最後にベッド関連の通知(tile.bed.*)を受けた時刻。0 なら未受信。 */
+	public lastBedAckAt = 0;
+	/** 最後に tile.bed.respawnSet を受けた時刻。復帰地点が移った証拠。 */
+	public lastRespawnSetAt = 0;
+
+	/**
+	 * ベッドを叩き、サーバーの応答で結果を返す。
+	 *
+	 * "set" は復帰地点が移った(tile.bed.respawnSet)。"ack" は叩けたが移らなかった
+	 * (既にここが復帰地点、または寝られない旨だけ)。"none" は何も返って
+	 * こなかった = 叩けていない。実測 2026-09-21 06:55、activate が成功を返して
+	 * 「登録した」と記録したが応答は無く、次の死で初期リスへ戻された。
+	 * 成功した回(06:08, 06:37)は必ず respawnSet が来ている。
+	 */
+	async useBed(position: Position): Promise<"set" | "ack" | "none"> {
+		const t0 = Date.now();
+		await this.activateBlock(position);
+		for (let i = 0; i < 6; i++) {
+			if (this.lastRespawnSetAt >= t0) return "set";
+			if (this.lastBedAckAt >= t0) return "ack";
+			await sleep(300);
+		}
+		if (this.lastRespawnSetAt >= t0) return "set";
+		return this.lastBedAckAt >= t0 ? "ack" : "none";
 	}
 
 	async eat(_signal: AbortSignal, item?: string): Promise<boolean> {
@@ -1210,8 +1299,14 @@ export class BedrockDriver implements BotDriver {
 			// 統合版の消費は「使い始め」と「使い終わり」の2段。サイドカー側で
 			// 両方を送って、食べ終わるまで待ってから返す。
 			const res = await this.sidecar.send("eat", {}, 10_000);
-			if (!res?.ok) return false;
-		} catch {
+			if (!res?.ok) {
+				console.log(`[eat] サイドカーが食事を拒否: ${res?.error ?? "理由なし"}`);
+				return false;
+			}
+		} catch (e) {
+			// 黙って false を返すと「満腹度が上がらない」としか見えない。
+			// 実測 2026-09-21 08:16、本番で 0 秒で失敗が 3 連続し理由が分からなかった。
+			console.log(`[eat] ${food} を持てなかった/食べられなかった: ${e}`);
 			return false;
 		}
 

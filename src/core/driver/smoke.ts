@@ -62,6 +62,7 @@ const REQUIRED_MEMBERS: (keyof BotDriver)[] = [
 	"dig",
 	"placeBlock",
 	"activateBlock",
+	"useBed",
 	"attack",
 	"equip",
 	"equipBestTool",

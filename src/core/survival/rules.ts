@@ -34,6 +34,8 @@ export const SHELTER_HEALTH = envNum("SHELTER_HEALTH", 8);
 export const DEATH_STORM_LIMIT = envNum("DEATH_STORM_LIMIT", 3);
 /** 自分の列の地表がこれより上なら「地下深く」。 */
 export const DEEP_UNDERGROUND_GAP = envNum("DEEP_UNDERGROUND_GAP", 5);
+/** 夜明け後、丸腰で敵が至近なら籠りを続ける上限の時刻(tick)。 */
+export const DAWN_HOSTILE_HOLD_TICK = envNum("DAWN_HOSTILE_HOLD_TICK", 3000);
 /** 頭上にこれだけ固いものが積まっていたら「埋まっている」。 */
 export const BURIED_THICKNESS = envNum("BURIED_THICKNESS", 4);
 /** これを下回ったら、割の悪い手段でも食料を取りに行く。 */
@@ -99,6 +101,65 @@ export interface SurvivalRule {
  */
 function equipped(s: SurvivalSnapshot): boolean {
 	return s.armed && s.armored;
+}
+
+/**
+ * shelter が担当できない理由。null なら担当する。
+ *
+ * when を bool で持つと「前提が消えた」の中身が分からない(実測 2026-09-20
+ * 00:20、籠り中に手放して 1 秒後に死亡。どの条項かログから読めなかった)。
+ * agent は手放したときにこれをログに出す。
+ */
+export function shelterBlocker(s: SurvivalSnapshot): string | null {
+	if (!s.ready || s.health <= 0) return "not ready or dead";
+	// 地下深くでは担当しない。ただし今夜すでに籠って保持しているなら
+	// 手放さない。潜った足元が洞窟に抜けて深くなった瞬間に手放すと、
+	// LLM が夜の探索を始めて死ぬ(実測 2026-09-20 21:21、潜った22秒後に
+	// 「前提が消えた」→探索→ドラウンドに殺された)。深いところでは
+	// 掘り進まずその場で待つ(shelterNow 側)。
+	//
+	// 丸腰の夜も例外。日没を穴(初期リスのクレーター)の中で迎えると、この条項で
+	// 誰も担当せず LLM が暗い穴の中を歩いて死ぬ(実測 2026-09-21 08:59、時刻 13329
+	// で暗くなって 27 秒後にゾンビ。夜の死 12 件中 10 件がクレーター内)。
+	// 夜で装備が無ければ深さに関わらず担当し、掘らずに蓋をして待つ。
+	if (
+		s.depthBelowSurface !== null &&
+		s.depthBelowSurface > DEEP_UNDERGROUND_GAP &&
+		!(s.shelterHeld && s.night) &&
+		!(s.night && !equipped(s))
+	) {
+		return `deep underground (depth ${s.depthBelowSurface}) and not holding`;
+	}
+	const hurt = isHurtAndCanWait(s);
+	const dying = isDying(s);
+	// 夜明け直後、丸腰で敵が至近にいるなら出ない。クモは日光で燃えず、夜に
+	// 狙った相手を朝も追う。実測 2026-09-21 10:21、解除の 46 秒後にクモに殺された
+	// (その前の朝はスケルトンの矢)。敵が離れるか時刻 3000 まで待つ。
+	if (
+		!s.night &&
+		s.timeOfDay % 24000 < DAWN_HOSTILE_HOLD_TICK &&
+		s.hostilesClose > 0 &&
+		!equipped(s)
+	) {
+		return null;
+	}
+	if (!s.night && !hurt && !dying) return "daytime, not hurt, not dying";
+	// 頼まれた直後は出る。瀕死のときだけは、頼まれごとより先に死ぬので譲らない。
+	// 防具の無い夜も出ない。実測 2026-09-20 21:42、他プレイヤー同士の雑談から
+	// 「洞窟で迷子の救援」を依頼と取り、夜の籠りを解いて探索に出て死亡。
+	// 夜に丸腰で出ても助けには行けない。朝になってから応じる。
+	if (s.humanRequestFresh && !hurt && (!s.night || equipped(s))) return "fresh human request";
+	// LLM が籠らないと決めたなら従う。ただし夜は、剣と防具が揃っている
+	// ときだけ。防具の無い夜に Hide: no を通した結果が、14:05 以降の
+	// 夜の死 12 件のうち 10 件(直前の答えが no)。事実は渡しても 24B は
+	// 「計画がある」と no を出し続けたので、ここで受け付けない
+	// (2026-09-20、オーナー承認)。昼の傷・死に続けは従来どおり譲らない。
+	if (s.shelterDeclined && !hurt && !dying && (!s.night || equipped(s))) {
+		return "LLM declined (Hide: no) and is equipped or it is day";
+	}
+	// 装備が揃っていて無傷なら、夜でも歩ける。
+	if (!hurt && !dying && equipped(s)) return "armed and armored, unhurt";
+	return null;
 }
 
 /** 死に続けているか。 */
@@ -203,38 +264,7 @@ export const SURVIVAL_RULES: readonly SurvivalRule[] = [
 				: isHurtAndCanWait(s)
 					? `Reflex shelter: health ${s.health}, hid to regenerate.`
 					: "Reflex shelter: night and unarmed, hid underground until morning.",
-		when: (s) => {
-			if (!s.ready || s.health <= 0) return false;
-			// 地下深くでは担当しない。ただし今夜すでに籠って保持しているなら
-			// 手放さない。潜った足元が洞窟に抜けて深くなった瞬間に手放すと、
-			// LLM が夜の探索を始めて死ぬ(実測 2026-09-20 21:21、潜った22秒後に
-			// 「前提が消えた」→探索→ドラウンドに殺された)。深いところでは
-			// 掘り進まずその場で待つ(shelterNow 側)。
-			if (
-				s.depthBelowSurface !== null &&
-				s.depthBelowSurface > DEEP_UNDERGROUND_GAP &&
-				!(s.shelterHeld && s.night)
-			) {
-				return false;
-			}
-			const hurt = isHurtAndCanWait(s);
-			const dying = isDying(s);
-			if (!s.night && !hurt && !dying) return false;
-			// 頼まれた直後は出る。瀕死のときだけは、頼まれごとより先に死ぬので譲らない。
-			// 防具の無い夜も出ない。実測 2026-09-20 21:42、他プレイヤー同士の雑談から
-			// 「洞窟で迷子の救援」を依頼と取り、夜の籠りを解いて探索に出て死亡。
-			// 夜に丸腰で出ても助けには行けない。朝になってから応じる。
-			if (s.humanRequestFresh && !hurt && (!s.night || equipped(s))) return false;
-			// LLM が籠らないと決めたなら従う。ただし夜は、剣と防具が揃っている
-			// ときだけ。防具の無い夜に Hide: no を通した結果が、14:05 以降の
-			// 夜の死 12 件のうち 10 件(直前の答えが no)。事実は渡しても 24B は
-			// 「計画がある」と no を出し続けたので、ここで受け付けない
-			// (2026-09-20、オーナー承認)。昼の傷・死に続けは従来どおり譲らない。
-			if (s.shelterDeclined && !hurt && !dying && (!s.night || equipped(s))) return false;
-			// 装備が揃っていて無傷なら、夜でも歩ける。
-			if (!hurt && !dying && equipped(s)) return false;
-			return true;
-		},
+		when: (s) => shelterBlocker(s) === null,
 		// 統合版の夜は実時間で約8分。上限はそれを1周できる長さにし、
 		// 明ければ when が false になって自然に手放す。
 		holdMs: envNum("SHELTER_HOLD_MAX_MS", 10 * 60_000),

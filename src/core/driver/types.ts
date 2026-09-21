@@ -236,6 +236,12 @@ export interface BotDriver {
 	/** reference ブロックの face 方向の面にブロックを設置する。 */
 	placeBlock(signal: AbortSignal, reference: Position, face: Position): Promise<void>;
 	activateBlock(position: Position): Promise<void>;
+	/**
+	 * ベッドを使い、サーバーの応答で結果を返す。"set" は復帰地点が移った、
+	 * "ack" は叩けたが移らなかった(登録済み・寝られない)、"none" は応答が無い
+	 * (叩けていない)。
+	 */
+	useBed(position: Position): Promise<"set" | "ack" | "none">;
 
 	attack(signal: AbortSignal, entityId: number): Promise<void>;
 	equip(
