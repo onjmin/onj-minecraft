@@ -2392,6 +2392,16 @@ export class MinecraftAgent {
 	/**
 	 * 一覧に載せるか。対象そのものが無いスキルだけを外す(上の説明を参照)。
 	 */
+	/**
+	 * 石の採れ具合。collecting.stone を載せるかと、SITUATION に書く理由の両方が
+	 * これを見る。判定は collecting.stone 本体と同じ(近くの石 → 足元より下を除く)。
+	 */
+	private stoneReach(): "reachable" | "below" | "none" {
+		const found = stoneScanner.findNearbyStone(this.driver);
+		if (found.length === 0) return "none";
+		return notBelowFeet(this.driver, found).length > 0 ? "reachable" : "below";
+	}
+
 	private skillIsWorthOffering(name: string): boolean {
 		switch (name) {
 			case gotoDeathPointSkill.name:
@@ -2417,13 +2427,14 @@ export class MinecraftAgent {
 				// 判定は本体と同じ determineNextSkill。handler が先に呼ぶ棒・板の確保は
 				// 原木→板材→棒の変換なので、ここの判定(板材+原木×4 で数える)を動かさない。
 				return toolCraftingManager.determineNextSkill(this.driver) !== null;
-			case collectStoneSkill.name: {
+			case collectStoneSkill.name:
 				// 足元より下の石しか無いときは載せない。このスキルは下へ掘らないので
 				// (dig-guard)、載せても "Stone is only below your feet" で即失敗する。
 				// 実測 2026-09-21 run166、20分で 6 回中 6 回がこれ。石が要るなら崖か
-				// 洞窟まで歩くしかなく、それは exploring の仕事。
-				return notBelowFeet(this.driver, stoneScanner.findNearbyStone(this.driver)).length > 0;
-			}
+				// 洞窟まで歩くしかなく、それは exploring の仕事。外した理由は
+				// SITUATION に書く(stoneReach)。黙って消すと、石が要ると分かって
+				// いる LLM が石の上で立ち往生する。
+				return this.stoneReach() === "reachable";
 			case "building.bed": {
 				// 羊毛 3 枚(同色)かベッドを持っていないときは載せない。注記では止まらず、
 				// 羊毛 0 で選ばれた(2026-09-21 01:57)。作り方は SITUATION に書いてある。
@@ -3156,6 +3167,12 @@ export class MinecraftAgent {
 						(e) =>
 							`${e.name}(${Math.round(Math.hypot(e.position.x - pos.x, e.position.y - pos.y, e.position.z - pos.z))}m)`,
 					),
+				stoneReach: this.stoneReach(),
+				// 一覧から外した判定と同じものを使う。別々に書くとずれる。
+				nothingToCraft: {
+					weapon: craftingManager.determineNextWeapon(this) === null,
+					tool: toolCraftingManager.determineNextSkill(this.driver) === null,
+				},
 				respawnInHazard:
 					(this.spawnBed && this.isInHazard(this.spawnBed)) ||
 					(!this.spawnBed && !!this.lastRespawnPos && this.isInHazard(this.lastRespawnPos)),

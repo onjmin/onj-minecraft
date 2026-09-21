@@ -54,6 +54,31 @@ export interface SituationExtras {
 	 * 中か。死ぬたびに穴底から始まる、という事実は行動の優先順位を変える。
 	 */
 	respawnInHazard?: boolean;
+	/**
+	 * 石の採れ具合。"reachable" は掘れる石が近くにある。"below" は足元より
+	 * 下にしか無い。"none" は近くに石が無い。
+	 *
+	 * "below" と "none" のとき collecting.stone は一覧から外れる(即失敗する
+	 * ので載せない)。外すだけだと、LLM は石が要ると分かっていても「なぜ
+	 * 選べないのか」も「どこへ行けば採れるのか」も知らないまま、石の上で
+	 * 立ち往生する。外した理由はこちらで言う。
+	 */
+	stoneReach?: "reachable" | "below" | "none";
+	/**
+	 * 作る物が無いので一覧から外したクラフトのスキル。
+	 *
+	 * stoneReach と同じ穴が装備側に残っていた。crafting.weapon と
+	 * crafting.tool は「作れる物が無いときは載せない」ようになっているが、
+	 * 外した理由はどこにも書かれていない。LLM は装備を強化したいのに
+	 * 一覧に作る手が無く、存在しない名前を自分で作って呼ぶ。
+	 *
+	 * 実測 2026-09-21 18:30〜18:36(run167)、木の剣を持ち石を1つも持たない
+	 * 状態で作業台へ歩き、`crafting.craft` を 13 回選んだ。無効な名前を
+	 * 選ぶと前のタスクが走り続けるので、到着済みの goto.coords が 37 回
+	 * 空回りし、308 秒その場に立っていた。同じ 1.5 時間で存在しない
+	 * スキルの指定は 29 回あった。
+	 */
+	nothingToCraft?: { weapon: boolean; tool: boolean };
 }
 
 function minutes(ticks: number): string {
@@ -165,6 +190,33 @@ export function describeSituation(s: SurvivalSnapshot, x: SituationExtras = {}):
 			// (実測 2026-09-20、collecting.hunting 33回中32回が「いない」で失敗)。
 			lines.push("No huntable animal is in sight; hunting requires moving somewhere else first.");
 		}
+	}
+
+	// 石。道具の素材で、一番よく要る。採れないときは、その理由と行き先を言う。
+	if (x.stoneReach === "below") {
+		lines.push(
+			"collecting.stone is not offered here: the only stone is below your feet, and digging straight down needs an iron pickaxe, torches and food. Stone is exposed in cliff faces, ravines and cave mouths — walk to one first (exploring.explore_land).",
+		);
+	} else if (x.stoneReach === "none") {
+		lines.push(
+			"collecting.stone is not offered here: no stone is within reach. Stone is exposed in cliff faces, ravines and cave mouths, and underground below roughly Y=60.",
+		);
+	}
+
+	// クラフト。作る物が無くて外したなら、その理由を言う。言わないと、
+	// LLM は一覧に無い名前(crafting.craft など)を自分で作って呼ぶ。
+	if (x.nothingToCraft?.weapon && x.nothingToCraft?.tool) {
+		lines.push(
+			"crafting.weapon and crafting.tool are not offered here: everything you carry is already the best that your current materials can make. Gathering better material is what unlocks them — cobblestone for stone gear, iron for anything above that. Walking to a crafting table changes nothing by itself.",
+		);
+	} else if (x.nothingToCraft?.weapon) {
+		lines.push(
+			"crafting.weapon is not offered here: your combat gear is already the best your current materials can make. Cobblestone gives a stone sword; a shield needs iron.",
+		);
+	} else if (x.nothingToCraft?.tool) {
+		lines.push(
+			"crafting.tool is not offered here: your tools are already the best your current materials can make. Cobblestone gives stone tools.",
+		);
 	}
 
 	// 高さの推移。地下にいるときだけ。「登っている」と「行き来している」は

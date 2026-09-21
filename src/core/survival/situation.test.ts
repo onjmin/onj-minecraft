@@ -190,3 +190,50 @@ test("昼の地上では、未踏の遠い方向と最大到達距離を言う",
 	);
 	assert.doesNotMatch(night, /never been more than/);
 });
+
+test("石が足元より下にしか無いなら、外した理由と行き先を言う", () => {
+	const text = describeSituation(emptySnapshot({}), { stoneReach: "below" }).join("\n");
+	assert.match(text, /collecting\.stone is not offered/);
+	assert.match(text, /below your feet/);
+	assert.match(text, /cliff/);
+});
+
+test("石が採れるなら、石の話はしない", () => {
+	const text = describeSituation(emptySnapshot({}), { stoneReach: "reachable" }).join("\n");
+	assert.ok(!text.includes("collecting.stone"), text);
+});
+
+test("作る物が無くて外したなら、その理由と何が要るかを言う", () => {
+	// 外すだけだと、LLM は一覧に無い名前を自分で作って呼ぶ。実測
+	// 2026-09-21 18:30〜18:36(run167)、木の剣を持ち石を1つも持たない状態で
+	// crafting.craft を 13 回選び、前のタスク(到着済みの goto.coords)が
+	// 37 回空回りして 308 秒その場に立っていた。
+	const text = describeSituation(emptySnapshot({}), {
+		nothingToCraft: { weapon: true, tool: true },
+	}).join("\n");
+	assert.match(text, /crafting\.weapon and crafting\.tool are not offered/);
+	assert.match(text, /cobblestone/i);
+	// 作業台まで歩いても解決しないことを言う。18:27 の判断がそれだった。
+	assert.match(text, /crafting table changes nothing/);
+});
+
+test("片方だけ作れないなら、そちらだけ言う", () => {
+	const weaponOnly = describeSituation(emptySnapshot({}), {
+		nothingToCraft: { weapon: true, tool: false },
+	}).join("\n");
+	assert.match(weaponOnly, /crafting\.weapon is not offered/);
+	assert.ok(!weaponOnly.includes("crafting.tool is not offered"), weaponOnly);
+
+	const toolOnly = describeSituation(emptySnapshot({}), {
+		nothingToCraft: { weapon: false, tool: true },
+	}).join("\n");
+	assert.match(toolOnly, /crafting\.tool is not offered/);
+	assert.ok(!toolOnly.includes("crafting.weapon is not offered"), toolOnly);
+});
+
+test("両方作れるなら、クラフトの話はしない", () => {
+	const text = describeSituation(emptySnapshot({}), {
+		nothingToCraft: { weapon: false, tool: false },
+	}).join("\n");
+	assert.ok(!text.includes("is not offered"), text);
+});
