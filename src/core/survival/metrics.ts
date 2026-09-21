@@ -119,8 +119,20 @@ export class SurvivalMetrics {
 		if (stall > this.longestStallMs) this.longestStallMs = stall;
 	}
 
+	/**
+	 * 死んだ。記録して、その場で書き出す。
+	 *
+	 * 書き出しは reportIfDue の中だけにしてはいけない。定期報告の間隔の途中で
+	 * 死んで落ちると、その区間が丸ごと消える。しかも消えるのは「死んだ回」に
+	 * 偏るので、死亡数だけが抜けて稼働時間は残り、死亡率が実際より低く出る。
+	 *
+	 * 実測 2026-09-21、ログを grep した死亡は 30 件あるのに metrics-*.json の
+	 * 合計は 20 件だった。この 10 件の差で、同じ期間の死亡率が 2.34 回/h とも
+	 * 3.50 回/h とも読め、改修の効果判定が有意・非有意の両側に振れた。
+	 */
 	noteDeath(): void {
 		this.deaths.push(this.now());
+		this.save();
 	}
 
 	noteMeal(foodBefore: number, foodAfter: number): void {

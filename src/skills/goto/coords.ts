@@ -74,7 +74,30 @@ export const gotoCoordsSkill = createSkill<
 					{ timeoutMs },
 				);
 			}
-			return skillResult.ok(`Moved to coordinates (${x}, ${y ?? "surface"}, ${z}).`, { x, y, z });
+			// 動いていないなら、動いたと言わない。
+			//
+			// driver.goto は目標から distance(2) 以内なら即座に成功を返す。これは
+			// 正しい。問題は、その結果を「Moved to coordinates」と報告していたこと。
+			// LLM は移動したと読み、状況が変わらないので同じ手をまた選ぶ。実測
+			// 2026-09-21 12:02〜17:16 の 5.1 時間で、同じ座標を 3 回以上続けて
+			// 指した塊が 35 回、合計 35 分(稼働の約11%)その場に立っていた。
+			// 最長は 13:51〜13:54 の 180 秒・24 回連続。
+			//
+			// ここで「その座標へは行かない」と拒否してはいけない。行き先を選ぶのは
+			// LLM の仕事で、コードの仕事は起きた事実を漏らさず返すこと(AGENTS.md)。
+			// 失敗にもしない。成功率だけを見せると、実際に効いている手を LLM が
+			// 捨てることがある(goto.surface で実測済み)。
+			const arrived = advanced();
+			if (arrived.moved < 1) {
+				return skillResult.ok(
+					`Already at (${x}, ${y ?? "surface"}, ${z}) — you were ${Math.round(distanceBefore)} blocks away, within arrival range, and did not move. Calling goto.coords with the same x,z again will do nothing. Choose a different destination or a different skill.`,
+					{ x, y, z },
+				);
+			}
+			return skillResult.ok(
+				`Moved ${arrived.moved} blocks to coordinates (${x}, ${y ?? "surface"}, ${z}).`,
+				{ x, y, z },
+			);
 		} catch (err) {
 			const { moved, remaining } = advanced();
 			if (!signal.aborted && moved >= 16) {

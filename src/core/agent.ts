@@ -2154,6 +2154,14 @@ export class MinecraftAgent {
 	public cancelAllTasks() {
 		this.log(`Cancelling all tasks...`);
 
+		// 落ちる前に計測を書き出す。
+		//
+		// ここは切断・席譲り・終了の合流点で、この後たいてい process.exit する。
+		// 定期報告(reportIfDue)を待っていると最後の区間が消え、しかも消えるのは
+		// 「切断で終わった回」に偏る。死亡時の保存(metrics.noteDeath)と対で、
+		// 分子と分母を噛み合わせるためのもの。
+		this.metrics.save();
+
 		this.shouldStopSkill = true;
 
 		if (this.currentAbort) {
