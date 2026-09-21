@@ -896,6 +896,20 @@ export class MinecraftAgent {
 	private lastCapAt = 0;
 	/** この籠りで蓋に失敗した回数。3 回で諦める(夜明けか死亡で戻る)。 */
 	private capFailures = 0;
+	/**
+	 * 自分で置いた蓋の位置。原木を蓋にしたときの置き直しループを防ぐ。
+	 *
+	 * 「蓋あり」の判定が2つあり、食い違っていた。capHead は `!== "air"` で
+	 * 成功とし、呼び出し側は `!isTreeBlockName()` を足していた。2026-09-21
+	 * 11:42 に PLACEABLE_COVER へ `_log`/`_wood` を足した結果、原木が蓋に
+	 * 選ばれるようになり、置いた直後に呼び出し側が「蓋なし」と読んで置き直す。
+	 * 実測 11:52〜11:55、spruce_log を 16 秒おきに 12 回置き続けた(在庫を
+	 * 削りながら、蓋は最初の 1 枚で足りていた)。
+	 *
+	 * 自然の樹冠を「屋根」と誤認しないための除外なので、自分で置いた1マスは
+	 * 対象外でよい。位置が変われば当たらなくなる。
+	 */
+	private cappedLidAt: Position | null = null;
 	/** 今夜潜った回数。同じ場所で 2 回まで(縦穴にしない)。場所が変われば数え直す。 */
 	private burrowsThisNight = 0;
 	private lastBurrowPos: Position | null = null;
@@ -4275,8 +4289,16 @@ export class MinecraftAgent {
 			// 四方が塞がっているだけで蓋が無いなら、蓋を置く。矢は上から来る。
 			// 実測 2026-09-21 02:39〜02:41、四方が塞がった窪みを「籠れた」として
 			// 80 秒立ち尽くし、スケルトンに撃たれて死亡。
-			const above = this.driver.world.blockAt({ ...foot, y: foot.y + 2 });
-			const lidded = !!above && above.name !== "air" && !isTreeBlockName(above.name);
+			const lidCell = { ...foot, y: foot.y + 2 };
+			const above = this.driver.world.blockAt(lidCell);
+			// 原木でも、自分がそこへ置いた蓋なら蓋として数える(cappedLidAt の説明)。
+			const ownLid =
+				!!this.cappedLidAt &&
+				this.cappedLidAt.x === lidCell.x &&
+				this.cappedLidAt.y === lidCell.y &&
+				this.cappedLidAt.z === lidCell.z;
+			const lidded =
+				!!above && above.name !== "air" && (ownLid || !isTreeBlockName(above.name));
 			if (this.resealRequested && Date.now() - this.lastSealAt > 15_000) {
 				// 削られた直後。蓋より先に横を塞ぐ(矢は横から来ている)。
 				this.resealRequested = false;
@@ -4359,6 +4381,9 @@ export class MinecraftAgent {
 		if (Date.now() < this.shelterLatchBlockedUntil) return;
 		this.shelterLatch = { health: state.health };
 		this.capFailures = 0;
+		// 前の籠りで置いた蓋の位置は持ち越さない。場所が違えば当たらないが、
+		// 同じ穴へ戻ったときに古い記録で「蓋あり」と読むのを避ける。
+		this.cappedLidAt = null;
 		this.burrowsThisNight = 0;
 		this.homeUnroofedLogged = false;
 		this.homeStayLogged = false;
@@ -5608,6 +5633,7 @@ export class MinecraftAgent {
 					if (lidOk()) {
 						this.log("[反射] 頭上に蓋を置いた");
 						this.capFailures = 0;
+						this.cappedLidAt = lidPos;
 						return;
 					}
 				}
@@ -5643,6 +5669,7 @@ export class MinecraftAgent {
 				if (lidOk()) {
 					this.log("[反射] 頭上に蓋を置いた(支えを積んで)");
 					this.capFailures = 0;
+					this.cappedLidAt = lidPos;
 					return;
 				}
 			}
