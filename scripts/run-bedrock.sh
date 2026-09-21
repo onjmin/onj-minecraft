@@ -78,8 +78,14 @@ if [ -f "$PID_FILE" ]; then
       kill -9 "$OLD_MSYS" >/dev/null 2>&1 || true
       # Windows pid が分かっているときだけ taskkill を使う。msys pid を
       # 渡してはいけない(別プロセスを殺す)。
+      #
+      # //T を付けない。付けるとループ・node・サイドカーが同時に落ち、
+      # サイドカーは標準入力の EOF を受け取れずに死ぬ。すると Realm へ
+      # 切断が届かず、次の接続が "different device" で弾かれる
+      # (詳しくは下の「前の実行が残した〜」の節)。ここではループだけ止め、
+      # node とサイドカーは後で順番に畳む。
       if [ -n "${OLD_WIN:-}" ] && command -v taskkill >/dev/null 2>&1; then
-        taskkill //F //T //PID "$OLD_WIN" >/dev/null 2>&1 || true
+        taskkill //F //PID "$OLD_WIN" >/dev/null 2>&1 || true
       fi
       # 本当に消えたか確かめる。消せないまま進むと2本走り、同じアカウントを
       # 奪い合って延々と弾かれる。黙って続けるのが一番たちが悪い。
@@ -109,13 +115,21 @@ printf '%s %s\n' "$SELF_MSYS" "${SELF_WIN:-}" > "$PID_FILE"
 # `bash -c "... run-bedrock.sh ..."` のように文字列を含むだけのシェル
 # (ログを見ているだけの端末など)まで巻き込む。実際それで無関係のシェルを
 # 5本落とした。末尾一致にし、`-c` 付きの呼び出しを除く。
+#
+# 自分の子(bash が外部コマンドを起動するために fork した複製)も除く。
+# fork 直後の子は親と同じコマンドラインを持つので、この条件に素で当たる。
+# 実測 2026-09-21、稼働中のループ win=55252 の下に同じコマンドラインの
+# win=50720 が常駐しており、起動のたびに「記録に無い」として3本前後を
+# 報告していた。実際には他人のループではなく自分の身内で、ログだけが
+# 「取りこぼしが常にある」ように見えていた。
 if command -v powershell >/dev/null 2>&1; then
   for other in $(powershell -NoProfile -Command \
-    "Get-CimInstance Win32_Process | Where-Object { \$_.Name -eq 'bash.exe' -and \$_.CommandLine -like '*run-bedrock.sh' -and \$_.CommandLine -notlike '* -c *' } | Select-Object -ExpandProperty ProcessId" \
+    "Get-CimInstance Win32_Process | Where-Object { \$_.Name -eq 'bash.exe' -and \$_.CommandLine -like '*run-bedrock.sh' -and \$_.CommandLine -notlike '* -c *' -and \$_.ParentProcessId -ne ${SELF_WIN:-0} } | Select-Object -ExpandProperty ProcessId" \
     2>/dev/null | tr -d '\r'); do
     [ "$other" = "${SELF_WIN:-}" ] && continue
     echo "[run] 記録に無いrun-bedrock.sh(win=$other)を止める"
-    taskkill //F //T //PID "$other" >/dev/null 2>&1 || true
+    # //T を付けない。理由は上の「前回のrun-bedrock.sh」と同じ。
+    taskkill //F //PID "$other" >/dev/null 2>&1 || true
   done
 fi
 
@@ -131,28 +145,80 @@ trap 'if [ "$(awk "NR==1{print \$1}" "$PID_FILE" 2>/dev/null)" = "$SELF_MSYS" ];
 # 親(tsx)を殺してもサイドカーは生き残る。実際に接続したまま残っていたのを
 # 確認している。残ったまま繋ぎ直すと同じアカウントの奪い合いになり、
 # duplicate_login で切れる。存在しないバグを追う羽目になるので先に消す。
-if command -v taskkill >/dev/null 2>&1; then
-  taskkill //IM onj-bedrock.exe //F >/dev/null 2>&1 || true
-fi
-pkill -f "onj-bedrock" >/dev/null 2>&1 || true
-pkill -f "tsx --env-file=.env src/workflow/bedrock.ts" >/dev/null 2>&1 || true
-# pnpm 経由で起動されたものは上のパターンに当たらない。
+#
+# 消し方には順番がある。サイドカーを taskkill //F でいきなり落とすと、
+# Realm に切断が届かないままプロセスだけが消える。サーバー側はしばらく
+# 「まだ別デバイスで遊んでいる」と見なすので、直後の接続は必ず
+# "Cannot join world ... different device" で弾かれる。実測 2026-09-21、
+# 本日の起動30回すべてで最初の1回が弾かれ、30秒待って入り直していた。
+# 1回あたり約70秒、合計35分がここで溶けていた。
+#
+# サイドカーは標準入力が閉じたら自分で片付ける(session.go readCommands の
+# EOF → close → main.go の defer conn.Close())。親の node を先に落とせば
+# パイプが閉じ、切断が正しく Realm に届く。そこで
+#   1. node/tsx を //T 無しで止める     … サイドカーの stdin が閉じる
+#   2. サイドカーが自分で消えるのを待つ … ここで切断が届く
+#   3. 残ったときだけ //F で落とす      … 従来どおりの保険
+# の順で進める。//T を使うと node とサイドカーが同時に死に、EOF を
+# 渡す相手がいなくなるので付けない。
 #
 # `pnpm run start:bedrock` のコマンドラインは
 # `node .../pnpm.cjs run start:bedrock` になるので "tsx --env-file=..." を
 # 含まない。実測 2026-09-12、そうして残った2本が接続を握ったままで、
 # 新しい接続が "different device" で弾かれ続けた。名前で取りこぼさないよう、
 # コマンドラインで数えて始末する。
+killed_bot=0
 if command -v powershell >/dev/null 2>&1; then
   for stale in $(powershell -NoProfile -Command \
     "Get-CimInstance Win32_Process | Where-Object { \$_.Name -like 'node*' -and (\$_.CommandLine -like '*workflow/bedrock.ts*' -or \$_.CommandLine -like '*start:bedrock*') } | Select-Object -ExpandProperty ProcessId" \
     2>/dev/null | tr -d '\r'); do
     [ "$stale" = "${SELF_WIN:-}" ] && continue
     echo "[run] 残っていたボット(win=$stale)を止める"
-    taskkill //F //T //PID "$stale" >/dev/null 2>&1 || true
+    taskkill //F //PID "$stale" >/dev/null 2>&1 || true
+    killed_bot=1
   done
 fi
+pkill -f "tsx --env-file=.env src/workflow/bedrock.ts" >/dev/null 2>&1 || true
 pkill -f "start:bedrock" >/dev/null 2>&1 || true
+
+# サイドカーが自分で切断して消えるのを待つ。
+#
+# 実測、行儀よく閉じれば数秒で消える。それを待たずに次へ進むと、
+# 上で書いた "different device" に逆戻りする。
+sidecar_pids() {
+  if command -v powershell >/dev/null 2>&1; then
+    powershell -NoProfile -Command \
+      "Get-CimInstance Win32_Process | Where-Object { \$_.Name -like 'onj-bedrock*' } | Select-Object -ExpandProperty ProcessId" \
+      2>/dev/null | tr -d '\r'
+  fi
+}
+
+if [ -n "$(sidecar_pids)" ]; then
+  echo "[run] サイドカーが自分で切断するのを待つ"
+  for _ in $(seq 1 20); do
+    [ -z "$(sidecar_pids)" ] && break
+    sleep 1
+  done
+fi
+
+# それでも残るときだけ力ずくで落とす。
+#
+# この経路を通ったときは Realm 側に切断が届いていない。すぐ繋ぎ直しても
+# 弾かれるだけなので、セッションが切れるまで待ってから入る。実測、
+# 強制終了から入り直せたのは約40秒後だった。余裕を見て60秒置く。
+if [ -n "$(sidecar_pids)" ]; then
+  echo "[run] サイドカーが応じないので強制終了する" >&2
+  if command -v taskkill >/dev/null 2>&1; then
+    taskkill //IM onj-bedrock.exe //F >/dev/null 2>&1 || true
+  fi
+  pkill -f "onj-bedrock" >/dev/null 2>&1 || true
+  echo "[run] Realm 側のセッションが切れるまで60秒待つ" >&2
+  sleep 60
+elif [ "$killed_bot" = "1" ]; then
+  # 行儀よく閉じた場合でも、サーバーが後始末を終えるまでに少し間がある。
+  echo "[run] 切断の後始末に5秒置く"
+  sleep 5
+fi
 
 REJOIN_WAIT="${REJOIN_INTERVAL_MS:-120000}"
 REJOIN_SEC=$((REJOIN_WAIT / 1000))
