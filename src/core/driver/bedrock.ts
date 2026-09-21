@@ -1032,7 +1032,14 @@ export class BedrockDriver implements BotDriver {
 				break;
 			}
 		}
-		await this.sidecar.send("moveSlot", { names: [String(item.slot)], count: target });
+		try {
+			await this.sidecar.send("moveSlot", { names: [String(item.slot)], count: target });
+			// 通ったということは、この山の識別子は合っていた。ずれの記録を消す。
+			this.staleStackAt = 0;
+		} catch (e) {
+			this.noteStackRejection(e);
+			throw e;
+		}
 		await sleep(300);
 		await this.refresh();
 		return target;
@@ -1286,6 +1293,24 @@ export class BedrockDriver implements BotDriver {
 		return this.lastBedAckAt >= t0 ? "ack" : "none";
 	}
 
+	/**
+	 * 識別子のずれ(status=49)で拒まれた時刻。0 なら一度も拒まれていない。
+	 *
+	 * ずれは「実際に持ち物が変わる」まで直らないので、古い記録を見せ続けても
+	 * 嘘にはならない。ただし直ったあとも残ると、スキルが要らない後始末
+	 * (ブロックを置いて掘り戻す)を繰り返す。成功した操作で消す。
+	 */
+	private staleStackAt = 0;
+
+	/** 拒否の理由が識別子のずれなら控える。それ以外は触らない。 */
+	private noteStackRejection(err: unknown): void {
+		if (String(err).includes("status=49")) this.staleStackAt = Date.now();
+	}
+
+	stackIdsStale(): boolean {
+		return this.staleStackAt !== 0;
+	}
+
 	async eat(_signal: AbortSignal, item?: string): Promise<boolean> {
 		await this.refresh();
 		const names = this.inventory.items().map((i) => i.name);
@@ -1306,6 +1331,7 @@ export class BedrockDriver implements BotDriver {
 		} catch (e) {
 			// 黙って false を返すと「満腹度が上がらない」としか見えない。
 			// 実測 2026-09-21 08:16、本番で 0 秒で失敗が 3 連続し理由が分からなかった。
+			this.noteStackRejection(e);
 			console.log(`[eat] ${food} を持てなかった/食べられなかった: ${e}`);
 			return false;
 		}
@@ -1348,6 +1374,8 @@ export class BedrockDriver implements BotDriver {
 			// 分からないままのスタックを素材に使って弾かれる。
 			await sleep(700);
 		}
+		// 作れたなら素材の識別子は合っていた。サーバーも一覧を送り直している。
+		this.staleStackAt = 0;
 		await this.refresh();
 	}
 

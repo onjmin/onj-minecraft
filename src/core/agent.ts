@@ -4,7 +4,10 @@ import mineflayer, { type ControlState } from "mineflayer";
 import { goals, Movements, pathfinder } from "mineflayer-pathfinder";
 import type { AgentProfile } from "../profiles/types";
 import { BED_WOOL_COUNT, pickBedWool, totalWool } from "../skills/building/bed";
+import { collectStoneSkill, stoneScanner } from "../skills/collecting/stone";
+import { craftingManager as toolCraftingManager } from "../skills/crafting/tool";
 import { craftingManager } from "../skills/crafting/weapon";
+import { notBelowFeet } from "../skills/dig-guard";
 import { exploreLandSkill } from "../skills/exploring/land";
 import { gotoDeathPointSkill } from "../skills/goto/death";
 import { gainedSince, snapshotInventory, totalGain } from "../skills/inventory-delta";
@@ -32,9 +35,9 @@ import { SurvivalMetrics } from "./survival/metrics";
 import { ReflexLog } from "./survival/reflex-log";
 import {
 	BURIED_THICKNESS,
+	DAWN_HOSTILE_HOLD_TICK,
 	DEATH_STORM_LIMIT,
 	DEEP_UNDERGROUND_GAP,
-	DAWN_HOSTILE_HOLD_TICK,
 	HUNT_RANGE,
 	SHELTER_HEALTH,
 	type SurvivalActions,
@@ -2408,6 +2411,19 @@ export class MinecraftAgent {
 				// 「もう最高品質」と 12 回失敗していた(2026-09-21 02:08〜02:34)。盾は
 				// 統合版では鉄が要る。
 				return craftingManager.determineNextWeapon(this) !== null;
+			case "crafting.tool":
+				// 武器と同じ。作る物が無いときは載せない。石の道具を一式持った状態で
+				// 「もう最高品質」と 26 回失敗していた(2026-09-21 17:20〜17:40、run166)。
+				// 判定は本体と同じ determineNextSkill。handler が先に呼ぶ棒・板の確保は
+				// 原木→板材→棒の変換なので、ここの判定(板材+原木×4 で数える)を動かさない。
+				return toolCraftingManager.determineNextSkill(this.driver) !== null;
+			case collectStoneSkill.name: {
+				// 足元より下の石しか無いときは載せない。このスキルは下へ掘らないので
+				// (dig-guard)、載せても "Stone is only below your feet" で即失敗する。
+				// 実測 2026-09-21 run166、20分で 6 回中 6 回がこれ。石が要るなら崖か
+				// 洞窟まで歩くしかなく、それは exploring の仕事。
+				return notBelowFeet(this.driver, stoneScanner.findNearbyStone(this.driver)).length > 0;
+			}
 			case "building.bed": {
 				// 羊毛 3 枚(同色)かベッドを持っていないときは載せない。注記では止まらず、
 				// 羊毛 0 で選ばれた(2026-09-21 01:57)。作り方は SITUATION に書いてある。
@@ -4147,6 +4163,7 @@ export class MinecraftAgent {
 			craftableWeapon: planks + logs * 4 >= 6,
 			edible: pickFood(names),
 			cookable: pickCookable(names),
+			lastResortFood: names.includes("rotten_flesh"),
 			inventoryCount: items.length,
 			recentDeaths: this.countRecentDeaths(),
 			deathPoint: point ? { ...point } : null,
@@ -4305,8 +4322,7 @@ export class MinecraftAgent {
 				this.cappedLidAt.x === lidCell.x &&
 				this.cappedLidAt.y === lidCell.y &&
 				this.cappedLidAt.z === lidCell.z;
-			const lidded =
-				!!above && above.name !== "air" && (ownLid || !isTreeBlockName(above.name));
+			const lidded = !!above && above.name !== "air" && (ownLid || !isTreeBlockName(above.name));
 			if (this.resealRequested && Date.now() - this.lastSealAt > 15_000) {
 				// 削られた直後。蓋より先に横を塞ぐ(矢は横から来ている)。
 				this.resealRequested = false;

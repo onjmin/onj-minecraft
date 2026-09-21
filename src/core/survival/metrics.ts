@@ -42,6 +42,15 @@ export interface MetricsSummary {
 	meals: number;
 	foodRestored: number;
 	haveFoodRatio: number;
+	/**
+	 * 腐った肉しか持っていない時間も food に数えた割合。
+	 *
+	 * haveFoodRatio は pickFood が選ぶ物(=反射が自動で食べる物)だけを数える。
+	 * 腐肉はそこに入らないので、腐肉だけで夜を越えた時間が 0 と出ていた。
+	 * 「狩り→焼きの鎖が通っているか」は haveFoodRatio、「餓えて詰んでいるか」
+	 * は anyFoodRatio で見る。
+	 */
+	anyFoodRatio: number;
 	armedRatio: number;
 	inventoryRatio: number;
 	skillIdleRatio: number;
@@ -59,6 +68,7 @@ export class SurvivalMetrics {
 	private lastSampleAt = 0;
 	private totalMs = 0;
 	private haveFoodMs = 0;
+	private anyFoodMs = 0;
 	private armedMs = 0;
 	private inventoryMs = 0;
 	private idleMs = 0;
@@ -105,7 +115,9 @@ export class SurvivalMetrics {
 		if (dt <= 0) return;
 
 		this.totalMs += dt;
-		if (s.edible !== null || s.cookable !== null) this.haveFoodMs += dt;
+		const haveFood = s.edible !== null || s.cookable !== null;
+		if (haveFood) this.haveFoodMs += dt;
+		if (haveFood || s.lastResortFood) this.anyFoodMs += dt;
 		if (s.armed) this.armedMs += dt;
 		if (s.inventoryCount > 0) this.inventoryMs += dt;
 		// "(llm)" 付きは LLM が明示的に許した担当。時間の内訳には残すが、
@@ -188,6 +200,7 @@ export class SurvivalMetrics {
 			meals: this.meals,
 			foodRestored: this.foodRestored,
 			haveFoodRatio: ratio(this.haveFoodMs),
+			anyFoodRatio: ratio(this.anyFoodMs),
 			armedRatio: ratio(this.armedMs),
 			inventoryRatio: ratio(this.inventoryMs),
 			skillIdleRatio: ratio(this.idleMs),
@@ -213,7 +226,7 @@ export class SurvivalMetrics {
 			`死亡 ${m.deaths}(${m.deathsPerHour.toFixed(1)}/h`,
 			m.medianSurvivalMs !== null ? `間隔中央値 ${min(m.medianSurvivalMs)})` : "間隔 —)",
 			`食事 ${m.meals}`,
-			`食料保有 ${pct(m.haveFoodRatio)}`,
+			`食料保有 ${pct(m.haveFoodRatio)}(腐肉込み ${pct(m.anyFoodRatio)})`,
 			`武器保有 ${pct(m.armedRatio)}`,
 			`持ち物あり ${pct(m.inventoryRatio)}`,
 			`スキル可 ${pct(m.skillIdleRatio)}`,

@@ -11,6 +11,7 @@
  * item を省けば pickFood の優先順位で選ぶ(反射と同じ)。
  */
 import { NEVER_EAT, pickFood } from "../../core/driver/food";
+import { resyncStackIds } from "../crafting/util";
 import { createSkill, type SkillResponse, skillResult } from "../types";
 
 export const survivalEatSkill = createSkill<{ item?: string }, { item: string; hunger: number }>({
@@ -50,7 +51,20 @@ export const survivalEatSkill = createSkill<{ item?: string }, { item: string; h
 		if (before >= 20) {
 			return skillResult.fail("Hunger is already full (20/20); you cannot eat now.");
 		}
-		const ate = await driver.eat(signal, item);
+		let ate = await driver.eat(signal, item);
+		if (!ate && driver.stackIdsStale()) {
+			// 食べ物が持ち物の奥にあると、手に持つところで moveSlot を送る。拾った
+			// ばかりの山は識別子がずれていて status=49 で弾かれ、何度やっても同じ
+			// 理由で弾かれ続ける。持っている肉を一口も食べられないまま満腹度だけが
+			// 落ちる(実測 2026-09-21 run165、beef を2個持ったまま 33 回)。
+			// クラフトと同じ手で、ブロックを1個置いて一覧を取り直してからやり直す。
+			agent.log(`[survival.eat] 識別子のずれで持てなかった。取り直して ${item} を食べ直す`);
+			const undo = await resyncStackIds(agent, "survival.eat");
+			if (undo) {
+				ate = await driver.eat(signal, item);
+				await undo();
+			}
+		}
 		const after = driver.getState().food;
 		if (!ate || after <= before) {
 			return skillResult.fail(`Tried to eat ${item} but hunger stayed at ${before}.`);

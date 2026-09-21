@@ -54,6 +54,16 @@ export interface SurvivalSnapshot {
 	readonly edible: string | null;
 	/** 焼けば食べ物になる物の名前。無ければ null。 */
 	readonly cookable: string | null;
+	/**
+	 * 腐った肉を持っているか。
+	 *
+	 * pickFood は腐肉を選ばない(NEVER_EAT)ので edible には出ない。反射が
+	 * 勝手に食べないのはそのままでよいが、「食料をまったく持っていない」
+	 * と「腐肉だけはある」は別の状態で、後者は LLM が survival.eat で
+	 * 食べられる。指標がこれを 0 と数えていたため、腐肉を4個持って夜を
+	 * 越えた run でも食料保有 1% と出ていた(実測 2026-09-21 run165)。
+	 */
+	readonly lastResortFood: boolean;
 	readonly inventoryCount: number;
 
 	/** 直近の窓(既定10分)で死んだ回数。 */
@@ -112,6 +122,7 @@ export function describeSnapshot(s: SurvivalSnapshot): string {
 	];
 	if (s.edible) parts.push(`食料:${s.edible}`);
 	else if (s.cookable) parts.push(`生肉:${s.cookable}`);
+	else if (s.lastResortFood) parts.push("腐肉のみ");
 	else parts.push("食料なし");
 	if (s.sheltered) parts.push("潜伏中");
 	if (s.boxedIn) parts.push("四方塞がり");
@@ -149,6 +160,7 @@ export function emptySnapshot(over: Partial<SurvivalSnapshot> = {}): SurvivalSna
 		craftableWeapon: false,
 		edible: "cooked_beef",
 		cookable: null,
+		lastResortFood: false,
 		inventoryCount: 1,
 		recentDeaths: 0,
 		deathPoint: null,

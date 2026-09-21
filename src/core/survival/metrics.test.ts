@@ -5,6 +5,9 @@
  * 差し替えられるようにしてあるので、何時間ぶんでも一瞬で回せる。
  */
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { test } from "node:test";
 import { SurvivalMetrics } from "./metrics";
 import { emptySnapshot } from "./snapshot";
@@ -100,4 +103,58 @@ test("LLM が許した籠り(shelter(llm))は内訳に残るが、スキル可�
 	assert.equal(sum.controlMsByRule["shelter(llm)"], 10_000);
 	assert.equal(sum.controlMsByRule.shelter, 10_000);
 	assert.equal(sum.skillIdleRatio, 0.5);
+});
+
+test("死亡はその場で書き出される。定期報告を待たない", () => {
+	// 定期報告(reportIfDue)の間隔の途中で死んで落ちると、その区間が丸ごと
+	// 消える。しかも消えるのは「死んだ回」に偏るので、死亡数だけが抜けて
+	// 稼働時間は残り、死亡率が実際より低く出る。実測 2026-09-21、ログを
+	// grep した死亡は 30 件あるのに metrics-*.json の合計は 20 件だった。
+	const clock = fakeClock(1_000);
+	const savePath = path.join(os.tmpdir(), `metrics-death-save-${process.pid}-${Date.now()}.json`);
+	const m = new SurvivalMetrics({ savePath, now: clock.now });
+	try {
+		assert.equal(fs.existsSync(savePath), false, "まだ何も書かれていないはず");
+
+		m.noteDeath();
+
+		assert.equal(fs.existsSync(savePath), true, "死亡時に書き出されていない");
+		const saved = JSON.parse(fs.readFileSync(savePath, "utf8"));
+		assert.equal(saved.deaths, 1);
+	} finally {
+		if (fs.existsSync(savePath)) fs.unlinkSync(savePath);
+	}
+});
+
+test("腐った肉しか無い時間は、食料保有に入らず腐肉込みには入る", () => {
+	const clock = fakeClock();
+	const m = new SurvivalMetrics({ now: clock.now });
+	// pickFood は腐肉を選ばない(NEVER_EAT)ので edible は null のまま。
+	// これを「食料ゼロ」と数えていたため、腐肉で夜を越えた run でも
+	// 食料保有 1% と出ていた(実測 2026-09-21 run165)。
+	for (let i = 0; i < 60; i++) {
+		clock.advance(10_000);
+		m.noteTick(
+			emptySnapshot({ at: clock.now(), edible: null, cookable: null, lastResortFood: true }),
+			null,
+		);
+	}
+	const summary = m.summary();
+	assert.equal(summary.haveFoodRatio, 0);
+	assert.equal(summary.anyFoodRatio, 1);
+});
+
+test("何も持っていなければ、どちらの食料保有も 0", () => {
+	const clock = fakeClock();
+	const m = new SurvivalMetrics({ now: clock.now });
+	for (let i = 0; i < 60; i++) {
+		clock.advance(10_000);
+		m.noteTick(
+			emptySnapshot({ at: clock.now(), edible: null, cookable: null, lastResortFood: false }),
+			null,
+		);
+	}
+	const summary = m.summary();
+	assert.equal(summary.haveFoodRatio, 0);
+	assert.equal(summary.anyFoodRatio, 0);
 });

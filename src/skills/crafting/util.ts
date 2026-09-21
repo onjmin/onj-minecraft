@@ -270,15 +270,8 @@ async function tryCraft(
 		agent.log(`[${label}] クラフトが拒否された: ${itemName} x${count}: ${err}`);
 		if (!String(err).includes("status=49")) return false;
 	}
-	// FailedToValidateSrcSlot(49): 拾った直後で、素材の山の識別子をこちらが
-	// 知らない。統合版は拾っても持ち物の更新を送ってこず、閉じる・開く・
-	// 主張違いの持ち替えや取引で促しても返ってこない(実測 2026-09-19、
-	// 5通り全滅)。返ってくるのは**実際に持ち物が変わったあと**だけなので、
-	// 余っているブロックを1個置いて変化を起こし、一覧を取り直してから
-	// もう一度だけ作る。置いたものは作ったあとに掘り戻す(先に掘り戻すと
-	// 拾い直しでまた識別子が分からなくなる)。
-	const placed = await placeSpareBlock(agent, label);
-	if (!placed) return false;
+	const undo = await resyncStackIds(agent, label);
+	if (!undo) return false;
 	let ok = false;
 	try {
 		await agent.driver.craft(itemName, count, craftingTable);
@@ -286,15 +279,41 @@ async function tryCraft(
 	} catch (err) {
 		agent.log(`[${label}] 取り直しても拒否された: ${itemName} x${count}: ${err}`);
 	}
-	if (placed.recover) {
+	await undo();
+	return ok;
+}
+
+/**
+ * 識別子のずれ(status=49)から立ち直る。立ち直れたら「後始末」を返す。
+ *
+ * FailedToValidateSrcSlot(49): 拾った直後で、その山の識別子をこちらが
+ * 知らない。統合版は拾っても持ち物の更新を送ってこず、閉じる・開く・
+ * 主張違いの持ち替えや取引で促しても返ってこない(実測 2026-09-19、
+ * 5通り全滅)。返ってくるのは**実際に持ち物が変わったあと**だけなので、
+ * 余っているブロックを1個置いて変化を起こし、一覧を取り直す。
+ *
+ * 呼び出し側は、返ってきた後始末を**やり直しが終わってから**呼ぶこと。
+ * 先に掘り戻すと、拾い直しでまた識別子が分からなくなる。
+ *
+ * クラフトだけの話ではない。持ち替え(moveSlot)も同じ要求で送るので、
+ * 拾った肉を手に持てず、食事がまるごと通らないことがある(実測
+ * 2026-09-21 run165、"Tried to eat beef but hunger stayed at 16" が 33 回)。
+ */
+export async function resyncStackIds(
+	agent: MinecraftAgent,
+	label: string,
+): Promise<(() => Promise<void>) | null> {
+	const placed = await placeSpareBlock(agent, label);
+	if (!placed) return null;
+	return async () => {
+		if (!placed.recover) return;
 		try {
 			await agent.driver.dig(neverAbort(), placed.block.position);
 			await agent.driver.pickupNearbyItems(neverAbort());
 		} catch (err) {
 			agent.log(`[${label}] 置いたブロックを掘り戻せなかった: ${err}`);
 		}
-	}
-	return ok;
+	};
 }
 
 /** 素手で掘り戻せる順。cobblestone は素手だと落ちないので最後で、掘り戻さない。 */

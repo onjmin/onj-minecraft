@@ -339,6 +339,11 @@ export class JavaDriver implements BotDriver {
 		await this.agent.pickupNearbyItems(signal);
 	}
 
+	/** Java版に識別子のずれは無い。 */
+	stackIdsStale(): boolean {
+		return false;
+	}
+
 	async eat(_signal: AbortSignal, item?: string): Promise<boolean> {
 		const names = this.bot.inventory.items().map((i) => i.name);
 		const food = item ? (names.includes(item) ? item : null) : pickFood(names);
