@@ -2708,6 +2708,17 @@ func (s *session) dispatch(c command) {
 				s.reply(c.ID, false, "スロットは 0..35 です", nil)
 				return
 			}
+			// 拾った直後の持ち物は識別子が予測のままなので、先に取り直す。
+			// craft が同じ理由で呼んでいる(「拾った直後の持ち物は識別子が
+			// 予測のまま」の注記)。ItemStackRequest を組む前に要る。
+			//
+			// 実測 2026-09-22、この呼び出しが craft と attack にしか無く、
+			// wear と moveSlot が素通りしていた。結果、防具の着用は全ログ
+			// 通算で0件(run-178 の5分だけで leather_boots が 35 回、
+			// 全部 FailedToValidateSrcSlot(49))。食事も奥の枠から持ち替える
+			// ときに同じ 49 で落ち、腐肉を17個持ったまま満腹度13で死んでいる
+			// (run-180 00:47)。クラフトだけが通っていたのはこれがあったから。
+			s.resyncSlotsIfPredicted()
 			s.mu.Lock()
 			src, ok := s.rawSlots[from]
 			if !ok || src.Stack.Count == 0 {
@@ -2882,6 +2893,17 @@ func (s *session) dispatch(c command) {
 				s.reply(c.ID, false, "防具スロットは 0..3 です", nil)
 				return
 			}
+			// 拾った直後の持ち物は識別子が予測のままなので、先に取り直す。
+			// craft が同じ理由で呼んでいる(「拾った直後の持ち物は識別子が
+			// 予測のまま」の注記)。ItemStackRequest を組む前に要る。
+			//
+			// 実測 2026-09-22、この呼び出しが craft と attack にしか無く、
+			// wear と moveSlot が素通りしていた。結果、防具の着用は全ログ
+			// 通算で0件(run-178 の5分だけで leather_boots が 35 回、
+			// 全部 FailedToValidateSrcSlot(49))。食事も奥の枠から持ち替える
+			// ときに同じ 49 で落ち、腐肉を17個持ったまま満腹度13で死んでいる
+			// (run-180 00:47)。クラフトだけが通っていたのはこれがあったから。
+			s.resyncSlotsIfPredicted()
 			s.mu.Lock()
 			item, ok := s.rawSlots[fromSlot]
 			if !ok || item.Stack.Count == 0 {

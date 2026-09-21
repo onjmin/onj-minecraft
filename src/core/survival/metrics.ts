@@ -121,7 +121,13 @@ export class SurvivalMetrics {
 		if (s.armed) this.armedMs += dt;
 		if (s.inventoryCount > 0) this.inventoryMs += dt;
 		// "(llm)" 付きは LLM が明示的に許した担当。時間の内訳には残すが、
-		// 「コードが LLM から奪った時間」ではないので idle(スキル可)に数える。
+		// 「コードが LLM から奪った時間」ではないので idle に数える。
+		//
+		// この値は「スキルが走れた割合」ではない。shelter(llm) の間はスキルも
+		// 止まっている(agent.ts の reflexSurvival が decision.rule !== null で
+		// 返すため)。実測 2026-09-21、skillIdleRatio 0.66 を「3分の2は暇」と
+		// 読み違えた。実際にスキルが動けたのは controlMsByRule の合計を
+		// 稼働から引いた残りで、そのとき 39% だった。表示は「LLM可」。
 		if (controlledBy === null || controlledBy.endsWith("(llm)")) this.idleMs += dt;
 		if (controlledBy !== null) {
 			this.controlMs.set(controlledBy, (this.controlMs.get(controlledBy) ?? 0) + dt);
@@ -229,7 +235,7 @@ export class SurvivalMetrics {
 			`食料保有 ${pct(m.haveFoodRatio)}(腐肉込み ${pct(m.anyFoodRatio)})`,
 			`武器保有 ${pct(m.armedRatio)}`,
 			`持ち物あり ${pct(m.inventoryRatio)}`,
-			`スキル可 ${pct(m.skillIdleRatio)}`,
+			`LLM可 ${pct(m.skillIdleRatio)}`,
 			`空振り ${runs > 0 ? pct(emptyRuns / runs) : "—"}`,
 			`最長停滞 ${min(m.longestStallMs)}`,
 		].join(" ");

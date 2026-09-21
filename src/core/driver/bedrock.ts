@@ -1007,7 +1007,19 @@ export class BedrockDriver implements BotDriver {
 		if (!item) {
 			throw new Error(`${itemName} を持っていません`);
 		}
-		await this.sidecar.send("wear", { names: [String(item.slot)], count: armorSlot });
+		try {
+			await this.sidecar.send("wear", { names: [String(item.slot)], count: armorSlot });
+		} catch (e) {
+			// 何が着られなかったのかを残す。これが無いと「着用: が出ない」と
+			// しか見えない。実測 2026-09-21、run-165 で leather_boots を拾った
+			// 次の行から status=49 が 181 回続いたが、防具の話だと分かるまでに
+			// ログを4本読み直すことになった。識別子のずれは他所と同じ扱いにする。
+			this.noteStackRejection(e);
+			console.log(
+				`[wear] ${want} を着られなかった(持ち物スロット ${item.slot} -> 防具スロット ${armorSlot}): ${e}`,
+			);
+			throw e;
+		}
 		await sleep(300);
 		await this.refresh();
 		// 着せたものを控える。防具コンテナは読み返せないので、ここが唯一の記録。
@@ -1314,33 +1326,56 @@ export class BedrockDriver implements BotDriver {
 	async eat(_signal: AbortSignal, item?: string): Promise<boolean> {
 		await this.refresh();
 		const names = this.inventory.items().map((i) => i.name);
-		const food = item ? (names.includes(item) ? item : null) : pickFood(names);
-		if (!food) return false;
+		// 名前を指定されたら、それしか食べない。別の物に差し替えると、
+		// 呼び出し側(survival.eat)が「Ate chicken」と嘘を報告することになる。
+		//
+		// 指定が無いとき(反射)の約束は「安全な食べ物を1つ」なので、ここで
+		// 選び直してよい。ホットバーにある物を先に試す。奥の枠(9..35)から
+		// 食べるには moveSlot が要り、拾ったばかりの山は識別子のずれで
+		// status=49 に弾かれる。ホットバーなら持ち替えだけで食べられる。
+		// 実測 2026-09-21、骸骨に撃たれながら反射の eat が 49 で3連続空振り
+		// して死んでいる(run165 14:20)。
+		const candidates = item
+			? names.includes(item)
+				? [item]
+				: []
+			: [...new Set([pickFood(this.hotbarNames()), pickFood(names)])].filter(
+					(n): n is string => n !== null,
+				);
+		if (candidates.length === 0) return false;
 
 		const before = this.state.food;
-		try {
-			// 食べるのは手に持っているものなので、まず持ち替える。
-			await this.equip(food, "hand");
-			// 統合版の消費は「使い始め」と「使い終わり」の2段。サイドカー側で
-			// 両方を送って、食べ終わるまで待ってから返す。
-			const res = await this.sidecar.send("eat", {}, 10_000);
-			if (!res?.ok) {
-				console.log(`[eat] サイドカーが食事を拒否: ${res?.error ?? "理由なし"}`);
-				return false;
+		for (const food of candidates) {
+			try {
+				// 食べるのは手に持っているものなので、まず持ち替える。
+				await this.equip(food, "hand");
+				// 統合版の消費は「使い始め」と「使い終わり」の2段。サイドカー側で
+				// 両方を送って、食べ終わるまで待ってから返す。
+				const res = await this.sidecar.send("eat", {}, 10_000);
+				if (!res?.ok) {
+					console.log(`[eat] サイドカーが食事を拒否: ${res?.error ?? "理由なし"}`);
+					return false;
+				}
+			} catch (e) {
+				// 黙って false を返すと「満腹度が上がらない」としか見えない。
+				// 実測 2026-09-21 08:16、本番で 0 秒で失敗が 3 連続し理由が分からなかった。
+				this.noteStackRejection(e);
+				console.log(`[eat] ${food} を持てなかった/食べられなかった: ${e}`);
+				continue;
 			}
-		} catch (e) {
-			// 黙って false を返すと「満腹度が上がらない」としか見えない。
-			// 実測 2026-09-21 08:16、本番で 0 秒で失敗が 3 連続し理由が分からなかった。
-			this.noteStackRejection(e);
-			console.log(`[eat] ${food} を持てなかった/食べられなかった: ${e}`);
-			return false;
-		}
 
-		// 満腹度はサーバーから遅れて届く。増えていなければ食べられていない
-		// （満腹だった・持ち替えに失敗した）ので、成功を騙らない。
-		await sleep(500);
-		await this.refresh();
-		return this.state.food > before;
+			// 満腹度はサーバーから遅れて届く。増えていなければ食べられていない
+			// （満腹だった・持ち替えに失敗した）ので、成功を騙らない。
+			await sleep(500);
+			await this.refresh();
+			return this.state.food > before;
+		}
+		return false;
+	}
+
+	/** ホットバー(枠0..8)にある物の名前。持ち替えだけで手に持てる範囲。 */
+	private hotbarNames(): string[] {
+		return this.items.filter((i) => i.slot >= 0 && i.slot <= 8).map((i) => i.name);
 	}
 
 	async dropItem(itemName: string, count: number): Promise<void> {

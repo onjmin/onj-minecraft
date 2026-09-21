@@ -84,6 +84,27 @@ cap_fail=$(count "蓋を置けなかった")
 seals=$(count "横を .* マス塞いだ")
 hits_in_shelter=$(count "籠っているのに削られた")
 burrows=$(count "潜って身を隠す")
+redispatch_blocked=$(count "前提が消えたので投げ直さない")
+spun_out=$(count "回続けて空振り。投げ直さず考え直す")
+maintenance_failed=$(count "手入れでつまずいた")
+killed_by=$(count "にやられた")
+
+# 籠っている最中に死んだ回数。
+#
+# 籠りは稼働の半分を握る主戦略なので、「隠れているはずなのに死ぬ」割合が
+# そのまま戦略の質になる。蓋の枚数は安全の指標にならない。実測 2026-09-22
+# (run-150〜176)、やられた29件のうち8件(28%)が夜の籠りを握ったままで、
+# うち5件が骸骨(4件は death.attack.arrow)。当時は蓋46回に対し横塞ぎが
+# 5回しか走っておらず、矢は横から素通りしていた。
+#
+# ラッチの開閉はログの行順で追う。時刻では追えない(1本が日を跨ぐため)。
+shelter_deaths=$(awk '
+  FNR==1 { latched=0 }
+  /夜の籠りに入った/ { latched=1 }
+  /夜が明けた/ { latched=0 }
+  /にやられた/ { if (latched) n++ }
+  END { print n+0 }
+' $FILES)
 
 echo "=========================================="
 echo " 生存レポート  $RANGE_LABEL"
@@ -113,10 +134,40 @@ echo "蓋を置けた          : $caps"
 echo "蓋を置けなかった    : $cap_fail"
 echo "横を塞いだ          : $seals"
 echo "籠っているのに被弾  : $hits_in_shelter"
+if [ "$killed_by" -gt 0 ]; then
+  echo "籠ったまま死んだ    : $shelter_deaths / $killed_by ($((shelter_deaths * 100 / killed_by))%)"
+else
+  echo "籠ったまま死んだ    : $shelter_deaths / 0"
+fi
 echo
 echo "--- 接続 ---"
 echo "different device    : $dd"
 echo "異常終了して再接続  : $restarts"
+echo
+echo "--- 空振りと手入れ ---"
+# 前提が消えたのに投げ直そうとして止めた回数。
+#
+# 実行ループは currentTaskName を LLM を通さず秒間隔で再投入する。
+# 止める仕組みを入れたのが 2026-09-22。ここが増えているのは「無駄な実行を
+# 止められている」ということで、悪い数字ではない。逆に 0 のまま
+# "Already on the surface" や "Hunger is already full" が出ているなら、
+# 止める判定に漏れがある。
+# 止め方は2つある。前提で止める(実行前)と、空振りで止める(結果を見て)。
+#
+# 前者だけでは取りこぼす。実測 2026-09-22、goto.surface は
+# skillPrecondition が lastKnownDepth() を見るのにプローブが古いと null を
+# 返して素通りし、空振り 17/17(100%)に対して前提での停止が 0 回だった。
+# goto.coords に至っては前提のケース自体が無い(空振り 552/716)。
+echo "前提で止めた        : $redispatch_blocked"
+echo "空振り3連で止めた   : $spun_out"
+echo "  うち地表で goto   : $(count "Already on the surface")"
+echo "  うち満腹で eat    : $(count "Hunger is already full \(20/20\); you cannot")"
+echo "  うち動物なしで狩り: $(count "No animals found nearby")"
+# 手入れ(装備・着用・目印・寝床登録)の失敗。判断は続く。
+# 判断ごと落としていたのを 2026-09-22 に隔離した。
+echo "手入れの失敗        : $maintenance_failed"
+echo "防具を着られなかった: $(count "\[wear\]")"
+echo "防具を着られた      : $(count "着用:")"
 echo
 echo "--- その他 ---"
 echo "食事                : $meals"

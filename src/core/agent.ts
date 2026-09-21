@@ -143,8 +143,6 @@ const PLACEABLE_COVER = [
 	"mud",
 	"moss_block",
 ];
-/** 防具かどうかの判定に使う。 */
-const ARMOR_SUFFIXES = ["_helmet", "_chestplate", "_leggings", "_boots"];
 /**
  * 防具の部位と装備先。並びは driver.inventory.armor() が返す順（頭・胴・脚・足）
  * と一致させること。突き合わせに添字を使っている。
@@ -2402,6 +2400,24 @@ export class MinecraftAgent {
 		return notBelowFeet(this.driver, found).length > 0 ? "reachable" : "below";
 	}
 
+	/**
+	 * いま投げても無駄なら、その理由。投げてよいなら null。
+	 *
+	 * 前提判定は2系統ある。`skillIsWorthOffering` は一覧を絞る側、
+	 * `skillPrecondition` は理由の文面を出す側で、枝の持ち物が違う。
+	 * 例えば goto.surface の「地表にいる」は後者にしか無く、
+	 * collecting.pickup の「落ちている物が無い」は前者にしか無い。
+	 * 片方だけ見ると漏れる。断る側は必ずこれを使う。
+	 */
+	private skillBlockedReason(name: string): string | null {
+		return (
+			this.skillPrecondition(name) ??
+			(this.skillIsWorthOffering(name)
+				? null
+				: "its target is not present right now (nothing to act on)")
+		);
+	}
+
 	private skillIsWorthOffering(name: string): boolean {
 		switch (name) {
 			case gotoDeathPointSkill.name:
@@ -2413,6 +2429,19 @@ export class MinecraftAgent {
 			case "collecting.pickup":
 				// 落ちている物が無いときは載せない。対象そのものが無い。
 				return this.driver.nearbyEntities(24).some((e) => e.kind === "item");
+			case "collecting.hunting":
+				// 動物がいないときは載せない。pickup と同じで、対象そのものが無い。
+				//
+				// 前提判定(skillPrecondition)には「32 ブロック以内に動物がいない」が
+				// 最初からあるのに、一覧を絞っているのはこちらの関数なので効いて
+				// いなかった。上の「いま成立しないものは見せない」の注記が挙げて
+				// いる「動物がいないのに 20 回選ばれた」がそのまま残っている。
+				// 実測 2026-09-22 集計(run-150〜176)、狩りの失敗 72 件のうち
+				// 63 件(88%)が "No animals found nearby to hunt."。
+				//
+				// 深さ(地下にいる)の方は載せたままにする。あちらは「地上へ出れば
+				// 狩れる」という情報で、消すと行き先の手掛かりごと消える。
+				return this.driver.nearbyEntities(HUNT_RANGE).some((e) => PREY_NAMES.has(e.name));
 			case "collecting.stealing":
 				// チェストが無いときは載せない(実測 2026-09-20 23:56、無いのに3連続で選んだ)。
 				return this.driver.world.findBlock(["chest", "barrel", "trapped_chest"], 16) !== null;
@@ -2572,6 +2601,39 @@ export class MinecraftAgent {
 						continue;
 					}
 
+					// 前提が消えたものを投げ直さない。
+					//
+					// このループは LLM を通さずに currentTaskName を再投入する。
+					// 選んだ時点では正当でも、1回走った結果それが崩れると、
+					// その後は失敗するだけの実行を秒間隔で繰り返す。実測
+					// 2026-09-22 00:33:53〜57、腐肉を食べて満腹度が 20 になった
+					// 2 秒後に同じ引数で再実行し "Hunger is already full (20/20)"
+					// で失敗している。LLM 側のゲート(選択を断る箇所)を直しても、
+					// そちらを通らないのでここには効かない。
+					//
+					// 空振り(empty)の主因もこれ。goto.surface は「地表にいる」を
+					// skillPrecondition が持っているのに再投入され、99 回中 75 回が
+					// "Already on the surface" で何も変えていない。goto.coords は
+					// 152 回中 113 回。
+					//
+					// 2系統あるので両方見る。skillIsWorthOffering は一覧を絞る側で
+					// goto.surface の枝を持たず、skillPrecondition は理由を出す側で
+					// collecting.hunting の深さ判定を持つ。片方だけでは漏れる。
+					const blockedReason = this.skillBlockedReason(skill.name);
+					if (blockedReason) {
+						this.log(`[実行] ${skill.name} の前提が消えたので投げ直さない: ${blockedReason}`);
+						this.pushHistory({
+							action: skill.name,
+							rationale: "(repeat dispatch)",
+							result: "Fail",
+							message: `Stopped repeating it: ${blockedReason}. Pick another skill.`,
+						});
+						this.currentTaskName = "idle";
+						this.requestImmediateThink();
+						await new Promise((r) => setTimeout(r, 500));
+						continue;
+					}
+
 					let result: SkillResponse | undefined;
 
 					const args = this.currentSkillArgs[skill.name] || {};
@@ -2635,6 +2697,8 @@ export class MinecraftAgent {
 						this.currentExecutionStartedAt = 0;
 					}
 					this.log(`${skill.name} end`);
+					// 3回続けて何も変わらなかったか。投げ直しを止める判断に使う。
+					let spunOut = false;
 					{
 						const gained = gainedSince(this.driver, inventoryBefore);
 						const to = this.driver.getState().position;
@@ -2667,6 +2731,7 @@ export class MinecraftAgent {
 								this.noteStall(
 									`${skill.name} reports success but nothing changed ${times} times in a row (no items gained, no movement).`,
 								);
+								spunOut = true;
 							}
 						} else if (changed) {
 							this.emptyRuns.set(skill.name, 0);
@@ -2707,6 +2772,29 @@ export class MinecraftAgent {
 						result: result.success ? "Success" : "Fail",
 						message: result.summary,
 					});
+					// 空振りが続いたら、投げ直すのをやめて考え直させる。
+					//
+					// 失敗は上で requestImmediateThink しているのに、空振り
+					// (成功を返したが世界が変わらない)は noteStall で知らせるだけで、
+					// ループは同じものを秒間隔で投げ直し続けていた。LLM が選んだのは
+					// 1回で、繰り返しはループの都合なので、ここで止めてよい。
+					//
+					// 前提判定によるガードでは届かない。実測 2026-09-22、
+					// goto.surface は skillPrecondition が lastKnownDepth() を見るが、
+					// プローブが無い/古いと null を返して `=== 0` が偽になり素通りする。
+					// スキル本体は自前で判定して "Already on the surface" と言うので、
+					// 両者が食い違う。run-181/182 では空振り 17/17(100%)に対して
+					// ガードの発火が 0 回だった。結果を見て止める方が取りこぼさない。
+					//
+					// 行き先を選ぶのは LLM のまま。ここは「新しい入力なしに同じ
+					// 何もしない実行を繰り返さない」だけで、選択を拒否はしない。
+					// スキルの戻り文(「同じ座標をまた指しても何も起きない」)が
+					// 履歴に載っているので、判断の材料はそろっている。
+					if (spunOut) {
+						this.log(`[実行] ${skill.name} が ${SPIN_LIMIT} 回続けて空振り。投げ直さず考え直す`);
+						this.currentTaskName = "idle";
+						this.requestImmediateThink();
+					}
 					// 同じスキルが失敗し続けるなら、間隔を倍々に広げる(2s→4s→…→20s)。
 					// 次の思考が来るまで3秒おきに同じ失敗を繰り返していた(実測
 					// 2026-09-19 夜、secure_food が49回連続)。判断ではなく、同じ入力で
@@ -3429,18 +3517,27 @@ export class MinecraftAgent {
 			}
 		}
 
-		if (
-			foundSkillName &&
-			this.skills.has(foundSkillName) &&
-			!this.skillIsWorthOffering(foundSkillName) &&
-			this.currentTaskName !== foundSkillName
-		) {
+		const pickBlockedReason =
+			foundSkillName && this.skills.has(foundSkillName)
+				? this.skillBlockedReason(foundSkillName)
+				: null;
+		if (foundSkillName && pickBlockedReason) {
 			// 候補から外したスキルでも、LLM は SITUATION や履歴から名前を拾って
 			// 選ぶ(実測 2026-09-21 09:14、満腹 20/20 で survival.eat を 10 秒に 3 回)。
 			// 走らせても即失敗するだけなので、理由を履歴に載せて返す。
-			const reason =
-				this.skillPrecondition(foundSkillName) ??
-				"its target is not present right now (nothing to act on)";
+			//
+			// 「担当中のものは通す」(currentTaskName !== foundSkillName)は外した。
+			// 1回目で currentTaskName になった後は選び直すたびにここを素通りし、
+			// この注記が狙っていた「10 秒に 3 回」がそのまま通っていた。実測
+			// 2026-09-22 集計(run-160〜174)、前提で弾けたのが 82 回に対し、
+			// すり抜けて実行され "Hunger is already full (20/20); you cannot eat
+			// now." で失敗したのが 42 回。12:25:18/22/27 のように数秒間隔で並ぶ。
+			//
+			// ここで返しても実行中のものは止まらない(currentTaskName を触らずに
+			// return するだけ)。止めるのではなく、選び直しを断るだけの場所。
+			// 実行ループ側のガードと同じ判定にする。ずれていると、片方が弾いて
+			// もう片方が通すので「弾く→即再考→また同じものを選ぶ」で往復する。
+			const reason = pickBlockedReason;
 			this.log(`[思考] いま成立しない ${foundSkillName} を選んだ: ${reason}`);
 			this.pushHistory({
 				action: foundSkillName,
@@ -4015,6 +4112,8 @@ export class MinecraftAgent {
 	private lastLoggedLight: number | null | undefined = undefined;
 	/** 最後にログへ出した持ち物。変わったときだけ出す。 */
 	private lastLoggedInventory = "";
+	/** 手入れで最後に出た失敗。同じ文面を毎tick書かないための控え。 */
+	private lastMaintenanceError = "";
 	/** 直前に書いた時刻。値が細かく揺れても書き続けないようにする。 */
 	private lastLightLogAt = 0;
 
@@ -4085,12 +4184,29 @@ export class MinecraftAgent {
 		try {
 			this.noteDarkness();
 			this.noteInventory();
-			await this.wearBestArmor();
-			await this.equipBestWeapon();
-			// 見かけた建物を控える。地上に出たとき、向かう先として使う。
-			await this.noteLandmarksNearby();
-			// 昼のうちにベッドを叩いてリスポーン地点を移しておく。
-			await this.registerSpawnAtBed(signal);
+			// 手入れの失敗で判断を落とさない。
+			//
+			// wearBestArmor が status=49 を投げると下の catch まで飛び、
+			// arbiter.tick も metrics.noteTick も走らないまま tick が終わる。
+			// 実測 2026-09-21、run-165 で leather_boots を拾った次の行から
+			// 181 回連続でこれが起き、その間の生存判断と計測が丸ごと欠けていた
+			// (4本のログで計222回、全部 status=49)。上半分は拒否権を持たない
+			// 約束なので、ここで握り潰して判断へ進む。
+			try {
+				await this.wearBestArmor();
+				await this.equipBestWeapon();
+				// 見かけた建物を控える。地上に出たとき、向かう先として使う。
+				await this.noteLandmarksNearby();
+				// 昼のうちにベッドを叩いてリスポーン地点を移しておく。
+				await this.registerSpawnAtBed(signal);
+			} catch (e) {
+				// 毎tick同じ理由で落ちるので、文面が変わったときだけ書く。
+				const msg = String(e);
+				if (!signal.aborted && msg !== this.lastMaintenanceError) {
+					this.lastMaintenanceError = msg;
+					this.log(`[反射] 手入れでつまずいた(判断は続ける): ${msg}`);
+				}
+			}
 			// 待たせず自分から動く。await しない: LLM 呼び出しを含むので、
 			// ここで待つと反射ループそのものが詰まる。
 			this.maybeGreetNearbyPlayer();
@@ -4103,7 +4219,16 @@ export class MinecraftAgent {
 			this.survivalHolding = decision.rule !== null;
 			// 籠りが手放した理由を残す。「前提が消えた」だけでは直せない。
 			if (decision.kind === "release" && decision.released === "shelter") {
-				this.log(`[反射] shelter が手放した理由: ${shelterBlocker(snapshot) ?? "(none)"}`);
+				// 敵の頭数も一緒に書く。籠りを解いた直後の死は「手放した理由」
+				// だけでは追えない。実測 2026-09-22 02:03、夜を越えた直後に
+				// 矢で死んだが、夜明けの敵保留が外れたのが至近(半径6)に
+				// 数えなかったせいだと、ログからは証明できなかった。
+				this.log(
+					`[反射] shelter が手放した理由: ${shelterBlocker(snapshot) ?? "(none)"}` +
+						`（敵 近傍12=${snapshot.hostilesNear} 至近6=${snapshot.hostilesClose}` +
+						`、武器${snapshot.armed ? "あり" : "なし"} 防具${snapshot.armored ? "あり" : "なし"}` +
+						`、時刻${snapshot.timeOfDay % 24000}）`,
+				);
 			}
 			// 反射が失敗して手放したなら、待たずに考え直させる。理由は
 			// reflexLog に入っていて、次のプロンプトに載る。
@@ -4154,11 +4279,25 @@ export class MinecraftAgent {
 				(i) => i.name.endsWith("_log") || i.name.endsWith("_stem") || i.name.endsWith("_wood"),
 			)
 			.reduce((sum, i) => sum + i.count, 0);
-		// 着ている防具は items() に出てこない。持ち物だけを見ると、
-		// フル装備でも「丸腰」と判定されて毎晩潜ることになる。
-		const armored =
-			this.driver.inventory.armor().some((i) => i !== null) ||
-			names.some((n) => ARMOR_SUFFIXES.some((suf) => n.endsWith(suf)));
+		// 「着ている」だけを armored とする。持っているだけでは数えない。
+		//
+		// items() に持っている防具を足していたので、革のブーツを1個拾った
+		// だけで armored が真になり、equipped() も真になっていた。すると
+		// shelterBlocker の「armed and armored, unhurt」が成立し、夜の籠りが
+		// 解除される。実質は無防備なので、そのまま歩いて殺される。
+		//
+		// 実測 2026-09-22 00:47:18(run-180)、stone_sword と leather_boots を
+		// 持ち物に入れたまま、時刻 19223(夜)に探索を続けてゾンビに殺された。
+		// 拾ったチェストの中身(原木64x4・丸石ほか)を全部落とした。
+		// run-165 でも leather_boots を33分持ち歩いて一度も着ず、矢で死んでいる。
+		//
+		// これで armored は当面ずっと偽になる(着用は status=49 で通らない、
+		// bedrock-equipped-gate-is-armor 参照)。つまり夜は必ず籠る。それでよい。
+		// 籠って何もしない夜は時間を失うだけだが、無防備で歩く夜は積んだ物を
+		// 全部失う。昼は変わらない(shelterBlocker は昼、無傷なら担当しない)。
+		//
+		// 着ている防具は items() に出てこないので、armor() が唯一の手掛かり。
+		const armored = this.driver.inventory.armor().some((i) => i !== null);
 		const point = this.getDeathPoint();
 		return {
 			at: Date.now(),
@@ -4307,10 +4446,8 @@ export class MinecraftAgent {
 
 	/** 剣と防具が揃っているか。snapshot の armed && armored と同じ判定。 */
 	private isEquippedNow(): boolean {
-		const names = this.driver.inventory.items().map((i) => i.name);
-		const armored =
-			this.driver.inventory.armor().some((i) => i !== null) ||
-			names.some((n) => ARMOR_SUFFIXES.some((suf) => n.endsWith(suf)));
+		// armored の定義は buildSurvivalSnapshot と同じ。持っているだけでは数えない。
+		const armored = this.driver.inventory.armor().some((i) => i !== null);
 		return this.hasWeapon() && armored;
 	}
 
@@ -4340,7 +4477,28 @@ export class MinecraftAgent {
 				this.cappedLidAt.y === lidCell.y &&
 				this.cappedLidAt.z === lidCell.z;
 			const lidded = !!above && above.name !== "air" && (ownLid || !isTreeBlockName(above.name));
-			if (this.resealRequested && Date.now() - this.lastSealAt > 15_000) {
+			// 横が開いているなら、削られる前に塞ぐ。
+			//
+			// isSheltered は蓋が1枚あれば true を返し、四方を一度も見ない
+			// (上の「蓋がある。これが本来の潜れた形」の分岐)。そのため
+			// 「潜れた」状態のまま横が開きっぱなしになる。矢は横から来るので
+			// 蓋では止まらない。実測 2026-09-21、死亡29件のうち8件が夜の籠りを
+			// 握ったままで、うち5件が骸骨(4件は death.attack.arrow)。
+			// 「籠っているのに削られた」は25回。それに対して横塞ぎは5回しか
+			// 走っていない(蓋は46回)。resealRequested、つまり削られた後にしか
+			// 呼んでいなかったため。
+			//
+			// 読めない(null)マスは開いているとみなさない。掘る理由にしないのと
+			// 同じ扱い。水と溶岩は sealSides 側が置かずに飛ばすので、ここで
+			// 数えると 15 秒ごとに空振りし続ける(水際の籠りは実測で53回ある)。
+			const sidesOpen = BOX_DIRECTIONS.some((d) =>
+				[foot.y, foot.y + 1].some((y) => {
+					const b = this.driver.world.blockAt({ x: foot.x + d.x, y, z: foot.z + d.z });
+					if (!b || b.solid) return false;
+					return b.name !== "water" && b.name !== "flowing_water" && b.name !== "lava";
+				}),
+			);
+			if ((this.resealRequested || sidesOpen) && Date.now() - this.lastSealAt > 15_000) {
 				// 削られた直後。蓋より先に横を塞ぐ(矢は横から来ている)。
 				this.resealRequested = false;
 				this.lastSealAt = Date.now();
@@ -4492,7 +4650,15 @@ export class MinecraftAgent {
 			const f = this.driver.world.blockAt({ x: foot.x + dx, y: foot.y, z: foot.z + dz });
 			const h = this.driver.world.blockAt({ x: foot.x + dx, y: foot.y + 1, z: foot.z + dz });
 			if (f === null || h === null) return true;
-			return f.name === "air" && h.name === "air";
+			// 通れるかは .solid で見る。name === "air" だと、水・海草・シダ・ツタ・
+			// 積雪の上に立っているだけで「四方塞がり」に化ける。同じファイルの
+			// isSheltered / sealSides / hasRoof / burrow は全部 .solid なので、
+			// ここだけ基準が違っていた。
+			//
+			// 実測 2026-09-21(run-165〜171)、escape_boxed_in が掘った先に
+			// seagrass 6 / fern 2 / large_fern 1 / brown_mushroom 2 = 11件の
+			// 通れるブロックが混ざっていた。塞がれてなどいなかった。
+			return !f.solid && !h.solid;
 		};
 		return !BOX_DIRECTIONS.some((d) => open(d.x, d.z));
 	}
@@ -5780,6 +5946,24 @@ export class MinecraftAgent {
 			const current = worn[i];
 			if (current && armorRank(current.name) <= armorRank(best.name)) continue;
 
+			// 失敗は上(reflexSurvival の手入れ枠)で握り潰される。品名と
+			// スロットは bedrock.ts の wear 側がログに出す。
+			//
+			// ここで resyncStackIds による取り直し+再試行を試したが、効かない
+			// (2026-09-22 run-179 で差し戻した)。ブロックの設置自体は成功して
+			// いるのに、着せ直しは同じ status=49 で弾かれる:
+			//
+			//   [wear] leather_boots ... (持ち物スロット 10 -> 防具スロット 3): status=49
+			//   [wearBestArmor] 識別子を取り直すため dirt を1個置く
+			//   [tryPlaceBlock] SUCCESS
+			//   [wear] leather_boots ... : status=49        ← 変わらない
+			//
+			// 49 は FailedToValidateSrcSlot で、引くのはサイドカー側の
+			// rawSlots[slot].StackNetworkID(session.go の wear ハンドラ)。
+			// JS 側の一覧を取り直しても、そちらは変わらない。クラフトと
+			// survival.eat で効くのは、あちらが JS 側の写しを使うため。
+			// 直すならサイドカー側。効かないと分かったまま置いておくと、
+			// 60 秒ごとにブロックを置いては掘るだけになる。
 			await this.driver.equip(best.name, destination as any);
 		}
 	}
@@ -5836,7 +6020,15 @@ export class MinecraftAgent {
 			const h = driver.world.blockAt({ x: foot.x + dx, y: foot.y + 1, z: foot.z + dz });
 			// 未取得(null)は「塞がれている」と決めつけない。掘る理由にしない。
 			if (f === null || h === null) return true;
-			return f.name === "air" && h.name === "air";
+			// 通れるかは .solid で見る。name === "air" だと、水・海草・シダ・ツタ・
+			// 積雪の上に立っているだけで「四方塞がり」に化ける。同じファイルの
+			// isSheltered / sealSides / hasRoof / burrow は全部 .solid なので、
+			// ここだけ基準が違っていた。
+			//
+			// 実測 2026-09-21(run-165〜171)、escape_boxed_in が掘った先に
+			// seagrass 6 / fern 2 / large_fern 1 / brown_mushroom 2 = 11件の
+			// 通れるブロックが混ざっていた。塞がれてなどいなかった。
+			return !f.solid && !h.solid;
 		};
 
 		if (dirs.some((d) => open(d.x, d.z))) return;
@@ -5864,7 +6056,7 @@ export class MinecraftAgent {
 				// 頭の高さも空けないと通れない。
 				const head = { ...target, y: target.y + 1 };
 				const above = driver.world.blockAt(head);
-				if (above && above.name !== "air" && above.diggable) {
+				if (above?.solid && above.diggable) {
 					await driver.dig(signal, head);
 				}
 				return;
