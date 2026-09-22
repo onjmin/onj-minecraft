@@ -76,6 +76,10 @@ var undiggableBlocks = map[string]bool{
 	"bedrock": true, "barrier": true, "command_block": true,
 	"structure_block": true, "end_portal_frame": true, "obsidian": true,
 	"water": true, "flowing_water": true, "lava": true, "flowing_lava": true,
+	// ユーティリティ・インベントリ関連（破壊するとアイテムが散乱するか、拠点が機能不全になるためパスファインダーでの破壊を禁止）
+	"chest": true, "barrel": true, "trapped_chest": true, "ender_chest": true,
+	"furnace": true, "lit_furnace": true, "crafting_table": true, "bed": true,
+	"smoker": true, "lit_smoker": true, "blast_furnace": true, "lit_blast_furnace": true,
 }
 
 func (w *world) passable(p blockPos) bool {
