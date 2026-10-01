@@ -72,6 +72,16 @@ n_files=$(echo "$FILES" | wc -l | tr -d ' ')
 t_start=$(grep -oE "^\[[0-9]{2}:[0-9]{2}:[0-9]{2}\]" "$first" 2>/dev/null | head -1 | tr -d '[]')
 t_end=$(grep -oE "^\[[0-9]{2}:[0-9]{2}:[0-9]{2}\]" "$last" 2>/dev/null | tail -1 | tr -d '[]')
 
+# 自分の名前をログから引く。
+#
+# 通知は他人の死も同じ行形式で流れる。実測 2026-09-22(run-173〜184)、
+# 「にやられた」15件のうち2件は puyuyu2463 と MortalFir1257 のもので、
+# それが籠りの評価(籠ったまま死んだ 7/15)にそのまま乗っていた。母数にも
+# 分子にも他人が混ざるので、籠り戦略の良し悪しが人の出入りで動いてしまう。
+# 名前は各ログの「接続アカウント: X」から引く(検証は kusabot2361 側)。
+SELF=$(grep -hoE "接続アカウント: [^。]+" $FILES 2>/dev/null | head -1 | sed 's/.*: //')
+SELF="${SELF:-kusabot2361}"
+
 # 件数を数える。パターンは行単位。
 count() { grep -hcE "$1" $FILES 2>/dev/null | awk '{s+=$1} END {print s+0}'; }
 
@@ -87,7 +97,7 @@ burrows=$(count "潜って身を隠す")
 redispatch_blocked=$(count "前提が消えたので投げ直さない")
 spun_out=$(count "回続けて空振り。投げ直さず考え直す")
 maintenance_failed=$(count "手入れでつまずいた")
-killed_by=$(count "にやられた")
+killed_by=$(count "$SELF が .* にやられた")
 
 # 籠っている最中に死んだ回数。
 #
@@ -98,11 +108,11 @@ killed_by=$(count "にやられた")
 # 5回しか走っておらず、矢は横から素通りしていた。
 #
 # ラッチの開閉はログの行順で追う。時刻では追えない(1本が日を跨ぐため)。
-shelter_deaths=$(awk '
+shelter_deaths=$(awk -v self="$SELF" '
   FNR==1 { latched=0 }
   /夜の籠りに入った/ { latched=1 }
   /夜が明けた/ { latched=0 }
-  /にやられた/ { if (latched) n++ }
+  $0 ~ self " が " && /にやられた/ { if (latched) n++ }
   END { print n+0 }
 ' $FILES)
 
@@ -122,7 +132,7 @@ if [ "$deaths" -gt 0 ]; then
     | awk '{printf "  %-34s %s\n", $2, $1}'
   echo
   echo "やられた相手(通知から):"
-  grep -h "にやられた" $FILES \
+  grep -h "$SELF が .* にやられた" $FILES \
     | sed 's/.*が %entity\.\(.*\)\.name にやられた.*/\1/' \
     | sort | uniq -c | sort -rn \
     | awk '{printf "  %-34s %s\n", $2, $1}'

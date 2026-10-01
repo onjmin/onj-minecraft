@@ -14,9 +14,9 @@
  *
  * 実行:
  *   REALM_INVITE=https://realms.gg/xxxx npx tsx --env-file=.env \
- *     src/core/driver/bedrock-realm-chat-test.ts
+ *     src/core/driver/probes/bedrock-realm-chat-test.ts
  */
-import { BedrockDriver } from "./bedrock";
+import { BedrockDriver } from "../bedrock";
 
 const INVITE = process.env.REALM_INVITE ?? "";
 /** 送信を何回試すか。1回だけだと見落としと不着の区別がつかない。 */

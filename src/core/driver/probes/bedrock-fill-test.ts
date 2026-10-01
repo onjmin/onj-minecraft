@@ -5,10 +5,10 @@
  * 「石が無い」と言い続けた。石室(数列 x 21層)の fill は写しに届いていた
  * (写しの天井=stone)ので、広い一層の書き換えだけが落ちている疑い。
  *
- * 実行: npx tsx src/core/driver/bedrock-fill-test.ts
+ * 実行: npx tsx src/core/driver/probes/bedrock-fill-test.ts
  */
 import { execFileSync } from "node:child_process";
-import { BedrockDriver } from "./bedrock";
+import { BedrockDriver } from "../bedrock";
 
 const ADDRESS = process.env.BEDROCK_ADDRESS ?? "127.0.0.1:19132";
 const VIA_WSL = (process.env.BEDROCK_WSL ?? (process.platform === "win32" ? "1" : "0")) === "1";

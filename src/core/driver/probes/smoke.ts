@@ -9,24 +9,24 @@
  * mineflayer の Bot を実際には作らないため、JavaDriver には
  * ダミーの agent を渡している。メソッドの「存在」だけを見る。
  */
-import { buildingBaseSkill } from "../../skills/building/base";
-import { collectDirtSkill } from "../../skills/collecting/dirt";
-import { huntAnimalsSkill } from "../../skills/collecting/hunting";
-import { mineOresSkill } from "../../skills/collecting/mining";
-import { stealFromChestSkill } from "../../skills/collecting/stealing";
-import { collectStoneSkill } from "../../skills/collecting/stone";
-import { collectWoodSkill } from "../../skills/collecting/wood";
-import { craftSmeltingSkill } from "../../skills/crafting/smelting";
-import { craftToolSkill } from "../../skills/crafting/tool";
-import { craftTorchSkill } from "../../skills/crafting/torch";
-import { craftWeaponSkill } from "../../skills/crafting/weapon";
-import { exploreLandSkill } from "../../skills/exploring/land";
-import { gotoBaseSkill } from "../../skills/goto/base";
-import { gotoCoordsSkill } from "../../skills/goto/coords";
-import { gotoPlayerSkill } from "../../skills/goto/player";
-import { gotoSurfaceSkill } from "../../skills/goto/surface";
-import { JavaDriver } from "./java";
-import type { BotDriver } from "./types";
+import { buildingBaseSkill } from "../../../skills/building/base";
+import { collectDirtSkill } from "../../../skills/collecting/dirt";
+import { huntAnimalsSkill } from "../../../skills/collecting/hunting";
+import { mineOresSkill } from "../../../skills/collecting/mining";
+import { stealFromChestSkill } from "../../../skills/collecting/stealing";
+import { collectStoneSkill } from "../../../skills/collecting/stone";
+import { collectWoodSkill } from "../../../skills/collecting/wood";
+import { craftSmeltingSkill } from "../../../skills/crafting/smelting";
+import { craftToolSkill } from "../../../skills/crafting/tool";
+import { craftTorchSkill } from "../../../skills/crafting/torch";
+import { craftWeaponSkill } from "../../../skills/crafting/weapon";
+import { exploreLandSkill } from "../../../skills/exploring/land";
+import { gotoBaseSkill } from "../../../skills/goto/base";
+import { gotoCoordsSkill } from "../../../skills/goto/coords";
+import { gotoPlayerSkill } from "../../../skills/goto/player";
+import { gotoSurfaceSkill } from "../../../skills/goto/surface";
+import { JavaDriver } from "../java";
+import type { BotDriver } from "../types";
 
 const allSkills = [
 	huntAnimalsSkill,

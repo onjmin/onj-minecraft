@@ -12,13 +12,13 @@
  *
  * 実行(ローカル専用):
  *   docker compose -f docker-compose.bedrock-dev.yml up -d
- *   npx tsx src/core/driver/bedrock-hunt-check.ts
+ *   npx tsx src/core/driver/probes/bedrock-hunt-check.ts
  *   # 別の端末から、下に出る POS の座標へ牛を湧かせる:
  *   #   docker exec onj-bedrock-dev send-command "summon cow <x> <y> <z>"
  *
  * 本番 Realm には繋がない(接続先はローカル固定)。
  */
-import { BedrockDriver } from "./bedrock";
+import { BedrockDriver } from "../bedrock";
 
 const ADDRESS = process.env.BEDROCK_ADDRESS ?? "127.0.0.1:19132";
 const VIA_WSL = (process.env.BEDROCK_WSL ?? (process.platform === "win32" ? "1" : "0")) === "1";

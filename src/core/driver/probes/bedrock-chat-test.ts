@@ -13,9 +13,9 @@
  *
  * 実行(WSL の Docker で開発サーバーを起動してから):
  *   docker compose -f docker-compose.bedrock-dev.yml up -d
- *   npx tsx src/core/driver/bedrock-chat-test.ts
+ *   npx tsx src/core/driver/probes/bedrock-chat-test.ts
  */
-import { BedrockDriver } from "./bedrock";
+import { BedrockDriver } from "../bedrock";
 
 const ADDRESS = process.env.BEDROCK_ADDRESS ?? "127.0.0.1:19132";
 // Windows から WSL の Docker へは UDP が転送されないため、既定で WSL 経由にする。

@@ -6,11 +6,11 @@
  * DISABLE_AUTONOMY=1 でループを止めた上で各スキルを順に直接呼ぶ。
  *
  * 実行(Java版):
- *   DISABLE_AUTONOMY=1 npx tsx src/core/driver/skillcheck.ts
+ *   DISABLE_AUTONOMY=1 npx tsx src/core/driver/probes/skillcheck.ts
  * 実行(統合版・ローカル開発サーバー):
- *   DISABLE_AUTONOMY=1 BEDROCK_ADDRESS=127.0.0.1:19132 npx tsx src/core/driver/skillcheck.ts
+ *   DISABLE_AUTONOMY=1 BEDROCK_ADDRESS=127.0.0.1:19132 npx tsx src/core/driver/probes/skillcheck.ts
  * 実行(統合版・本番 Realms):
- *   DISABLE_AUTONOMY=1 REALM_INVITE=https://realms.gg/xxxx  *     npx tsx --env-file=.env src/core/driver/skillcheck.ts
+ *   DISABLE_AUTONOMY=1 REALM_INVITE=https://realms.gg/xxxx  *     npx tsx --env-file=.env src/core/driver/probes/skillcheck.ts
  *
  * 本番を回す意味: ローカルの開発サーバーは平地・単一バイオーム・チート有効で、
  * 木も鉱石も動物も無い。そこで通ったことは本番で通ることを意味しない。
@@ -22,25 +22,25 @@
  *   Driver 層の実装漏れ・移行漏れによるクラッシュ。
  */
 
-import { profiles } from "../../profiles";
-import { buildingBaseSkill } from "../../skills/building/base";
-import { collectDirtSkill } from "../../skills/collecting/dirt";
-import { huntAnimalsSkill } from "../../skills/collecting/hunting";
-import { mineOresSkill } from "../../skills/collecting/mining";
-import { stealFromChestSkill } from "../../skills/collecting/stealing";
-import { collectStoneSkill } from "../../skills/collecting/stone";
-import { collectWoodSkill } from "../../skills/collecting/wood";
-import { craftSmeltingSkill } from "../../skills/crafting/smelting";
-import { craftToolSkill } from "../../skills/crafting/tool";
-import { craftTorchSkill } from "../../skills/crafting/torch";
-import { craftWeaponSkill } from "../../skills/crafting/weapon";
-import { exploreLandSkill } from "../../skills/exploring/land";
-import { gotoBaseSkill } from "../../skills/goto/base";
-import { gotoCoordsSkill } from "../../skills/goto/coords";
-import { gotoPlayerSkill } from "../../skills/goto/player";
-import { gotoSurfaceSkill } from "../../skills/goto/surface";
-import { MinecraftAgent } from "../agent";
-import { BedrockDriver } from "./bedrock";
+import { profiles } from "../../../profiles";
+import { buildingBaseSkill } from "../../../skills/building/base";
+import { collectDirtSkill } from "../../../skills/collecting/dirt";
+import { huntAnimalsSkill } from "../../../skills/collecting/hunting";
+import { mineOresSkill } from "../../../skills/collecting/mining";
+import { stealFromChestSkill } from "../../../skills/collecting/stealing";
+import { collectStoneSkill } from "../../../skills/collecting/stone";
+import { collectWoodSkill } from "../../../skills/collecting/wood";
+import { craftSmeltingSkill } from "../../../skills/crafting/smelting";
+import { craftToolSkill } from "../../../skills/crafting/tool";
+import { craftTorchSkill } from "../../../skills/crafting/torch";
+import { craftWeaponSkill } from "../../../skills/crafting/weapon";
+import { exploreLandSkill } from "../../../skills/exploring/land";
+import { gotoBaseSkill } from "../../../skills/goto/base";
+import { gotoCoordsSkill } from "../../../skills/goto/coords";
+import { gotoPlayerSkill } from "../../../skills/goto/player";
+import { gotoSurfaceSkill } from "../../../skills/goto/surface";
+import { MinecraftAgent } from "../../agent";
+import { BedrockDriver } from "../bedrock";
 
 /** 指定すると統合版のローカルサーバーへ繋ぐ。無ければ Java 版。 */
 const BEDROCK_ADDRESS = process.env.BEDROCK_ADDRESS ?? "";

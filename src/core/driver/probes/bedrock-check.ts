@@ -2,10 +2,10 @@
  * BedrockDriver を実 Realm に繋いで検証する。
  *
  * 実行(本番 Realms):
- *   REALM_INVITE=https://realms.gg/xxxx npx tsx src/core/driver/bedrock-check.ts
+ *   REALM_INVITE=https://realms.gg/xxxx npx tsx src/core/driver/probes/bedrock-check.ts
  * 実行(ローカル開発サーバー):
  *   docker compose -f docker-compose.bedrock-dev.yml up -d
- *   BEDROCK_ADDRESS=127.0.0.1:19132 npx tsx src/core/driver/bedrock-check.ts
+ *   BEDROCK_ADDRESS=127.0.0.1:19132 npx tsx src/core/driver/probes/bedrock-check.ts
  *
  * LLM を介さず直接ドライバを叩く。思考ループ越しに待つと時間がかかるうえ、
  * 失敗が「LLM が選ばなかった」のか「実装が壊れている」のか切り分けられない。
@@ -13,7 +13,7 @@
  * 意図的にチャットは送らない。Realm の他プレイヤーに見えてしまうため、
  * 送信を試すときは SEND_CHAT に文言を入れて明示的に指定する。
  */
-import { BedrockDriver } from "./bedrock";
+import { BedrockDriver } from "../bedrock";
 
 const INVITE = process.env.REALM_INVITE ?? "";
 /** 開発用。指定するとローカルサーバーへ直に繋ぐ。 */

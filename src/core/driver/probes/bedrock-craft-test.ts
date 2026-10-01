@@ -6,9 +6,9 @@
  * 動いているので、ボット自身に丸太を集めさせて自己完結させる。
  *
  * 実行:
- *   BEDROCK_ADDRESS=127.0.0.1:19132 npx tsx src/core/driver/bedrock-craft-test.ts
+ *   BEDROCK_ADDRESS=127.0.0.1:19132 npx tsx src/core/driver/probes/bedrock-craft-test.ts
  */
-import { BedrockDriver } from "./bedrock";
+import { BedrockDriver } from "../bedrock";
 
 const ADDRESS = process.env.BEDROCK_ADDRESS ?? "127.0.0.1:19132";
 // Windows で直接動かしているサーバーへ繋ぐので、既定では WSL を経由しない。

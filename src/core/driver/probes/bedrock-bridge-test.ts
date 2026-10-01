@@ -9,9 +9,9 @@
  *   docker exec onj-bedrock-dev send-command give bridger dirt 64
  *
  * 実行:
- *   BEDROCK_ADDRESS=127.0.0.1:19132 npx tsx src/core/driver/bedrock-bridge-test.ts
+ *   BEDROCK_ADDRESS=127.0.0.1:19132 npx tsx src/core/driver/probes/bedrock-bridge-test.ts
  */
-import { BedrockDriver } from "./bedrock";
+import { BedrockDriver } from "../bedrock";
 
 const ADDRESS = process.env.BEDROCK_ADDRESS ?? "127.0.0.1:19132";
 const VIA_WSL = (process.env.BEDROCK_WSL ?? (process.platform === "win32" ? "1" : "0")) === "1";

@@ -10,10 +10,10 @@
  * を1ブロックずつ行い、落下物(isItem)と持ち物の差分を出す。
  *
  * 実行(ローカル Docker の開発サーバー、WSL 経由):
- *   npx tsx src/core/driver/bedrock-drop-test.ts
+ *   npx tsx src/core/driver/probes/bedrock-drop-test.ts
  */
 import { execFileSync } from "node:child_process";
-import { BedrockDriver } from "./bedrock";
+import { BedrockDriver } from "../bedrock";
 
 const ADDRESS = process.env.BEDROCK_ADDRESS ?? "127.0.0.1:19132";
 const VIA_WSL = (process.env.BEDROCK_WSL ?? (process.platform === "win32" ? "1" : "0")) === "1";

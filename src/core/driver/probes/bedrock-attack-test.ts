@@ -6,9 +6,9 @@
  * 寄って殴り、相手が減るか消えるかを見る。
  *
  * 実行:
- *   BEDROCK_ADDRESS=127.0.0.1:19132 npx tsx src/core/driver/bedrock-attack-test.ts
+ *   BEDROCK_ADDRESS=127.0.0.1:19132 npx tsx src/core/driver/probes/bedrock-attack-test.ts
  */
-import { BedrockDriver } from "./bedrock";
+import { BedrockDriver } from "../bedrock";
 
 const ADDRESS = process.env.BEDROCK_ADDRESS ?? "127.0.0.1:19132";
 const VIA_WSL = (process.env.BEDROCK_WSL ?? (process.platform === "win32" ? "1" : "0")) === "1";

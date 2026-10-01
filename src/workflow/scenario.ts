@@ -21,6 +21,7 @@
  *   SCENARIO=cobble pnpm scenario                  # ツルハシ持ちで丸石8個を集められるか(掘り→拾得)
  *   SCENARIO=wood-tool pnpm scenario               # 素手・昼・木が近くにある状態から、原木を得て木の道具/剣を作れるか
  *   SCENARIO_MINUTES=15 SCENARIO=raw-food pnpm scenario
+ *   BRAIN=fly SCENARIO=fly pnpm scenario           # ハエの脳: 空腹で食べ、迫る敵から逃げるか
  *
  * 本番 Realm には繋がない。接続先はローカル固定にしてある。
  * サーバーへのコマンドは docker exec … send-command で送る。Windows では
@@ -28,6 +29,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { MinecraftAgent } from "../core/agent";
+import { flyProgramCounts } from "../core/brain/fly-brain";
 import { BedrockDriver } from "../core/driver/bedrock";
 import type { BotDriver } from "../core/driver/types";
 import { kusabot } from "../profiles/kusabot";
@@ -233,6 +235,10 @@ function sweepArtifacts(f: { x: number; y: number; z: number }): void {
 	serverCommand("kill @e[type=item]");
 }
 
+/** fly の採点で、敵を出す前と後の数を分けるための控え。 */
+let flyEscapeBeforeThreat = -1;
+let flyThreatTimer: NodeJS.Timeout | null = null;
+
 const scenarios: Record<string, Scenario> = {
 	baseline: {
 		name: "baseline",
@@ -350,6 +356,57 @@ const scenarios: Record<string, Scenario> = {
 				detail: `最大所持 ${cobbleMax} 個`,
 			},
 		],
+	},
+
+	fly: {
+		name: "fly",
+		intent:
+			"ハエの脳(BRAIN=fly)。空腹で焼いた肉を持たせ、2分後に近くへハスク(日光で燃えない敵)を出す。砂糖→摂食、迫る影→逃避が、配線図からマイクラの行動まで通るか",
+		defaultMinutes: 6,
+		setup: async (driver) => {
+			if (process.env.BRAIN !== "fly") throw new Error("SCENARIO=fly は BRAIN=fly で動かす");
+			resetFlatWorld(driver);
+			await sleep(8_000);
+			serverCommand("time set 1000");
+			serverCommand(`clear ${BOT_NAME}`);
+			await starve(driver, 14);
+			// 空腹にしてから渡す。先に渡すと、削っている間に反射が食べてしまう。
+			// 渡した後は反射 eat と脳の摂食が競う。採点は「脳が摂食を出したか」で
+			// 見るので、どちらが先に口へ運んでも構わない。
+			await giveAndVerify(driver, "cooked_beef", 3);
+			console.log(`[scenario] 満腹度 ${driver.getState().food}`);
+			flyThreatTimer = setTimeout(() => {
+				const f = foot(driver);
+				flyEscapeBeforeThreat = flyProgramCounts.escape;
+				serverCommand(`summon husk ${f.x + 5} ${f.y} ${f.z}`);
+				serverCommand(`summon husk ${f.x - 4} ${f.y} ${f.z + 3}`);
+			}, 120_000);
+		},
+		teardown: () => {
+			if (flyThreatTimer) clearTimeout(flyThreatTimer);
+			serverCommand("kill @e[type=husk]");
+		},
+		goal: () => {
+			const c = flyProgramCounts;
+			const escapes = flyEscapeBeforeThreat < 0 ? 0 : c.escape - flyEscapeBeforeThreat;
+			return [
+				{
+					label: "空腹で食べ物を持ったら、摂食の出力が勝った",
+					ok: c.feed >= 1,
+					detail: `feed ${c.feed} 回`,
+				},
+				{
+					label: "敵が出てから、逃避の出力が勝った",
+					ok: escapes >= 1,
+					detail: `敵の後の escape ${escapes} 回`,
+				},
+				{
+					label: "行動型の内訳",
+					ok: true,
+					detail: JSON.stringify(c),
+				},
+			];
+		},
 	},
 
 	"raw-food": {
@@ -528,7 +585,10 @@ async function main() {
 	}
 
 	const runs = Object.values(summary.skills).reduce((sum, s) => sum + s.runs, 0);
-	const empty = Object.values(summary.skills).reduce((sum, s) => sum + s.empty, 0);
+	// survival.rest(ハエの「止まる」)は何も変えないのが正しい行動なので空振りに数えない。
+	const empty = Object.entries(summary.skills)
+		.filter(([name]) => name !== "survival.rest")
+		.reduce((sum, [, s]) => sum + s.empty, 0);
 	const emptyRatio = runs > 0 ? empty / runs : 0;
 
 	const health: Check[] = [

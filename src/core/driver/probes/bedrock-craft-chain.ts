@@ -11,13 +11,13 @@
  *
  * 実行:
  *   REALM_INVITE=https://realms.gg/xxxx npx tsx --env-file=.env \
- *     src/core/driver/bedrock-craft-chain.ts
+ *     src/core/driver/probes/bedrock-craft-chain.ts
  */
-import { profiles } from "../../profiles";
-import { collectStoneSkill } from "../../skills/collecting/stone";
-import { collectWoodSkill } from "../../skills/collecting/wood";
-import { MinecraftAgent } from "../agent";
-import { BedrockDriver } from "./bedrock";
+import { profiles } from "../../../profiles";
+import { collectStoneSkill } from "../../../skills/collecting/stone";
+import { collectWoodSkill } from "../../../skills/collecting/wood";
+import { MinecraftAgent } from "../../agent";
+import { BedrockDriver } from "../bedrock";
 
 const INVITE = process.env.REALM_INVITE ?? "";
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));

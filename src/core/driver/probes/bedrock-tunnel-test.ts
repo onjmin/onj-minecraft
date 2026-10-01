@@ -8,9 +8,9 @@
  *   docker exec onj-bedrock-dev send-command fill 5 -60 -12 5 -58 12 dirt
  *
  * 実行:
- *   BEDROCK_ADDRESS=127.0.0.1:19132 npx tsx src/core/driver/bedrock-tunnel-test.ts
+ *   BEDROCK_ADDRESS=127.0.0.1:19132 npx tsx src/core/driver/probes/bedrock-tunnel-test.ts
  */
-import { BedrockDriver } from "./bedrock";
+import { BedrockDriver } from "../bedrock";
 
 const ADDRESS = process.env.BEDROCK_ADDRESS ?? "127.0.0.1:19132";
 const VIA_WSL = (process.env.BEDROCK_WSL ?? (process.platform === "win32" ? "1" : "0")) === "1";

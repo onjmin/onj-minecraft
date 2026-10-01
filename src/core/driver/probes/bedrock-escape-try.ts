@@ -5,8 +5,8 @@
  * 「経路探索に脱出能力が無い」のか「時間が足りないだけ」なのかが分からない。
  * ここでは1回の goto に十分な時間を与えて、その区別をつける。
  */
-import { gotoSurfaceSkill } from "../../skills/goto/surface";
-import { BedrockDriver } from "./bedrock";
+import { gotoSurfaceSkill } from "../../../skills/goto/surface";
+import { BedrockDriver } from "../bedrock";
 
 const INVITE = process.env.REALM_INVITE ?? "";
 const TIMEOUT_MS = Number(process.env.ESCAPE_TIMEOUT_MS ?? 120_000);

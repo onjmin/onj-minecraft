@@ -9,14 +9,14 @@
  *
  * 実行(ローカル専用):
  *   docker compose -f docker-compose.bedrock-dev.yml up -d
- *   npx tsx src/core/driver/bedrock-eat-check.ts
+ *   npx tsx src/core/driver/probes/bedrock-eat-check.ts
  *   # 別の端末から、食べ物を渡して満腹度を減らす:
  *   #   docker exec onj-bedrock-dev send-command "give eatcheck cooked_beef 8"
  *   #   docker exec onj-bedrock-dev send-command "effect eatcheck hunger 5 60"
  *
  * 本番 Realm には繋がない(接続先はローカル固定)。
  */
-import { BedrockDriver } from "./bedrock";
+import { BedrockDriver } from "../bedrock";
 
 const ADDRESS = process.env.BEDROCK_ADDRESS ?? "127.0.0.1:19132";
 const VIA_WSL = (process.env.BEDROCK_WSL ?? (process.platform === "win32" ? "1" : "0")) === "1";
